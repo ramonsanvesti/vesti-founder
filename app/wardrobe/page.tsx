@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getSupabaseBrowserClient } from "@/lib/supabaseClient.browser";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClientBrowser";
 
 type Garment = {
   id: string;
