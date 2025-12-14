@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClient.browser";
 
 type Garment = {
   id: string;
@@ -14,6 +14,8 @@ type Garment = {
 };
 
 export default function WardrobePage() {
+  const supabase = getSupabaseBrowserClient();
+
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -23,6 +25,7 @@ export default function WardrobePage() {
   // 1) Cargar prendas
   const fetchGarments = async () => {
     setLoading(true);
+
     const { data, error } = await supabase
       .from("garments")
       .select("*")
@@ -33,11 +36,13 @@ export default function WardrobePage() {
     } else {
       setGarments((data || []) as Garment[]);
     }
+
     setLoading(false);
   };
 
   useEffect(() => {
     fetchGarments();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 2) Seleccionar archivo
@@ -58,12 +63,11 @@ export default function WardrobePage() {
       const fileName = `${Date.now()}-${Math.random()
         .toString(16)
         .slice(2)}.${ext}`;
-      const filePath = fileName;
 
       // 3.2 Subir al bucket garments (público)
       const { error: uploadError } = await supabase.storage
         .from("garments")
-        .upload(filePath, file, {
+        .upload(fileName, file, {
           cacheControl: "3600",
           upsert: false,
         });
@@ -78,7 +82,7 @@ export default function WardrobePage() {
       // 3.3 Obtener URL pública
       const { data: publicData } = supabase.storage
         .from("garments")
-        .getPublicUrl(filePath);
+        .getPublicUrl(fileName);
 
       const publicUrl = publicData.publicUrl;
 
@@ -88,7 +92,7 @@ export default function WardrobePage() {
         return;
       }
 
-      // 3.4 Llamar a /api/ingest (mode: photo)
+      // 3.4 Llamar a /api/ingest
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -155,7 +159,9 @@ export default function WardrobePage() {
         </button>
 
         <div className="text-xs text-gray-500">
-          {file ? `Seleccionado: ${file.name}` : "Selecciona una imagen para empezar."}
+          {file
+            ? `Seleccionado: ${file.name}`
+            : "Selecciona una imagen para empezar."}
         </div>
       </section>
 
