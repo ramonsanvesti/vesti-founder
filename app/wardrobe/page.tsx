@@ -22,7 +22,7 @@ export default function WardrobePage() {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
-  // helper: obtener cliente supabase SOLO en browser runtime
+  // Import dinámico para que Supabase NO se evalúe en build/SSR
   const getClient = async () => {
     const mod = await import("@/lib/supabaseClientBrowser");
     return mod.getSupabaseBrowserClient();
@@ -38,11 +38,8 @@ export default function WardrobePage() {
         .select("*")
         .order("created_at", { ascending: false });
 
-      if (error) {
-        console.error("Error loading garments:", error);
-      } else {
-        setGarments((data || []) as Garment[]);
-      }
+      if (error) console.error("Error loading garments:", error);
+      else setGarments((data || []) as Garment[]);
     } catch (err) {
       console.error("fetchGarments unexpected:", err);
     } finally {
@@ -73,10 +70,7 @@ export default function WardrobePage() {
 
       const { error: uploadError } = await supabase.storage
         .from("garments")
-        .upload(filePath, file, {
-          cacheControl: "3600",
-          upsert: false,
-        });
+        .upload(filePath, file, { cacheControl: "3600", upsert: false });
 
       if (uploadError) {
         console.error("Upload error:", uploadError);
@@ -84,10 +78,7 @@ export default function WardrobePage() {
         return;
       }
 
-      const { data: publicData } = supabase.storage
-        .from("garments")
-        .getPublicUrl(filePath);
-
+      const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
       const publicUrl = publicData?.publicUrl;
 
       if (!publicUrl) {
@@ -98,10 +89,7 @@ export default function WardrobePage() {
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "photo",
-          payload: { imageUrl: publicUrl },
-        }),
+        body: JSON.stringify({ mode: "photo", payload: { imageUrl: publicUrl } }),
       });
 
       if (!res.ok) {
@@ -113,8 +101,8 @@ export default function WardrobePage() {
 
       const newGarment = (await res.json()) as Garment;
       setGarments((prev) => [newGarment, ...prev]);
-      setFile(null);
 
+      setFile(null);
       const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
     } catch (err) {
@@ -129,9 +117,7 @@ export default function WardrobePage() {
     <main className="p-6 space-y-6">
       <header>
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
-        <p className="text-sm text-gray-500">
-          Sube una prenda por foto. Luego le inyectamos Vision AI.
-        </p>
+        <p className="text-sm text-gray-500">Sube una prenda por foto. Luego le inyectamos Vision AI.</p>
       </header>
 
       <section className="border rounded-lg p-4 space-y-3">
@@ -169,19 +155,13 @@ export default function WardrobePage() {
         {loading ? (
           <p className="text-sm text-gray-500">Cargando prendas…</p>
         ) : garments.length === 0 ? (
-          <p className="text-sm text-gray-500">
-            Todavía no hay prendas. Sube tu primera foto arriba.
-          </p>
+          <p className="text-sm text-gray-500">Todavía no hay prendas. Sube tu primera foto arriba.</p>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {garments.map((g) => (
               <div key={g.id} className="border rounded-lg p-3 text-sm flex flex-col gap-2">
                 {g.image_url && (
-                  <img
-                    src={g.image_url}
-                    alt="Prenda"
-                    className="w-full h-40 object-cover rounded"
-                  />
+                  <img src={g.image_url} alt="Prenda" className="w-full h-40 object-cover rounded" />
                 )}
                 <div className="font-medium">{g.title || g.category || "Prenda"}</div>
                 <div className="text-xs text-gray-500">
