@@ -1,7 +1,10 @@
+// app/api/ingest/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 import { analyzeGarmentFromImageUrl } from "@/lib/vision";
 import { normalizeCategory } from "@/lib/category";
+
+export const runtime = "nodejs";
 
 type IngestMode = "photo";
 
@@ -32,20 +35,26 @@ export async function POST(req: NextRequest) {
 
     const imageUrl = String(body.payload.imageUrl).trim();
     if (!imageUrl) {
-      return NextResponse.json({ error: "payload.imageUrl is empty" }, { status: 400 });
+      return NextResponse.json(
+        { error: "payload.imageUrl is empty" },
+        { status: 400 }
+      );
     }
 
     // 1) Vision AI (NO debe tumbar ingest si falla)
-    let visionResult: Awaited<ReturnType<typeof analyzeGarmentFromImageUrl>> = null;
+    let visionResult: Awaited<ReturnType<typeof analyzeGarmentFromImageUrl>> =
+      null;
+    let visionError: string | null = null;
 
     try {
       visionResult = await analyzeGarmentFromImageUrl(imageUrl);
     } catch (e: any) {
-      console.warn("Vision failed, continuing without classification:", e?.message);
+      visionError = e?.message ?? String(e);
+      console.warn("Vision failed, continuing without classification:", visionError);
       visionResult = null;
     }
 
-    // 2) Normalización a tus categorías VESTI
+    // 2) Normalización a categorías VESTI
     const normalized = normalizeCategory({
       garmentType: visionResult?.garmentType ?? null,
       subcategory: visionResult?.subcategory ?? null,
@@ -63,10 +72,10 @@ export async function POST(req: NextRequest) {
           .slice(0, 30)
       : [];
 
-    // Founder Edition fake user_id
+    // Founder Edition fake user_id (luego lo conectamos a auth)
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // 4) metadata.vision
+    // 4) metadata.vision (siempre presente)
     const visionMetadata = visionResult
       ? {
           ok: true,
@@ -88,12 +97,14 @@ export async function POST(req: NextRequest) {
             subcategory: normalized.subcategory,
           },
 
+          raw_text: visionResult.raw_text ?? null,
           raw: visionResult.raw ?? null,
         }
       : {
           ok: false,
           reason:
             "Vision unavailable (missing OPENAI_API_KEY) or Vision error. Inserted without classification.",
+          vision_error: visionError,
           normalized: {
             category: normalized.category,
             subcategory: normalized.subcategory,
@@ -105,11 +116,6 @@ export async function POST(req: NextRequest) {
 
     const garmentToInsert: Record<string, any> = {
       user_id: fakeUserId,
-
-      // ✅ REQUIRED by your DB (NOT NULL)
-      source: "photo",
-      source_id: null,
-
       image_url: imageUrl,
 
       category: normalized.category,
@@ -118,7 +124,7 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
-      // columnas opcionales
+      // columnas opcionales (si existen en tu tabla, se guardan)
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
       size: visionResult?.size ?? null,
