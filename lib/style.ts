@@ -9,10 +9,6 @@ function norm(s: string) {
     .replace(/\s+/g, " ");
 }
 
-function uniqStrings(arr: string[]) {
-  return Array.from(new Set(arr.map(norm).filter(Boolean)));
-}
-
 export type UseCaseTag =
   | "casual"
   | "streetwear"
@@ -24,8 +20,30 @@ export type UseCaseTag =
   | "travel"
   | "lounge";
 
-function uniqUseCase(arr: UseCaseTag[]) {
+const USE_CASE_SET = new Set<UseCaseTag>([
+  "casual",
+  "streetwear",
+  "work",
+  "athletic",
+  "formal",
+  "winter",
+  "summer",
+  "travel",
+  "lounge",
+]);
+
+function uniqStrings(arr: string[]) {
+  return Array.from(new Set(arr.map(norm).filter(Boolean)));
+}
+
+function uniqUseCaseTags(arr: UseCaseTag[]): UseCaseTag[] {
+  // uniq + mantiene el tipo
   return Array.from(new Set(arr));
+}
+
+function asUseCaseTag(v: string): UseCaseTag | null {
+  const n = norm(v) as UseCaseTag;
+  return USE_CASE_SET.has(n) ? n : null;
 }
 
 export function inferFit(input: { tags?: string[]; title?: string | null }): string {
@@ -33,9 +51,12 @@ export function inferFit(input: { tags?: string[]; title?: string | null }): str
   const title = norm(input.title ?? "");
   const blob = `${title} ${tags.join(" ")}`.trim();
 
-  if (blob.includes("oversized") || blob.includes("over sized") || blob.includes("boxy")) return "oversized";
-  if (blob.includes("relaxed") || blob.includes("loose") || blob.includes("roomy") || blob.includes("comfort")) return "relaxed";
-  if (blob.includes("slim") || blob.includes("fitted") || blob.includes("tailored")) return "slim";
+  if (blob.includes("oversized") || blob.includes("over sized") || blob.includes("boxy"))
+    return "oversized";
+  if (blob.includes("relaxed") || blob.includes("loose") || blob.includes("roomy") || blob.includes("comfort"))
+    return "relaxed";
+  if (blob.includes("slim") || blob.includes("fitted") || blob.includes("tailored"))
+    return "slim";
 
   return "regular";
 }
@@ -60,23 +81,21 @@ export function inferUseCaseTags(input: {
     blob.includes("training") ||
     blob.includes("gym") ||
     blob.includes("running") ||
-    blob.includes("trail") ||
     blob.includes("athleisure")
   ) out.push("athletic");
 
   // Work
   if (
+    blob.includes("work") ||
     blob.includes("office") ||
     blob.includes("business") ||
     blob.includes("blazer") ||
     blob.includes("trousers") ||
-    blob.includes("dress shirt") ||
+    blob.includes("dress") ||
     blob.includes("oxford") ||
     blob.includes("button up") ||
     blob.includes("button-up") ||
-    blob.includes("tailored") ||
-    blob.includes("smart casual") ||
-    blob.includes("smart-casual")
+    blob.includes("tailored")
   ) out.push("work");
 
   // Formal
@@ -84,21 +103,18 @@ export function inferUseCaseTags(input: {
     blob.includes("formal") ||
     blob.includes("suit") ||
     blob.includes("tux") ||
-    blob.includes("evening") ||
-    blob.includes("dress shoe") ||
-    blob.includes("heels")
+    blob.includes("evening")
   ) out.push("formal");
 
-  // Streetwear (más específico, menos trigger fácil)
+  // Streetwear
   if (
     blob.includes("streetwear") ||
-    blob.includes("graphic tee") ||
+    blob.includes("logo") ||
     blob.includes("graphic") ||
+    blob.includes("drawstring") ||
     blob.includes("hoodie") ||
     blob.includes("cargo") ||
-    blob.includes("oversized") ||
-    blob.includes("essential") ||
-    blob.includes("drawstring")
+    blob.includes("oversized")
   ) out.push("streetwear");
 
   // Lounge
@@ -112,18 +128,17 @@ export function inferUseCaseTags(input: {
     blob.includes("fleece")
   ) out.push("lounge");
 
-  // Winter
+  // Winter / Summer
   if (
     blob.includes("winter") ||
     blob.includes("coat") ||
     blob.includes("puffer") ||
     blob.includes("parka") ||
     blob.includes("beanie") ||
-    blob.includes("wool") ||
-    blob.includes("thermal")
+    blob.includes("fleece") ||
+    blob.includes("wool")
   ) out.push("winter");
 
-  // Summer
   if (
     blob.includes("summer") ||
     blob.includes("shorts") ||
@@ -136,30 +151,33 @@ export function inferUseCaseTags(input: {
   // Travel
   if (blob.includes("travel") || blob.includes("packable")) out.push("travel");
 
-  // Ayudas por categoría
-  if (input.category === "outerwear") {
-    if (!out.includes("winter") && (blob.includes("puffer") || blob.includes("parka") || blob.includes("coat"))) out.push("winter");
+  // Default
+  if (out.length === 0) out.push("casual");
+  else if (!out.includes("casual")) out.push("casual");
+
+  // Si vinieran tags externos (por ejemplo manuales), los aceptamos SOLO si son válidos
+  // (esto te salva si más adelante mezclas strings)
+  const extra: UseCaseTag[] = [];
+  for (const t of tags) {
+    const maybe = asUseCaseTag(t);
+    if (maybe) extra.push(maybe);
   }
 
-  if (input.category === "shoes") {
-    if (!out.includes("athletic") && (blob.includes("sneaker") || blob.includes("running") || blob.includes("trainer"))) out.push("athletic");
-    if (!out.includes("formal") && (blob.includes("loafer") || blob.includes("oxford") || blob.includes("derby"))) out.push("formal");
-  }
-
-  // Casual solo si el texto lo sugiere o si no hay nada más
-  if (blob.includes("casual") || blob.includes("everyday") || blob.includes("daily")) {
-    out.push("casual");
-  }
-
-  const deduped = uniqUseCase(out);
-
-  if (deduped.length === 0) return ["casual"];
-
-  return deduped;
+  return uniqUseCaseTags([...out, ...extra]);
 }
 
 export function pickPrimaryUseCase(tags: UseCaseTag[]): UseCaseTag {
-  const priority: UseCaseTag[] = ["athletic", "work", "formal", "streetwear", "winter", "summer", "travel", "lounge", "casual"];
+  const priority: UseCaseTag[] = [
+    "athletic",
+    "work",
+    "streetwear",
+    "formal",
+    "winter",
+    "summer",
+    "travel",
+    "lounge",
+    "casual",
+  ];
   for (const p of priority) if (tags.includes(p)) return p;
   return "casual";
 }

@@ -2,7 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 import { analyzeGarmentFromImageUrl } from "@/lib/vision";
 import { normalizeCategory } from "@/lib/category";
-import { inferFit, inferUseCaseTags, pickPrimaryUseCase } from "@/lib/style";
+import {
+  inferFit,
+  inferUseCaseTags,
+  pickPrimaryUseCase,
+  type UseCaseTag,
+} from "@/lib/style";
 
 type IngestMode = "photo";
 
@@ -10,6 +15,40 @@ type IngestRequestBody = {
   mode: IngestMode;
   payload: { imageUrl: string };
 };
+
+function norm(s: string) {
+  return s.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+function titleCase(s: string) {
+  const t = s.trim();
+  if (!t) return t;
+  return t
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w[0]?.toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/**
+ * Catálogo: Marca + Color + Modelo
+ * Ej: "GAP Gray Relaxed Gap Logo Zip Hoodie"
+ */
+function buildCatalogName(input: {
+  brand?: string | null;
+  color?: string | null;
+  fit?: string | null;
+  model?: string | null; // vision catalog_name o garmentType/subcategory
+}) {
+  const brand = (input.brand ?? "").trim();
+  const color = (input.color ?? "").trim();
+  const fit = (input.fit ?? "").trim();
+  const model = (input.model ?? "").trim();
+
+  const parts = [brand, color, fit, model].filter(Boolean);
+  const name = parts.join(" ").replace(/\s+/g, " ").trim();
+  return name ? titleCase(name) : "Unknown Item";
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -49,65 +88,67 @@ export async function POST(req: NextRequest) {
       visionResult = null;
     }
 
-    // 2) Normalización categoría (usa lo que haya: Vision o fallback)
-    const normalized = normalizeCategory({
-      garmentType: visionResult?.garmentType ?? null,
-      subcategory: visionResult?.subcategory ?? null,
-      tags: visionResult?.tags ?? [],
-      title: visionResult?.catalog_name ?? null,
-    });
-
-    // 3) Brand/Color/Fit/Model vienen de Vision.ts (si existe)
-    // catalog_name ya viene armado Brand + Color + Fit + Model
-    const finalCatalogName = (visionResult?.catalog_name ?? "").trim() || "unknown";
-
+    // 2) Tags (si vision falla -> [])
     const finalTags = Array.isArray(visionResult?.tags)
       ? visionResult!.tags
-          .map((t) => String(t).toLowerCase().trim())
+          .map((t) => norm(String(t)))
           .filter(Boolean)
           .slice(0, 30)
       : [];
 
-    // 4) Fit + Use case (si Vision ya trae fit/use_case, úsalo; si no, infiere)
-    const fit =
-      (visionResult?.fit ? String(visionResult.fit) : null) ||
-      inferFit({ tags: finalTags, title: finalCatalogName });
+    // 3) Normalización category/subcategory (si vision falla -> default tops)
+    const normalized = normalizeCategory({
+      garmentType: visionResult?.garmentType ?? null,
+      subcategory: visionResult?.subcategory ?? null,
+      tags: finalTags,
+      title: visionResult?.catalog_name ?? null,
+    });
 
-    const useCaseTags =
-      (Array.isArray(visionResult?.use_case_tags) && visionResult!.use_case_tags.length
-        ? visionResult!.use_case_tags.map((t) => String(t).toLowerCase().trim()).filter(Boolean)
-        : null) ||
-      inferUseCaseTags({
-        tags: finalTags,
-        category: normalized.category,
-        subcategory: normalized.subcategory,
-        title: finalCatalogName,
-      });
+    // 4) Fit + Use case (nuevo)
+    const fit = inferFit({ tags: finalTags, title: visionResult?.catalog_name ?? null });
 
-    const useCase =
-      (visionResult?.use_case ? String(visionResult.use_case) : null) ||
-      pickPrimaryUseCase(useCaseTags);
+    // 👇 FIX TS: forzamos UseCaseTag[] aunque TS infiera string[]
+    const useCaseTags = inferUseCaseTags({
+      tags: finalTags,
+      category: normalized.category,
+      subcategory: normalized.subcategory,
+      title: visionResult?.catalog_name ?? null,
+    }) as UseCaseTag[];
+
+    const useCase = pickPrimaryUseCase(useCaseTags);
+
+    // 5) Catalog name final (Marca + Color + Fit + Modelo)
+    // Modelo lo saco de (vision.catalog_name) o (vision.subcategory/garmentType) como fallback.
+    const model =
+      (visionResult?.catalog_name ?? "").trim() ||
+      (visionResult?.subcategory ?? "").trim() ||
+      (visionResult?.garmentType ?? "").trim();
+
+    const finalCatalogName = buildCatalogName({
+      brand: visionResult?.brand ?? null,
+      color: visionResult?.color ?? null,
+      fit,
+      model,
+    });
 
     // Founder Edition fake user_id
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // 5) metadata.vision (incluye todo, y deja trazabilidad de fallback)
+    // 6) metadata.vision
     const visionMetadata = visionResult
       ? {
           ok: true,
           provider: visionResult.provider ?? "openai",
-          model: visionResult.model_id ?? null,
+          model: visionResult.model ?? null,
           confidence: visionResult.confidence ?? null,
 
           garmentType: visionResult.garmentType ?? null,
           subcategory: visionResult.subcategory ?? null,
-
           brand: visionResult.brand ?? null,
           color: visionResult.color ?? null,
           material: visionResult.material ?? null,
           size: visionResult.size ?? null,
 
-          model_name: visionResult.model ?? null,
           catalog_name: finalCatalogName,
           tags: finalTags,
 
@@ -140,13 +181,14 @@ export async function POST(req: NextRequest) {
           vision_error: visionError,
         };
 
-    // 6) Insert en garments
-    // Nota: tu tabla exige "source" NOT NULL -> lo seteamos siempre
+    // 7) Insert en garments
     const supabase = getSupabaseServerClient();
 
     const garmentToInsert: Record<string, any> = {
       user_id: fakeUserId,
-      source: "photo", // <-- CLAVE para evitar el error NOT NULL
+
+      // ✅ IMPORTANTE: tu DB requiere source NOT NULL
+      source: "photo",
       source_id: null,
 
       image_url: imageUrl,
@@ -157,11 +199,12 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
+      // NUEVO (ya creaste columnas)
       fit,
       use_case: useCase,
       use_case_tags: useCaseTags,
 
-      // opcionales (si existen)
+      // opcionales (según tu schema)
       brand: visionResult?.brand ?? null,
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
