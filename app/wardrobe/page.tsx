@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getSupabaseBrowserClient } from "@/lib/supabaseClientBrowser";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 type Garment = {
   id: string;
@@ -14,30 +16,38 @@ type Garment = {
 };
 
 export default function WardrobePage() {
-  const supabase = getSupabaseBrowserClient();
-
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
-  // 1) Cargar prendas
+  // helper: obtener cliente supabase SOLO en browser runtime
+  const getClient = async () => {
+    const mod = await import("@/lib/supabaseClientBrowser");
+    return mod.getSupabaseBrowserClient();
+  };
+
   const fetchGarments = async () => {
     setLoading(true);
+    try {
+      const supabase = await getClient();
 
-    const { data, error } = await supabase
-      .from("garments")
-      .select("*")
-      .order("created_at", { ascending: false });
+      const { data, error } = await supabase
+        .from("garments")
+        .select("*")
+        .order("created_at", { ascending: false });
 
-    if (error) {
-      console.error("Error loading garments:", error);
-    } else {
-      setGarments((data || []) as Garment[]);
+      if (error) {
+        console.error("Error loading garments:", error);
+      } else {
+        setGarments((data || []) as Garment[]);
+      }
+    } catch (err) {
+      console.error("fetchGarments unexpected:", err);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   };
 
   useEffect(() => {
@@ -45,53 +55,46 @@ export default function WardrobePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 2) Seleccionar archivo
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0] ?? null;
     setFile(selected);
   };
 
-  // 3) Subir imagen + llamar API ingest
   const handleUpload = async () => {
     if (!file) return;
 
     try {
       setUploading(true);
+      const supabase = await getClient();
 
       const ext = file.name.split(".").pop() || "jpg";
-      const fileName = `${Date.now()}-${Math.random()
-        .toString(16)
-        .slice(2)}.${ext}`;
+      const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+      const filePath = fileName;
 
-      // 3.1 Subir a Storage
       const { error: uploadError } = await supabase.storage
         .from("garments")
-        .upload(fileName, file, {
+        .upload(filePath, file, {
           cacheControl: "3600",
           upsert: false,
         });
 
       if (uploadError) {
-        console.error(uploadError);
-        alert("Error subiendo la imagen.");
-        setUploading(false);
+        console.error("Upload error:", uploadError);
+        alert("Error subiendo la imagen a Storage.");
         return;
       }
 
-      // 3.2 Obtener URL pública
       const { data: publicData } = supabase.storage
         .from("garments")
-        .getPublicUrl(fileName);
+        .getPublicUrl(filePath);
 
-      const publicUrl = publicData.publicUrl;
+      const publicUrl = publicData?.publicUrl;
 
       if (!publicUrl) {
-        alert("No se pudo generar URL pública.");
-        setUploading(false);
+        alert("No se pudo generar la URL pública.");
         return;
       }
 
-      // 3.3 Llamar API ingest
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -104,24 +107,20 @@ export default function WardrobePage() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         console.error("Ingest error:", err);
-        alert("Error creando la prenda.");
-        setUploading(false);
+        alert("Error creando la prenda (ingest).");
         return;
       }
 
       const newGarment = (await res.json()) as Garment;
-
-      // 3.4 Actualizar UI
       setGarments((prev) => [newGarment, ...prev]);
       setFile(null);
 
-      const input = document.getElementById("file-input") as HTMLInputElement;
+      const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      setUploading(false);
     } catch (err) {
-      console.error("Unexpected error:", err);
+      console.error("Unexpected upload error:", err);
       alert("Error inesperado.");
+    } finally {
       setUploading(false);
     }
   };
@@ -129,15 +128,12 @@ export default function WardrobePage() {
   return (
     <main className="p-6 space-y-6">
       <header>
-        <h1 className="text-2xl font-semibold">
-          VESTI · Wardrobe OS (Founder Edition)
-        </h1>
+        <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
-          Sube una prenda por foto. Luego conectamos Vision AI.
+          Sube una prenda por foto. Luego le inyectamos Vision AI.
         </p>
       </header>
 
-      {/* Upload */}
       <section className="border rounded-lg p-4 space-y-3">
         <h2 className="text-lg font-medium">Agregar prenda (BY PHOTO)</h2>
 
@@ -158,20 +154,14 @@ export default function WardrobePage() {
         </button>
 
         <div className="text-xs text-gray-500">
-          {file
-            ? `Seleccionado: ${file.name}`
-            : "Selecciona una imagen para empezar."}
+          {file ? `Seleccionado: ${file.name}` : "Selecciona una imagen para empezar."}
         </div>
       </section>
 
-      {/* Wardrobe Grid */}
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-medium">Tu closet</h2>
-          <button
-            onClick={fetchGarments}
-            className="text-sm underline text-gray-600"
-          >
+          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
             Refrescar
           </button>
         </div>
@@ -180,15 +170,12 @@ export default function WardrobePage() {
           <p className="text-sm text-gray-500">Cargando prendas…</p>
         ) : garments.length === 0 ? (
           <p className="text-sm text-gray-500">
-            Todavía no hay prendas. Sube tu primera foto.
+            Todavía no hay prendas. Sube tu primera foto arriba.
           </p>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {garments.map((g) => (
-              <div
-                key={g.id}
-                className="border rounded-lg p-3 text-sm flex flex-col gap-2"
-              >
+              <div key={g.id} className="border rounded-lg p-3 text-sm flex flex-col gap-2">
                 {g.image_url && (
                   <img
                     src={g.image_url}
@@ -196,9 +183,7 @@ export default function WardrobePage() {
                     className="w-full h-40 object-cover rounded"
                   />
                 )}
-                <div className="font-medium">
-                  {g.title || g.category || "Prenda"}
-                </div>
+                <div className="font-medium">{g.title || g.category || "Prenda"}</div>
                 <div className="text-xs text-gray-500">
                   {g.brand}
                   {g.brand && g.color && " · "}
