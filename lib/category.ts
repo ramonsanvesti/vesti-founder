@@ -74,7 +74,59 @@ export function normalizeCategory(input: {
     return { category: "shoes", subcategory: pickSubcategory(sub, g, "shoes") };
   }
 
-  // 3) accessories
+  // 3) outerwear (incluye hoodies y zips)  ✅ mover arriba
+  if (
+    blob.includes("hoodie") ||
+    blob.includes("zip hoodie") ||
+    blob.includes("zip up") ||
+    blob.includes("zipup") ||
+    blob.includes("full zip") ||
+    blob.includes("half zip") ||
+    blob.includes("quarter zip") ||
+    blob.includes("jacket") ||
+    blob.includes("coat") ||
+    blob.includes("parka") ||
+    blob.includes("puffer") ||
+    blob.includes("windbreaker") ||
+    blob.includes("anorak") ||
+    blob.includes("trench") ||
+    blob.includes("varsity") ||
+    blob.includes("blazer") ||
+    blob.includes("overcoat") ||
+    (blob.includes("fleece") && blob.includes("hood"))
+  ) {
+    return {
+      category: "outerwear",
+      subcategory: pickSubcategory(sub, g, "outerwear"),
+    };
+  }
+
+  // 4) bottoms
+  if (
+    blob.includes("pant") ||
+    blob.includes("pants") ||
+    blob.includes("trouser") ||
+    blob.includes("trousers") ||
+    blob.includes("jean") ||
+    blob.includes("jeans") ||
+    blob.includes("denim") ||
+    blob.includes("jogger") ||
+    blob.includes("joggers") ||
+    blob.includes("sweatpant") ||
+    blob.includes("sweatpants") ||
+    blob.includes("short") ||
+    blob.includes("shorts") ||
+    blob.includes("skirt") ||
+    blob.includes("leggings")
+  ) {
+    return {
+      category: "bottoms",
+      subcategory: pickSubcategory(sub, g, "bottoms"),
+    };
+  }
+
+  // 5) accessories (poner después de outerwear/bottoms)
+  // IMPORTANTE: NO uses "hood" aquí porque aparece en hoodies (drawstring hood)
   if (
     blob.includes("accessory") ||
     blob.includes("accessories") ||
@@ -98,65 +150,6 @@ export function normalizeCategory(input: {
     return {
       category: "accessories",
       subcategory: pickSubcategory(sub, g, "accessories"),
-    };
-  }
-
-  // 4) outerwear
-  if (
-    blob.includes("jacket") ||
-    blob.includes("coat") ||
-    blob.includes("parka") ||
-    blob.includes("puffer") ||
-    blob.includes("windbreaker") ||
-    blob.includes("anorak") ||
-    blob.includes("trench") ||
-    blob.includes("varsity") ||
-    blob.includes("blazer") ||
-    blob.includes("overcoat")
-  ) {
-    return {
-      category: "outerwear",
-      subcategory: pickSubcategory(sub, g, "outerwear"),
-    };
-  }
-
-  // Hoodies: tú decides si van a tops u outerwear. Yo los pongo en outerwear.
-  if (
-    blob.includes("hoodie") ||
-    blob.includes("zip up") ||
-    blob.includes("zipup") ||
-    blob.includes("full zip") ||
-    blob.includes("half zip") ||
-    blob.includes("quarter zip") ||
-    (blob.includes("fleece") && blob.includes("hood"))
-  ) {
-    return {
-      category: "outerwear",
-      subcategory: pickSubcategory(sub, g, "hoodie"),
-    };
-  }
-
-  // 5) bottoms
-  if (
-    blob.includes("pant") ||
-    blob.includes("pants") ||
-    blob.includes("trouser") ||
-    blob.includes("trousers") ||
-    blob.includes("jean") ||
-    blob.includes("jeans") ||
-    blob.includes("denim") ||
-    blob.includes("jogger") ||
-    blob.includes("joggers") ||
-    blob.includes("sweatpant") ||
-    blob.includes("sweatpants") ||
-    blob.includes("short") ||
-    blob.includes("shorts") ||
-    blob.includes("skirt") ||
-    blob.includes("leggings")
-  ) {
-    return {
-      category: "bottoms",
-      subcategory: pickSubcategory(sub, g, "bottoms"),
     };
   }
 
