@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { analyzeGarmentImage } from "@/lib/vision";
 
-export const runtime = "nodejs"; // OpenAI + supabase-js
-export const dynamic = "force-dynamic";
+/* ---------------------------------------
+   Types
+---------------------------------------- */
 
 type IngestMode = "photo";
 
@@ -14,21 +14,77 @@ type IngestRequestBody = {
   };
 };
 
-function getSupabaseAdmin() {
+/* ---------------------------------------
+   Supabase Server Client
+---------------------------------------- */
+
+function getSupabaseClient() {
   const url = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url) throw new Error("SUPABASE_URL is missing");
-  if (!serviceRoleKey) throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
+  if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
 
-  return createClient(url, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+  return createClient(url, key);
 }
+
+/* ---------------------------------------
+   Vision AI (v1 – heuristic / placeholder)
+   Luego lo cambiamos por OpenAI Vision
+---------------------------------------- */
+
+function runVisionAI(imageUrl: string) {
+  // 🔥 Mock inteligente (fase 1)
+  // Esto luego se reemplaza por GPT-4o Vision
+
+  const lower = imageUrl.toLowerCase();
+
+  let category: string = "unknown";
+  let tags: string[] = [];
+
+  if (lower.includes("jogger") || lower.includes("pant")) {
+    category = "bottoms";
+    tags = ["pants", "joggers", "casual"];
+  } else if (lower.includes("sweater") || lower.includes("hoodie")) {
+    category = "tops";
+    tags = ["sweater", "knit", "layering"];
+  } else if (lower.includes("jacket") || lower.includes("coat")) {
+    category = "outerwear";
+    tags = ["jacket", "outerwear"];
+  } else if (lower.includes("shoe") || lower.includes("sneaker")) {
+    category = "shoes";
+    tags = ["footwear", "shoes"];
+  } else if (lower.includes("bag") || lower.includes("cap")) {
+    category = "accessories";
+    tags = ["accessory"];
+  }
+
+  const catalogName =
+    category === "bottoms"
+      ? "Black Drawstring Fleece Joggers"
+      : category === "tops"
+      ? "Black Cotton-Blend Crewneck Sweater"
+      : "Unclassified Garment";
+
+  return {
+    category,
+    catalog_name: catalogName,
+    tags,
+    raw_text: `Detected via Vision AI: ${tags.join(", ")}`,
+    metadata: {
+      vision: "v1",
+      source: "photo",
+    },
+  };
+}
+
+/* ---------------------------------------
+   POST /api/ingest
+---------------------------------------- */
 
 export async function POST(req: NextRequest) {
   try {
-    // 0) Parse body
+    const supabase = getSupabaseClient();
     const body = (await req.json()) as IngestRequestBody;
 
     if (!body?.mode || !body?.payload?.imageUrl) {
@@ -40,76 +96,60 @@ export async function POST(req: NextRequest) {
 
     if (body.mode !== "photo") {
       return NextResponse.json(
-        { error: "Invalid mode. Only 'photo' supported for now." },
+        { error: "Invalid mode. Only 'photo' supported." },
         { status: 400 }
       );
     }
 
-    const imageUrl = body.payload.imageUrl;
+    const { imageUrl } = body.payload;
 
-    // 1) Vision AI
-    const vision = await analyzeGarmentImage(imageUrl);
+    // ⚠️ Temporal: user fijo
+    const userId = "00000000-0000-0000-0000-000000000001";
 
-    // 2) Insert DB (server-side, with Service Role)
-    const supabase = getSupabaseAdmin();
+    // 🧠 Vision AI
+    const vision = runVisionAI(imageUrl);
 
-    // ⚠️ Por ahora: user fijo hasta conectar Auth
-    const fakeUserId = "00000000-0000-0000-0000-000000000001";
-
-    const garmentToInsert = {
-      user_id: fakeUserId,
+    const garment = {
+      user_id: userId,
       source: "photo",
       source_id: null,
 
-      // “Nombre estilo catálogo”
-      title: vision.catalog_name ?? null,
+      title: null,
+      brand: null,
 
-      // “Clasificación VESTI”
-      category: vision.category ?? "unknown",
-      subcategory: vision.subcategory ?? null,
+      category: vision.category,
+      subcategory: null,
 
-      // Atributos
-      brand: vision.brand_guess ?? null,
-      color: vision.color_primary ?? null,
+      color: null,
       size: null,
-      material: vision.material ?? null,
+      material: null,
       quantity: 1,
 
-      // Imagen
       image_url: imageUrl,
 
-      // Embeddings (después)
+      tags: vision.tags,
+      raw_text: vision.raw_text,
+      metadata: vision.metadata,
+      catalog_name: vision.catalog_name,
+
       embedding: null,
-
-      // Texto crudo (después)
-      raw_text: null,
-
-      // Metadata: guardamos tags + colores secundarios + confidence
-      metadata: {
-        tags: vision.tags ?? [],
-        color_secondary: vision.color_secondary ?? null,
-        confidence: vision.confidence ?? 0.6,
-        vision_version: "v1",
-      },
     };
 
     const { data, error } = await supabase
       .from("garments")
-      .insert(garmentToInsert)
+      .insert(garment)
       .select("*")
       .single();
 
     if (error) {
+      console.error("Supabase insert error:", error);
       return NextResponse.json(
         { error: "Failed to insert garment", details: error.message },
         { status: 500 }
       );
     }
 
-    return NextResponse.json(data, {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-    });
+    return NextResponse.json(data, { status: 200 });
   } catch (err: any) {
     console.error("Error in /api/ingest:", err);
     return NextResponse.json(
