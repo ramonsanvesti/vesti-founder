@@ -13,32 +13,6 @@ type IngestRequestBody = {
   };
 };
 
-function uniq(arr: string[]) {
-  return Array.from(new Set(arr.map((s) => s.trim()).filter(Boolean)));
-}
-
-function normTag(s: string) {
-  return s
-    .toLowerCase()
-    .trim()
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ");
-}
-
-function fallbackTags(input: { normalizedCategory: string; imageUrl: string }) {
-  // tags mínimos para que nunca quede vacío
-  const base = [
-    "photo ingest",
-    "founder edition",
-    input.normalizedCategory,
-  ].map(normTag);
-
-  // pequeño hint por si es url de supabase storage
-  if (input.imageUrl.includes("supabase.co/storage")) base.push("supabase storage");
-
-  return uniq(base).slice(0, 30);
-}
-
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as IngestRequestBody;
@@ -67,17 +41,15 @@ export async function POST(req: NextRequest) {
 
     // 1) Vision AI (NO debe tumbar ingest si falla)
     let visionResult: Awaited<ReturnType<typeof analyzeGarmentFromImageUrl>> = null;
-    let visionError: string | null = null;
 
     try {
       visionResult = await analyzeGarmentFromImageUrl(imageUrl);
     } catch (e: any) {
+      console.warn("Vision failed, continuing without classification:", e?.message);
       visionResult = null;
-      visionError = e?.message ?? "Vision exception";
-      console.warn("Vision exception:", visionError);
     }
 
-    // 2) Normalización a categorías VESTI (usa Vision si está, sino fallback)
+    // 2) Normalización a categorías VESTI
     const normalized = normalizeCategory({
       garmentType: visionResult?.garmentType ?? null,
       subcategory: visionResult?.subcategory ?? null,
@@ -85,73 +57,68 @@ export async function POST(req: NextRequest) {
       title: visionResult?.catalog_name ?? null,
     });
 
-    // 3) Campos finales SIEMPRE (con fallback)
-    const finalCatalogName =
-      (visionResult?.catalog_name ?? "").trim() ||
-      // fallback razonable si Vision está caído
-      `${normalized.category} item`.replace(/\b\w/g, (m) => m.toUpperCase());
+    // 3) Campos finales
+    const finalCatalogName = (visionResult?.catalog_name ?? "").trim() || "unknown";
 
-    const finalTags =
-      Array.isArray(visionResult?.tags) && visionResult!.tags.length
-        ? uniq(
-            visionResult!.tags
-              .map((t) => normTag(String(t)))
-              .filter(Boolean)
-          ).slice(0, 30)
-        : fallbackTags({ normalizedCategory: normalized.category, imageUrl });
+    const finalTags = Array.isArray(visionResult?.tags)
+      ? visionResult!.tags
+          .map((t) => String(t).toLowerCase().trim())
+          .filter(Boolean)
+          .slice(0, 30)
+      : [];
 
-    // Founder Edition fake user_id (luego lo conectamos a auth)
+    // Founder Edition fake user_id
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // 4) metadata.vision SIEMPRE (ok true/false + details)
+    // 4) metadata.vision
     const visionMetadata = visionResult
       ? {
           ok: true,
-          provider: visionResult.provider,
-          model: visionResult.model,
-          confidence: visionResult.confidence,
-
-          garmentType: visionResult.garmentType,
-          subcategory: visionResult.subcategory,
-          brand: visionResult.brand,
-          color: visionResult.color,
-          material: visionResult.material,
-          size: visionResult.size,
+          provider: visionResult.provider ?? "openai",
+          model: visionResult.model ?? null,
+          confidence: visionResult.confidence ?? null,
 
           catalog_name: finalCatalogName,
           tags: finalTags,
+
+          garmentType: visionResult.garmentType ?? null,
+          subcategory: visionResult.subcategory ?? null,
+
+          brand: visionResult.brand ?? null,
+          color: visionResult.color ?? null,
+          material: visionResult.material ?? null,
+          size: visionResult.size ?? null,
+
+          fit: visionResult.fit ?? null,
+          use_case: visionResult.use_case ?? null,
 
           normalized: {
             category: normalized.category,
             subcategory: normalized.subcategory,
           },
 
-          raw_text: visionResult.raw_text,
-          raw: visionResult.raw,
+          raw: visionResult.raw ?? null,
         }
       : {
           ok: false,
           reason:
-            !process.env.OPENAI_API_KEY
-              ? "Vision unavailable (missing OPENAI_API_KEY)."
-              : "Vision returned null (request failed or JSON parse failed).",
-          vision_error: visionError,
+            "Vision unavailable (missing OPENAI_API_KEY) or Vision error. Inserted without classification.",
           normalized: {
             category: normalized.category,
             subcategory: normalized.subcategory,
           },
-          catalog_name: finalCatalogName,
-          tags: finalTags,
+          vision_error: null,
         };
 
     // 5) Insert en garments
     const supabase = getSupabaseServerClient();
 
-    // Asumimos columnas (según tus screenshots):
-    // user_id, image_url, category, subcategory, catalog_name, tags, metadata,
-    // y opcionales: brand/color/material/size/quantity/raw_text
     const garmentToInsert: Record<string, any> = {
       user_id: fakeUserId,
+
+      // ✅ tu constraint not null
+      source: "photo",
+
       image_url: imageUrl,
 
       category: normalized.category,
@@ -160,18 +127,22 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
-      // opcionales (si existen en tu tabla)
+      // opcionales (existen en tu tabla)
       brand: visionResult?.brand ?? null,
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
       size: visionResult?.size ?? null,
+
+      // ✅ nuevas columnas que ya agregaste
+      fit: visionResult?.fit ?? null,
+      use_case: visionResult?.use_case ?? null,
+
       raw_text: visionResult?.raw_text ?? null,
       quantity: 1,
 
-      // metadata jsonb
       metadata: {
+        ...(visionResult?.metadata ?? {}),
         vision: visionMetadata,
-        // puedes meter aquí otros módulos luego (e.g. embeddings, rules, etc.)
       },
     };
 
@@ -189,10 +160,7 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json(
-      {
-        ok: true,
-        garment: data,
-      },
+      { ok: true, garment: data },
       { status: 200 }
     );
   } catch (err: any) {

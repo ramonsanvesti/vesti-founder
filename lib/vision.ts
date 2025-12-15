@@ -15,6 +15,10 @@ export type VisionResult = {
   material: string | null;
   size: string | null;
 
+  // Jerarquía extra
+  fit: string | null; // oversized, relaxed, regular, slim, cropped, longline
+  use_case: string | null; // casual, streetwear, work, athletic, formal, lounge
+
   // Tags final (normalizados)
   tags: string[];
 
@@ -22,7 +26,7 @@ export type VisionResult = {
   confidence: number; // 0..1
   raw_text: string | null;
 
-  // Para metadata.vision (limpio)
+  // Para metadata.vision
   metadata: Record<string, any>;
 
   // Para trazabilidad
@@ -65,55 +69,28 @@ function titleCase(s: string) {
     .join(" ");
 }
 
-/**
- * Responses API puede devolver el output en distintos lugares.
- * Esta función intenta extraer el JSON como string.
- */
 function extractOutputText(resJson: any): string | null {
-  // Muchos responses devuelven output_text directo
+  // Responses API
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
-  // Otros: output[0].content[0].text/value
   const first = resJson?.output?.[0];
   const c0 = first?.content?.[0];
 
   if (typeof c0?.text === "string") return c0.text;
   if (typeof c0?.value === "string") return c0.value;
 
-  // Fallback adicional: buscar cualquier content con text
-  const out = resJson?.output;
-  if (Array.isArray(out)) {
-    for (const item of out) {
-      const content = item?.content;
-      if (Array.isArray(content)) {
-        for (const c of content) {
-          if (typeof c?.text === "string") return c.text;
-          if (typeof c?.value === "string") return c.value;
-        }
-      }
-    }
-  }
-
   return null;
 }
 
 function finalizeVision(parsed: any, rawResponse: any): VisionResult {
-  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(
-    0,
-    30
-  );
+  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(0, 30);
 
   const catalog =
-    safeString(parsed?.catalog_name) || safeString(parsed?.title) || "Unknown Item";
+    safeString(parsed?.catalog_name) ||
+    safeString(parsed?.title) ||
+    "Unknown Item";
 
   const rawNotes = safeString(parsed?.raw_notes);
-
-  const brand = safeString(parsed?.brand);
-  const color = safeString(parsed?.color);
-  const material = safeString(parsed?.material);
-  const size = safeString(parsed?.size);
-  const garmentType = safeString(parsed?.garmentType);
-  const subcategory = safeString(parsed?.subcategory);
 
   return {
     provider: "openai",
@@ -121,13 +98,16 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
 
     catalog_name: titleCase(catalog),
 
-    garmentType,
-    subcategory,
+    garmentType: safeString(parsed?.garmentType),
+    subcategory: safeString(parsed?.subcategory),
 
-    brand,
-    color,
-    material,
-    size,
+    brand: safeString(parsed?.brand),
+    color: safeString(parsed?.color),
+    material: safeString(parsed?.material),
+    size: safeString(parsed?.size),
+
+    fit: safeString(parsed?.fit),
+    use_case: safeString(parsed?.use_case),
 
     tags,
 
@@ -137,13 +117,12 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
     metadata: {
       raw_notes: rawNotes,
       tags,
-      garmentType,
-      subcategory,
-      brand,
-      color,
-      material,
-      size,
-      confidence: clamp01(parsed?.confidence, 0.6),
+      brand: safeString(parsed?.brand),
+      color: safeString(parsed?.color),
+      material: safeString(parsed?.material),
+      size: safeString(parsed?.size),
+      fit: safeString(parsed?.fit),
+      use_case: safeString(parsed?.use_case),
     },
 
     raw: {
@@ -154,44 +133,43 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
 }
 
 /**
- * Función “oficial” para usar desde /api/ingest
- * - Si falta OPENAI_API_KEY o Vision falla: devuelve null (NO rompe ingest)
+ * Nombre “oficial” para usar desde /api/ingest
+ * - Si falta OPENAI_API_KEY o Vision falla: devuelve null (no rompe ingest)
  */
 export async function analyzeGarmentFromImageUrl(
   imageUrl: string
 ): Promise<VisionResult | null> {
   const apiKey = process.env.OPENAI_API_KEY;
 
-  // Si no hay key, no rompemos ingest
+  // Si no hay key, no rompemos ingest: devolvemos null y route.ts hace fallback
   if (!apiKey) return null;
 
   const system = `
 You are VESTI Vision AI. Analyze a single product photo (clothing, shoes, accessories, or fragrance).
-Return ONLY valid JSON (no markdown, no commentary).
+Return ONLY valid JSON. No markdown. No commentary.
 
-Return schema (JSON object):
-{
-  "catalog_name": "Title Case 3-6 words",
-  "garmentType": "free text item type",
-  "subcategory": "more specific type or null",
-  "brand": "brand if clearly visible else null",
-  "color": "main color(s) else null",
-  "material": "material if inferable else null",
-  "size": "size if visible else null",
-  "tags": ["6-14 concise tags, no duplicates"],
-  "confidence": 0.0-1.0,
-  "raw_notes": "one short sentence describing what you saw"
-}
+Return a JSON object with exactly these fields:
+- catalog_name: short catalog-style name (3-6 words), Title Case. Example: "Gray Logo Zip Hoodie".
+- garmentType: free text describing item type (e.g. "hoodie", "sneakers", "trousers", "perfume bottle").
+- subcategory: more specific type if possible (e.g. "zip hoodie", "running sneaker", "crewneck tee").
+- brand: only if clearly visible; otherwise null.
+- color: main color(s) in simple terms (e.g. "black", "gray", "navy").
+- material: if reasonably inferable; else null.
+- size: if visible (e.g. "M", "10", "32W"); else null.
+- fit: one of ["oversized","relaxed","regular","slim","cropped","longline"] or null.
+- use_case: one of ["casual","streetwear","work","athletic","formal","lounge"] or null.
+- tags: 6-14 concise tags. Must be nouns/adjectives. No duplicates.
+- confidence: number 0 to 1.
+- raw_notes: one short sentence about what you saw.
 
-Rules:
-- catalog_name MUST be short and catalog-like, e.g. "Black Oversized Zip Hoodie".
-- tags MUST be useful for wardrobe search. Avoid verbs. Use nouns/adjectives.
-- If uncertain, set brand/material/size to null.
-`.trim();
+Important:
+- If uncertain, use null for brand/material/size/fit/use_case.
+- tags must be lower-noise and useful for wardrobe search.
+`;
 
   try {
     const body = {
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       input: [
         { role: "system", content: system },
         {
@@ -202,7 +180,7 @@ Rules:
           ],
         },
       ],
-      // ✅ IMPORTANT: Responses API moved response_format -> text.format
+      // ✅ nuevo formato (Responses API)
       text: { format: { type: "json_object" } },
     };
 
@@ -223,7 +201,6 @@ Rules:
 
     const json = await res.json();
 
-    // 1) Intentar extraer JSON como texto
     const outputText = extractOutputText(json);
 
     let parsed: any = null;
@@ -236,7 +213,7 @@ Rules:
         return null;
       }
     } else {
-      // 2) fallback: algunas variantes podrían traer json directo
+      // fallback: algunas variantes podrían traer json directo
       const maybeObj = json?.output?.[0]?.content?.[0]?.json;
       if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
     }
