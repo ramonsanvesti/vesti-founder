@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { getSupabaseBrowserClient } from "@/lib/supabaseClientBrowser";
 
 type Garment = {
   id: string;
@@ -10,6 +11,10 @@ type Garment = {
   color: string | null;
   image_url: string | null;
   created_at?: string;
+  metadata?: {
+    department?: string;
+    tags?: string[];
+  };
 };
 
 export default function WardrobeClient() {
@@ -19,6 +24,7 @@ export default function WardrobeClient() {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
+  // Lazy Supabase client (browser-safe)
   const getSupabase = async () => {
     const mod = await import("@/lib/supabaseClientBrowser");
     return mod.getSupabaseBrowserClient();
@@ -26,18 +32,19 @@ export default function WardrobeClient() {
 
   const fetchGarments = async () => {
     setLoading(true);
-    try {
-      const supabase = await getSupabase();
-      const { data, error } = await supabase
-        .from("garments")
-        .select("*")
-        .order("created_at", { ascending: false });
+    const supabase = await getSupabase();
 
-      if (error) console.error("Error loading garments:", error);
-      setGarments((data || []) as Garment[]);
-    } finally {
-      setLoading(false);
+    const { data, error } = await supabase
+      .from("garments")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Error loading garments:", error);
+    } else {
+      setGarments(data || []);
     }
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -45,8 +52,7 @@ export default function WardrobeClient() {
   }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
-    setFile(selected);
+    setFile(e.target.files?.[0] ?? null);
   };
 
   const handleUpload = async () => {
@@ -57,15 +63,17 @@ export default function WardrobeClient() {
       const supabase = await getSupabase();
 
       const ext = file.name.split(".").pop() || "jpg";
-      const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+      const fileName = `${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2)}.${ext}`;
 
       const { error: uploadError } = await supabase.storage
         .from("garments")
-        .upload(fileName, file, { cacheControl: "3600", upsert: false });
+        .upload(fileName, file);
 
       if (uploadError) {
-        console.error("Upload error:", uploadError);
         alert("Error subiendo la imagen a Storage.");
+        console.error(uploadError);
         return;
       }
 
@@ -73,17 +81,15 @@ export default function WardrobeClient() {
         .from("garments")
         .getPublicUrl(fileName);
 
-      const publicUrl = publicData?.publicUrl;
-
-      if (!publicUrl) {
-        alert("No se pudo generar la URL pública.");
-        return;
-      }
+      const publicUrl = publicData.publicUrl;
 
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "photo", payload: { imageUrl: publicUrl } }),
+        body: JSON.stringify({
+          mode: "photo",
+          payload: { imageUrl: publicUrl },
+        }),
       });
 
       if (!res.ok) {
@@ -96,9 +102,6 @@ export default function WardrobeClient() {
       const newGarment = (await res.json()) as Garment;
       setGarments((prev) => [newGarment, ...prev]);
       setFile(null);
-
-      const input = document.getElementById("file-input") as HTMLInputElement | null;
-      if (input) input.value = "";
     } catch (err) {
       console.error("Unexpected upload error:", err);
       alert("Error inesperado.");
@@ -110,63 +113,99 @@ export default function WardrobeClient() {
   return (
     <main className="p-6 space-y-6">
       <header>
-        <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
+        <h1 className="text-2xl font-semibold">
+          VESTI · Wardrobe OS (Founder Edition)
+        </h1>
         <p className="text-sm text-gray-500">
-          Sube una prenda por foto. Luego le inyectamos Vision AI.
+          Sube una prenda por foto. Vision AI la clasifica automáticamente.
         </p>
       </header>
 
+      {/* Upload */}
       <section className="border rounded-lg p-4 space-y-3">
         <h2 className="text-lg font-medium">Agregar prenda (BY PHOTO)</h2>
 
-        <input
-          id="file-input"
-          type="file"
-          accept="image/*"
-          onChange={handleFileChange}
-          className="block text-sm"
-        />
+        <input type="file" accept="image/*" onChange={handleFileChange} />
 
         <button
           onClick={handleUpload}
           disabled={!file || uploading}
-          className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+          className="px-4 py-2 rounded bg-black text-white disabled:opacity-50"
         >
           {uploading ? "Subiendo..." : "Subir prenda"}
         </button>
-
-        <div className="text-xs text-gray-500">
-          {file ? `Seleccionado: ${file.name}` : "Selecciona una imagen para empezar."}
-        </div>
       </section>
 
-      <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-medium">Tu closet</h2>
-          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
-            Refrescar
-          </button>
-        </div>
+      {/* Grid */}
+      <section className="space-y-4">
+        <h2 className="text-lg font-medium">Tu closet</h2>
 
         {loading ? (
           <p className="text-sm text-gray-500">Cargando prendas…</p>
         ) : garments.length === 0 ? (
-          <p className="text-sm text-gray-500">Todavía no hay prendas. Sube tu primera foto arriba.</p>
+          <p className="text-sm text-gray-500">
+            Todavía no hay prendas. Sube la primera.
+          </p>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {garments.map((g) => (
-              <div key={g.id} className="border rounded-lg p-3 text-sm flex flex-col gap-2">
-                {g.image_url && (
-                  <img src={g.image_url} alt="Prenda" className="w-full h-40 object-cover rounded" />
-                )}
-                <div className="font-medium">{g.title || g.category || "Prenda"}</div>
-                <div className="text-xs text-gray-500">
-                  {g.brand}
-                  {g.brand && g.color && " · "}
-                  {g.color}
+            {garments.map((g) => {
+              const dept = g.metadata?.department;
+              const tags = g.metadata?.tags || [];
+              const isFragrance = dept === "fragrance";
+
+              return (
+                <div
+                  key={g.id}
+                  className="border rounded-lg p-3 text-sm space-y-2"
+                >
+                  {g.image_url && (
+                    <img
+                      src={g.image_url}
+                      alt={g.title ?? "Prenda"}
+                      className="w-full h-40 object-cover rounded"
+                    />
+                  )}
+
+                  {/* Department badge */}
+                  {dept && (
+                    <span className="inline-block text-xs px-2 py-0.5 rounded bg-gray-800 text-white">
+                      {dept}
+                    </span>
+                  )}
+
+                  <div className="font-medium">
+                    {g.title || g.category || "Item"}
+                  </div>
+
+                  {/* Fragrance special line */}
+                  {isFragrance ? (
+                    <div className="text-xs text-gray-400 italic">
+                      {tags.join(" · ")}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-gray-500">
+                      {g.brand}
+                      {g.brand && g.color && " · "}
+                      {g.color}
+                    </div>
+                  )}
+
+                  {/* Tags */}
+                  {tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {tags.map((t) => (
+                        <span
+                          key={t}
+                          className="text-[10px] px-2 py-0.5 rounded-full bg-gray-200 text-gray-800"
+                        >
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
