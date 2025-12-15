@@ -16,40 +16,6 @@ type IngestRequestBody = {
   payload: { imageUrl: string };
 };
 
-function norm(s: string) {
-  return s.toLowerCase().trim().replace(/\s+/g, " ");
-}
-
-function titleCase(s: string) {
-  const t = s.trim();
-  if (!t) return t;
-  return t
-    .split(" ")
-    .filter(Boolean)
-    .map((w) => w[0]?.toUpperCase() + w.slice(1))
-    .join(" ");
-}
-
-/**
- * Catálogo: Marca + Color + Modelo
- * Ej: "GAP Gray Relaxed Gap Logo Zip Hoodie"
- */
-function buildCatalogName(input: {
-  brand?: string | null;
-  color?: string | null;
-  fit?: string | null;
-  model?: string | null; // vision catalog_name o garmentType/subcategory
-}) {
-  const brand = (input.brand ?? "").trim();
-  const color = (input.color ?? "").trim();
-  const fit = (input.fit ?? "").trim();
-  const model = (input.model ?? "").trim();
-
-  const parts = [brand, color, fit, model].filter(Boolean);
-  const name = parts.join(" ").replace(/\s+/g, " ").trim();
-  return name ? titleCase(name) : "Unknown Item";
-}
-
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as IngestRequestBody;
@@ -63,7 +29,7 @@ export async function POST(req: NextRequest) {
 
     if (body.mode !== "photo") {
       return NextResponse.json(
-        { error: "Invalid mode. Only 'photo' supported for now." },
+        { error: "Invalid mode. Only 'photo' supported." },
         { status: 400 }
       );
     }
@@ -76,121 +42,67 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1) Vision AI (NO tumba ingest si falla)
-    let visionResult: Awaited<ReturnType<typeof analyzeGarmentFromImageUrl>> = null;
+    // ─────────────────────────────────────
+    // 1) Vision AI (no rompe ingest si falla)
+    // ─────────────────────────────────────
+    let visionResult = null;
     let visionError: string | null = null;
 
     try {
       visionResult = await analyzeGarmentFromImageUrl(imageUrl);
     } catch (e: any) {
       visionError = e?.message ?? "unknown";
-      console.warn("Vision failed, continuing without classification:", visionError);
-      visionResult = null;
+      console.warn("Vision failed:", visionError);
     }
 
-    // 2) Tags (si vision falla -> [])
-    const finalTags = Array.isArray(visionResult?.tags)
+    // ─────────────────────────────────────
+    // 2) Category normalization
+    // ─────────────────────────────────────
+    const normalized = normalizeCategory({
+      garmentType: visionResult?.garmentType ?? null,
+      subcategory: visionResult?.subcategory ?? null,
+      tags: visionResult?.tags ?? [],
+      title: visionResult?.catalog_name ?? null,
+    });
+
+    // ─────────────────────────────────────
+    // 3) Base fields
+    // ─────────────────────────────────────
+    const finalCatalogName =
+      (visionResult?.catalog_name ?? "").trim() || "Unknown Item";
+
+    const finalTags: string[] = Array.isArray(visionResult?.tags)
       ? visionResult!.tags
-          .map((t) => norm(String(t)))
+          .map((t) => String(t).toLowerCase().trim())
           .filter(Boolean)
           .slice(0, 30)
       : [];
 
-    // 3) Normalización category/subcategory (si vision falla -> default tops)
-    const normalized = normalizeCategory({
-      garmentType: visionResult?.garmentType ?? null,
-      subcategory: visionResult?.subcategory ?? null,
+    // ─────────────────────────────────────
+    // 4) Style inference (FIXED TYPES)
+    // ─────────────────────────────────────
+    const fit = inferFit({
       tags: finalTags,
-      title: visionResult?.catalog_name ?? null,
+      title: finalCatalogName,
     });
 
-    // 4) Fit + Use case (nuevo)
-    const fit = inferFit({ tags: finalTags, title: visionResult?.catalog_name ?? null });
-
-    // 👇 FIX TS: forzamos UseCaseTag[] aunque TS infiera string[]
-    const useCaseTags = inferUseCaseTags({
+    const useCaseTags: UseCaseTag[] = inferUseCaseTags({
       tags: finalTags,
       category: normalized.category,
       subcategory: normalized.subcategory,
-      title: visionResult?.catalog_name ?? null,
-    }) as UseCaseTag[];
-
-    const useCase = pickPrimaryUseCase(useCaseTags);
-
-    // 5) Catalog name final (Marca + Color + Fit + Modelo)
-    // Modelo lo saco de (vision.catalog_name) o (vision.subcategory/garmentType) como fallback.
-    const model =
-      (visionResult?.catalog_name ?? "").trim() ||
-      (visionResult?.subcategory ?? "").trim() ||
-      (visionResult?.garmentType ?? "").trim();
-
-    const finalCatalogName = buildCatalogName({
-      brand: visionResult?.brand ?? null,
-      color: visionResult?.color ?? null,
-      fit,
-      model,
+      title: finalCatalogName,
     });
 
-    // Founder Edition fake user_id
+    const useCase: UseCaseTag = pickPrimaryUseCase(useCaseTags);
+
+    // ─────────────────────────────────────
+    // 5) Insert
+    // ─────────────────────────────────────
+    const supabase = getSupabaseServerClient();
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // 6) metadata.vision
-    const visionMetadata = visionResult
-      ? {
-          ok: true,
-          provider: visionResult.provider ?? "openai",
-          model: visionResult.model ?? null,
-          confidence: visionResult.confidence ?? null,
-
-          garmentType: visionResult.garmentType ?? null,
-          subcategory: visionResult.subcategory ?? null,
-          brand: visionResult.brand ?? null,
-          color: visionResult.color ?? null,
-          material: visionResult.material ?? null,
-          size: visionResult.size ?? null,
-
-          catalog_name: finalCatalogName,
-          tags: finalTags,
-
-          normalized: {
-            category: normalized.category,
-            subcategory: normalized.subcategory,
-          },
-
-          style: {
-            fit,
-            use_case: useCase,
-            use_case_tags: useCaseTags,
-          },
-
-          raw: visionResult.raw ?? null,
-        }
-      : {
-          ok: false,
-          reason:
-            "Vision unavailable (missing OPENAI_API_KEY) or Vision error. Inserted without classification.",
-          normalized: {
-            category: normalized.category,
-            subcategory: normalized.subcategory,
-          },
-          style: {
-            fit,
-            use_case: useCase,
-            use_case_tags: useCaseTags,
-          },
-          vision_error: visionError,
-        };
-
-    // 7) Insert en garments
-    const supabase = getSupabaseServerClient();
-
-    const garmentToInsert: Record<string, any> = {
+    const garmentToInsert = {
       user_id: fakeUserId,
-
-      // ✅ IMPORTANTE: tu DB requiere source NOT NULL
-      source: "photo",
-      source_id: null,
-
       image_url: imageUrl,
 
       category: normalized.category,
@@ -199,13 +111,10 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
-      // NUEVO (ya creaste columnas)
       fit,
       use_case: useCase,
       use_case_tags: useCaseTags,
 
-      // opcionales (según tu schema)
-      brand: visionResult?.brand ?? null,
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
       size: visionResult?.size ?? null,
@@ -213,8 +122,31 @@ export async function POST(req: NextRequest) {
       quantity: 1,
 
       metadata: {
-        ...(visionResult?.metadata ?? {}),
-        vision: visionMetadata,
+        vision: visionResult
+          ? {
+              ok: true,
+              provider: visionResult.provider,
+              model: visionResult.model,
+              confidence: visionResult.confidence,
+              normalized,
+              style: {
+                fit,
+                use_case: useCase,
+                use_case_tags: useCaseTags,
+              },
+              raw: visionResult.raw,
+            }
+          : {
+              ok: false,
+              reason: "Vision unavailable",
+              vision_error: visionError,
+              normalized,
+              style: {
+                fit,
+                use_case: useCase,
+                use_case_tags: useCaseTags,
+              },
+            },
       },
     };
 
