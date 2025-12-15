@@ -65,16 +65,34 @@ function titleCase(s: string) {
     .join(" ");
 }
 
+/**
+ * Responses API puede devolver el output en distintos lugares.
+ * Esta función intenta extraer el JSON como string.
+ */
 function extractOutputText(resJson: any): string | null {
-  // Responses API: output_text (más común)
+  // Muchos responses devuelven output_text directo
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
-  // Fallbacks
+  // Otros: output[0].content[0].text/value
   const first = resJson?.output?.[0];
   const c0 = first?.content?.[0];
 
   if (typeof c0?.text === "string") return c0.text;
   if (typeof c0?.value === "string") return c0.value;
+
+  // Fallback adicional: buscar cualquier content con text
+  const out = resJson?.output;
+  if (Array.isArray(out)) {
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (typeof c?.text === "string") return c.text;
+          if (typeof c?.value === "string") return c.value;
+        }
+      }
+    }
+  }
 
   return null;
 }
@@ -94,6 +112,8 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
   const color = safeString(parsed?.color);
   const material = safeString(parsed?.material);
   const size = safeString(parsed?.size);
+  const garmentType = safeString(parsed?.garmentType);
+  const subcategory = safeString(parsed?.subcategory);
 
   return {
     provider: "openai",
@@ -101,8 +121,8 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
 
     catalog_name: titleCase(catalog),
 
-    garmentType: safeString(parsed?.garmentType),
-    subcategory: safeString(parsed?.subcategory),
+    garmentType,
+    subcategory,
 
     brand,
     color,
@@ -117,13 +137,12 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
     metadata: {
       raw_notes: rawNotes,
       tags,
+      garmentType,
+      subcategory,
       brand,
       color,
       material,
       size,
-      garmentType: safeString(parsed?.garmentType),
-      subcategory: safeString(parsed?.subcategory),
-      catalog_name: titleCase(catalog),
       confidence: clamp01(parsed?.confidence, 0.6),
     },
 
@@ -135,32 +154,39 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
 }
 
 /**
- * Vision “oficial” para usar desde /api/ingest
- * - Si falta OPENAI_API_KEY o Vision falla: devuelve null (no rompe ingest)
+ * Función “oficial” para usar desde /api/ingest
+ * - Si falta OPENAI_API_KEY o Vision falla: devuelve null (NO rompe ingest)
  */
 export async function analyzeGarmentFromImageUrl(
   imageUrl: string
 ): Promise<VisionResult | null> {
   const apiKey = process.env.OPENAI_API_KEY;
 
-  // Si no hay key, no rompemos ingest: devolvemos null y route.ts hace fallback
+  // Si no hay key, no rompemos ingest
   if (!apiKey) return null;
 
   const system = `
 You are VESTI Vision AI. Analyze a single product photo (clothing, shoes, accessories, or fragrance).
 Return ONLY valid JSON (no markdown, no commentary).
 
+Return schema (JSON object):
+{
+  "catalog_name": "Title Case 3-6 words",
+  "garmentType": "free text item type",
+  "subcategory": "more specific type or null",
+  "brand": "brand if clearly visible else null",
+  "color": "main color(s) else null",
+  "material": "material if inferable else null",
+  "size": "size if visible else null",
+  "tags": ["6-14 concise tags, no duplicates"],
+  "confidence": 0.0-1.0,
+  "raw_notes": "one short sentence describing what you saw"
+}
+
 Rules:
-- catalog_name: short catalog-style name (3-6 words), Title Case. Example: "Black Oversized Zip Hoodie".
-- garmentType: free text describing the item type (e.g. "hoodie", "sneakers", "trousers", "perfume bottle").
-- subcategory: more specific type if possible (e.g. "zip hoodie", "running sneaker", "crewneck tee").
-- brand: only if clearly visible; otherwise null.
-- color: main color(s) in simple terms (e.g. "black", "white", "navy").
-- material: if reasonably inferable; else null.
-- size: if visible (e.g. "M", "10", "32W"); else null.
-- tags: 6-14 concise tags. Must be nouns/adjectives. No duplicates.
-- confidence: number 0 to 1.
-- raw_notes: one short sentence about what you saw.
+- catalog_name MUST be short and catalog-like, e.g. "Black Oversized Zip Hoodie".
+- tags MUST be useful for wardrobe search. Avoid verbs. Use nouns/adjectives.
+- If uncertain, set brand/material/size to null.
 `.trim();
 
   try {
@@ -176,7 +202,8 @@ Rules:
           ],
         },
       ],
-      response_format: { type: "json_object" },
+      // ✅ IMPORTANT: Responses API moved response_format -> text.format
+      text: { format: { type: "json_object" } },
     };
 
     const res = await fetch("https://api.openai.com/v1/responses", {
@@ -196,6 +223,7 @@ Rules:
 
     const json = await res.json();
 
+    // 1) Intentar extraer JSON como texto
     const outputText = extractOutputText(json);
 
     let parsed: any = null;
@@ -208,7 +236,7 @@ Rules:
         return null;
       }
     } else {
-      // fallback: algunas variantes podrían traer json directo
+      // 2) fallback: algunas variantes podrían traer json directo
       const maybeObj = json?.output?.[0]?.content?.[0]?.json;
       if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
     }
