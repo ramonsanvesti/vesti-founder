@@ -1,16 +1,14 @@
-// app/api/ingest/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 import { analyzeGarmentFromImageUrl } from "@/lib/vision";
 import { normalizeCategory } from "@/lib/category";
+import { inferFit, inferUseCaseTags, pickPrimaryUseCase } from "@/lib/style";
 
 type IngestMode = "photo";
 
 type IngestRequestBody = {
   mode: IngestMode;
-  payload: {
-    imageUrl: string;
-  };
+  payload: { imageUrl: string };
 };
 
 export async function POST(req: NextRequest) {
@@ -39,17 +37,19 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1) Vision AI (NO debe tumbar ingest si falla)
+    // 1) Vision AI (NO tumba ingest si falla)
     let visionResult: Awaited<ReturnType<typeof analyzeGarmentFromImageUrl>> = null;
+    let visionError: string | null = null;
 
     try {
       visionResult = await analyzeGarmentFromImageUrl(imageUrl);
     } catch (e: any) {
-      console.warn("Vision failed, continuing without classification:", e?.message);
+      visionError = e?.message ?? "unknown";
+      console.warn("Vision failed, continuing without classification:", visionError);
       visionResult = null;
     }
 
-    // 2) Normalización a categorías VESTI
+    // 2) Normalización categoría (usa lo que haya: Vision o fallback)
     const normalized = normalizeCategory({
       garmentType: visionResult?.garmentType ?? null,
       subcategory: visionResult?.subcategory ?? null,
@@ -57,7 +57,8 @@ export async function POST(req: NextRequest) {
       title: visionResult?.catalog_name ?? null,
     });
 
-    // 3) Campos finales
+    // 3) Brand/Color/Fit/Model vienen de Vision.ts (si existe)
+    // catalog_name ya viene armado Brand + Color + Fit + Model
     const finalCatalogName = (visionResult?.catalog_name ?? "").trim() || "unknown";
 
     const finalTags = Array.isArray(visionResult?.tags)
@@ -67,19 +68,36 @@ export async function POST(req: NextRequest) {
           .slice(0, 30)
       : [];
 
+    // 4) Fit + Use case (si Vision ya trae fit/use_case, úsalo; si no, infiere)
+    const fit =
+      (visionResult?.fit ? String(visionResult.fit) : null) ||
+      inferFit({ tags: finalTags, title: finalCatalogName });
+
+    const useCaseTags =
+      (Array.isArray(visionResult?.use_case_tags) && visionResult!.use_case_tags.length
+        ? visionResult!.use_case_tags.map((t) => String(t).toLowerCase().trim()).filter(Boolean)
+        : null) ||
+      inferUseCaseTags({
+        tags: finalTags,
+        category: normalized.category,
+        subcategory: normalized.subcategory,
+        title: finalCatalogName,
+      });
+
+    const useCase =
+      (visionResult?.use_case ? String(visionResult.use_case) : null) ||
+      pickPrimaryUseCase(useCaseTags);
+
     // Founder Edition fake user_id
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // 4) metadata.vision
+    // 5) metadata.vision (incluye todo, y deja trazabilidad de fallback)
     const visionMetadata = visionResult
       ? {
           ok: true,
           provider: visionResult.provider ?? "openai",
-          model: visionResult.model ?? null,
+          model: visionResult.model_id ?? null,
           confidence: visionResult.confidence ?? null,
-
-          catalog_name: finalCatalogName,
-          tags: finalTags,
 
           garmentType: visionResult.garmentType ?? null,
           subcategory: visionResult.subcategory ?? null,
@@ -89,12 +107,19 @@ export async function POST(req: NextRequest) {
           material: visionResult.material ?? null,
           size: visionResult.size ?? null,
 
-          fit: visionResult.fit ?? null,
-          use_case: visionResult.use_case ?? null,
+          model_name: visionResult.model ?? null,
+          catalog_name: finalCatalogName,
+          tags: finalTags,
 
           normalized: {
             category: normalized.category,
             subcategory: normalized.subcategory,
+          },
+
+          style: {
+            fit,
+            use_case: useCase,
+            use_case_tags: useCaseTags,
           },
 
           raw: visionResult.raw ?? null,
@@ -107,17 +132,22 @@ export async function POST(req: NextRequest) {
             category: normalized.category,
             subcategory: normalized.subcategory,
           },
-          vision_error: null,
+          style: {
+            fit,
+            use_case: useCase,
+            use_case_tags: useCaseTags,
+          },
+          vision_error: visionError,
         };
 
-    // 5) Insert en garments
+    // 6) Insert en garments
+    // Nota: tu tabla exige "source" NOT NULL -> lo seteamos siempre
     const supabase = getSupabaseServerClient();
 
     const garmentToInsert: Record<string, any> = {
       user_id: fakeUserId,
-
-      // ✅ tu constraint not null
-      source: "photo",
+      source: "photo", // <-- CLAVE para evitar el error NOT NULL
+      source_id: null,
 
       image_url: imageUrl,
 
@@ -127,16 +157,15 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
-      // opcionales (existen en tu tabla)
+      fit,
+      use_case: useCase,
+      use_case_tags: useCaseTags,
+
+      // opcionales (si existen)
       brand: visionResult?.brand ?? null,
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
       size: visionResult?.size ?? null,
-
-      // ✅ nuevas columnas que ya agregaste
-      fit: visionResult?.fit ?? null,
-      use_case: visionResult?.use_case ?? null,
-
       raw_text: visionResult?.raw_text ?? null,
       quantity: 1,
 
@@ -159,10 +188,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    return NextResponse.json(
-      { ok: true, garment: data },
-      { status: 200 }
-    );
+    return NextResponse.json({ ok: true, garment: data }, { status: 200 });
   } catch (err: any) {
     console.error("Error in /api/ingest:", err);
     return NextResponse.json(

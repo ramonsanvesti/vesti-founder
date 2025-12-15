@@ -15,9 +15,13 @@ export type VisionResult = {
   material: string | null;
   size: string | null;
 
-  // Jerarquía extra
-  fit: string | null; // oversized, relaxed, regular, slim, cropped, longline
-  use_case: string | null; // casual, streetwear, work, athletic, formal, lounge
+  // Jerarquía nueva
+  fit: string | null; // oversized, relaxed, slim, regular
+  use_case: string | null; // casual, streetwear, work, athletic
+  use_case_tags: string[]; // text[]
+
+  // Modelo “humano”
+  model: string | null; // "Gap Logo Zip Hoodie", etc.
 
   // Tags final (normalizados)
   tags: string[];
@@ -31,7 +35,7 @@ export type VisionResult = {
 
   // Para trazabilidad
   provider: "openai";
-  model: string | null;
+  model_id: string | null;
 
   // Respuesta raw completa
   raw: any;
@@ -60,7 +64,7 @@ function clamp01(n: any, fallback = 0.6) {
   return Math.max(0, Math.min(1, n));
 }
 
-function titleCase(s: string) {
+function titleCaseLoose(s: string) {
   return s
     .toLowerCase()
     .split(" ")
@@ -69,8 +73,25 @@ function titleCase(s: string) {
     .join(" ");
 }
 
+function joinParts(parts: Array<string | null | undefined>) {
+  return parts.map((p) => (p ?? "").trim()).filter(Boolean).join(" ");
+}
+
+function cleanBrand(b: string | null) {
+  if (!b) return null;
+  const t = b.trim();
+  if (!t) return null;
+  if (t.toLowerCase() === "gap") return "GAP";
+  return t;
+}
+
+function normEnumLike(s: string | null) {
+  if (!s) return null;
+  return s.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
 function extractOutputText(resJson: any): string | null {
-  // Responses API
+  // Responses API puede devolver output_text o dentro de output[0].content[0].text
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
   const first = resJson?.output?.[0];
@@ -82,32 +103,63 @@ function extractOutputText(resJson: any): string | null {
   return null;
 }
 
-function finalizeVision(parsed: any, rawResponse: any): VisionResult {
-  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(0, 30);
+function extractModelId(resJson: any): string | null {
+  return safeString(resJson?.model);
+}
 
-  const catalog =
-    safeString(parsed?.catalog_name) ||
-    safeString(parsed?.title) ||
-    "Unknown Item";
+function finalizeVision(parsed: any, rawResponse: any): VisionResult {
+  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(
+    0,
+    30
+  );
+
+  const brand = cleanBrand(safeString(parsed?.brand));
+  const colorRaw = safeString(parsed?.color);
+  const color = colorRaw ? titleCaseLoose(colorRaw) : null;
+
+  const fitRaw = safeString(parsed?.fit);
+  const fit = fitRaw ? titleCaseLoose(fitRaw) : null;
+
+  const useCaseRaw = safeString(parsed?.use_case);
+  const use_case = useCaseRaw ? normEnumLike(useCaseRaw) : null;
+
+  const useCaseTags = uniq(
+    (parsed?.use_case_tags ?? [])
+      .map((t: any) => normTag(String(t)))
+      .filter(Boolean)
+  ).slice(0, 20);
+
+  const modelRaw =
+    safeString(parsed?.model) ||
+    safeString(parsed?.subcategory) ||
+    safeString(parsed?.garmentType) ||
+    "Item";
+  const model = titleCaseLoose(modelRaw);
+
+  // Brand + Color + Fit + Model
+  const catalog_name = joinParts([brand, color, fit, model]) || "Unknown Item";
 
   const rawNotes = safeString(parsed?.raw_notes);
 
   return {
     provider: "openai",
-    model: safeString(rawResponse?.model) ?? "unknown",
+    model_id: extractModelId(rawResponse) ?? "unknown",
 
-    catalog_name: titleCase(catalog),
+    catalog_name,
 
     garmentType: safeString(parsed?.garmentType),
     subcategory: safeString(parsed?.subcategory),
 
-    brand: safeString(parsed?.brand),
-    color: safeString(parsed?.color),
+    brand,
+    color: colorRaw,
     material: safeString(parsed?.material),
     size: safeString(parsed?.size),
 
-    fit: safeString(parsed?.fit),
-    use_case: safeString(parsed?.use_case),
+    fit: fitRaw ? normEnumLike(fitRaw) : null,
+    use_case,
+    use_case_tags: useCaseTags,
+
+    model: modelRaw,
 
     tags,
 
@@ -117,12 +169,14 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
     metadata: {
       raw_notes: rawNotes,
       tags,
-      brand: safeString(parsed?.brand),
-      color: safeString(parsed?.color),
+      brand,
+      color: colorRaw,
       material: safeString(parsed?.material),
       size: safeString(parsed?.size),
-      fit: safeString(parsed?.fit),
-      use_case: safeString(parsed?.use_case),
+      model: modelRaw,
+      fit: fitRaw ? normEnumLike(fitRaw) : null,
+      use_case,
+      use_case_tags: useCaseTags,
     },
 
     raw: {
@@ -140,31 +194,26 @@ export async function analyzeGarmentFromImageUrl(
   imageUrl: string
 ): Promise<VisionResult | null> {
   const apiKey = process.env.OPENAI_API_KEY;
-
-  // Si no hay key, no rompemos ingest: devolvemos null y route.ts hace fallback
   if (!apiKey) return null;
 
   const system = `
 You are VESTI Vision AI. Analyze a single product photo (clothing, shoes, accessories, or fragrance).
-Return ONLY valid JSON. No markdown. No commentary.
+Return ONLY valid JSON (no markdown, no commentary).
 
-Return a JSON object with exactly these fields:
-- catalog_name: short catalog-style name (3-6 words), Title Case. Example: "Gray Logo Zip Hoodie".
-- garmentType: free text describing item type (e.g. "hoodie", "sneakers", "trousers", "perfume bottle").
-- subcategory: more specific type if possible (e.g. "zip hoodie", "running sneaker", "crewneck tee").
-- brand: only if clearly visible; otherwise null.
-- color: main color(s) in simple terms (e.g. "black", "gray", "navy").
-- material: if reasonably inferable; else null.
-- size: if visible (e.g. "M", "10", "32W"); else null.
-- fit: one of ["oversized","relaxed","regular","slim","cropped","longline"] or null.
-- use_case: one of ["casual","streetwear","work","athletic","formal","lounge"] or null.
-- tags: 6-14 concise tags. Must be nouns/adjectives. No duplicates.
-- confidence: number 0 to 1.
+Return JSON with these keys:
+- brand: string|null (only if clearly visible)
+- color: string|null (main color(s) in simple terms)
+- garmentType: string|null (e.g. "hoodie", "sneakers", "trousers", "beanie", "perfume bottle")
+- subcategory: string|null (more specific type if possible)
+- model: string|null (concise model name with distinguishing features; e.g. "Gap Logo Zip Hoodie")
+- fit: one of ["oversized","relaxed","slim","regular"] or null
+- use_case: one of ["casual","streetwear","work","athletic"] or null
+- use_case_tags: array of 3-8 tags aligned to use_case (e.g. ["layering","everyday","errands"])
+- material: string|null
+- size: string|null (only if visible)
+- tags: 6-14 concise tags (nouns/adjectives). No duplicates.
+- confidence: number 0..1
 - raw_notes: one short sentence about what you saw.
-
-Important:
-- If uncertain, use null for brand/material/size/fit/use_case.
-- tags must be lower-noise and useful for wardrobe search.
 `;
 
   try {
@@ -175,12 +224,12 @@ Important:
         {
           role: "user",
           content: [
-            { type: "input_text", text: "Analyze this image and extract the fields." },
+            { type: "input_text", text: "Analyze this image and extract the fields as JSON." },
             { type: "input_image", image_url: imageUrl },
           ],
         },
       ],
-      // ✅ nuevo formato (Responses API)
+      // IMPORTANT: Responses API usa text.format (no response_format)
       text: { format: { type: "json_object" } },
     };
 
