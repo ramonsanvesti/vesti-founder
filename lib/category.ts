@@ -46,7 +46,10 @@ export function normalizeCategory(input: {
     blob.includes("eau de toilette") ||
     blob.includes("parfum")
   ) {
-    return { category: "fragrance", subcategory: pickSubcategory(sub, g, "fragrance") };
+    return {
+      category: "fragrance",
+      subcategory: pickSubcategory(sub, g, "fragrance"),
+    };
   }
 
   // 2) shoes
@@ -92,7 +95,10 @@ export function normalizeCategory(input: {
     blob.includes("sunglass") ||
     blob.includes("sunglasses")
   ) {
-    return { category: "accessories", subcategory: pickSubcategory(sub, g, "accessories") };
+    return {
+      category: "accessories",
+      subcategory: pickSubcategory(sub, g, "accessories"),
+    };
   }
 
   // 4) outerwear
@@ -108,7 +114,10 @@ export function normalizeCategory(input: {
     blob.includes("blazer") ||
     blob.includes("overcoat")
   ) {
-    return { category: "outerwear", subcategory: pickSubcategory(sub, g, "outerwear") };
+    return {
+      category: "outerwear",
+      subcategory: pickSubcategory(sub, g, "outerwear"),
+    };
   }
 
   // Hoodies: tú decides si van a tops u outerwear. Yo los pongo en outerwear.
@@ -119,9 +128,12 @@ export function normalizeCategory(input: {
     blob.includes("full zip") ||
     blob.includes("half zip") ||
     blob.includes("quarter zip") ||
-    blob.includes("fleece") && blob.includes("hood")
+    (blob.includes("fleece") && blob.includes("hood"))
   ) {
-    return { category: "outerwear", subcategory: pickSubcategory(sub, g, "hoodie") };
+    return {
+      category: "outerwear",
+      subcategory: pickSubcategory(sub, g, "hoodie"),
+    };
   }
 
   // 5) bottoms
@@ -142,7 +154,10 @@ export function normalizeCategory(input: {
     blob.includes("skirt") ||
     blob.includes("leggings")
   ) {
-    return { category: "bottoms", subcategory: pickSubcategory(sub, g, "bottoms") };
+    return {
+      category: "bottoms",
+      subcategory: pickSubcategory(sub, g, "bottoms"),
+    };
   }
 
   // 6) tops (default razonable)
