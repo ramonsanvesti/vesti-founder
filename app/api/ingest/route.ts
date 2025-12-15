@@ -32,10 +32,7 @@ export async function POST(req: NextRequest) {
 
     const imageUrl = String(body.payload.imageUrl).trim();
     if (!imageUrl) {
-      return NextResponse.json(
-        { error: "payload.imageUrl is empty" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "payload.imageUrl is empty" }, { status: 400 });
     }
 
     // 1) Vision AI (NO debe tumbar ingest si falla)
@@ -57,8 +54,7 @@ export async function POST(req: NextRequest) {
     });
 
     // 3) Campos finales
-    const finalCatalogName =
-      (visionResult?.catalog_name ?? "").trim() || "unknown";
+    const finalCatalogName = (visionResult?.catalog_name ?? "").trim() || "unknown";
 
     const finalTags = Array.isArray(visionResult?.tags)
       ? visionResult!.tags
@@ -109,6 +105,11 @@ export async function POST(req: NextRequest) {
 
     const garmentToInsert: Record<string, any> = {
       user_id: fakeUserId,
+
+      // ✅ REQUIRED by your DB (NOT NULL)
+      source: "photo",
+      source_id: null,
+
       image_url: imageUrl,
 
       category: normalized.category,
@@ -117,7 +118,7 @@ export async function POST(req: NextRequest) {
       catalog_name: finalCatalogName,
       tags: finalTags,
 
-      // columnas opcionales (según tu screenshot existen)
+      // columnas opcionales
       color: visionResult?.color ?? null,
       material: visionResult?.material ?? null,
       size: visionResult?.size ?? null,
@@ -144,10 +145,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    return NextResponse.json(
-      { ok: true, garment: data },
-      { status: 200 }
-    );
+    return NextResponse.json({ ok: true, garment: data }, { status: 200 });
   } catch (err: any) {
     console.error("Error in /api/ingest:", err);
     return NextResponse.json(
