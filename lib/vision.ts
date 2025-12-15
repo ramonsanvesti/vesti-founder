@@ -22,7 +22,7 @@ export type VisionResult = {
   confidence: number; // 0..1
   raw_text: string | null;
 
-  // Para metadata.vision
+  // Para metadata.vision (limpio)
   metadata: Record<string, any>;
 
   // Para trazabilidad
@@ -66,9 +66,10 @@ function titleCase(s: string) {
 }
 
 function extractOutputText(resJson: any): string | null {
-  // Respuestas típicas en Responses API
+  // Responses API: output_text (más común)
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
+  // Fallbacks
   const first = resJson?.output?.[0];
   const c0 = first?.content?.[0];
 
@@ -79,14 +80,20 @@ function extractOutputText(resJson: any): string | null {
 }
 
 function finalizeVision(parsed: any, rawResponse: any): VisionResult {
-  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(0, 30);
+  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(
+    0,
+    30
+  );
 
   const catalog =
-    safeString(parsed?.catalog_name) ||
-    safeString(parsed?.title) ||
-    "Unknown Item";
+    safeString(parsed?.catalog_name) || safeString(parsed?.title) || "Unknown Item";
 
   const rawNotes = safeString(parsed?.raw_notes);
+
+  const brand = safeString(parsed?.brand);
+  const color = safeString(parsed?.color);
+  const material = safeString(parsed?.material);
+  const size = safeString(parsed?.size);
 
   return {
     provider: "openai",
@@ -97,10 +104,10 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
     garmentType: safeString(parsed?.garmentType),
     subcategory: safeString(parsed?.subcategory),
 
-    brand: safeString(parsed?.brand),
-    color: safeString(parsed?.color),
-    material: safeString(parsed?.material),
-    size: safeString(parsed?.size),
+    brand,
+    color,
+    material,
+    size,
 
     tags,
 
@@ -108,13 +115,16 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
     raw_text: rawNotes,
 
     metadata: {
-      // aquí puedes agregar campos extra que quieras guardar “limpios”
       raw_notes: rawNotes,
       tags,
-      brand: safeString(parsed?.brand),
-      color: safeString(parsed?.color),
-      material: safeString(parsed?.material),
-      size: safeString(parsed?.size),
+      brand,
+      color,
+      material,
+      size,
+      garmentType: safeString(parsed?.garmentType),
+      subcategory: safeString(parsed?.subcategory),
+      catalog_name: titleCase(catalog),
+      confidence: clamp01(parsed?.confidence, 0.6),
     },
 
     raw: {
@@ -125,7 +135,8 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
 }
 
 /**
- * Nombre “oficial” para usar desde /api/ingest
+ * Vision “oficial” para usar desde /api/ingest
+ * - Si falta OPENAI_API_KEY o Vision falla: devuelve null (no rompe ingest)
  */
 export async function analyzeGarmentFromImageUrl(
   imageUrl: string
@@ -139,77 +150,74 @@ export async function analyzeGarmentFromImageUrl(
 You are VESTI Vision AI. Analyze a single product photo (clothing, shoes, accessories, or fragrance).
 Return ONLY valid JSON (no markdown, no commentary).
 
-Output schema:
-{
-  "catalog_name": "Title Case 3-6 words",
-  "garmentType": "free text type",
-  "subcategory": "more specific type or null",
-  "brand": "brand if clearly visible else null",
-  "color": "main color(s) simple terms or null",
-  "material": "material if reasonably inferable else null",
-  "size": "size if visible (S/M/L/XL/number) else null",
-  "tags": ["6-14 concise tags, nouns/adjectives, lowercase ok, no duplicates"],
-  "confidence": 0.0-1.0,
-  "raw_notes": "one short sentence describing what you saw"
-}
-
 Rules:
-- catalog_name MUST be short and catalog-style.
-- tags MUST be concise and useful for filtering.
-- If unsure, use null rather than guessing brand/material/size.
-`;
+- catalog_name: short catalog-style name (3-6 words), Title Case. Example: "Black Oversized Zip Hoodie".
+- garmentType: free text describing the item type (e.g. "hoodie", "sneakers", "trousers", "perfume bottle").
+- subcategory: more specific type if possible (e.g. "zip hoodie", "running sneaker", "crewneck tee").
+- brand: only if clearly visible; otherwise null.
+- color: main color(s) in simple terms (e.g. "black", "white", "navy").
+- material: if reasonably inferable; else null.
+- size: if visible (e.g. "M", "10", "32W"); else null.
+- tags: 6-14 concise tags. Must be nouns/adjectives. No duplicates.
+- confidence: number 0 to 1.
+- raw_notes: one short sentence about what you saw.
+`.trim();
 
-  const body = {
-    model: "gpt-4.1-mini",
-    input: [
-      { role: "system", content: system },
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: "Analyze this image and extract the JSON fields." },
-          { type: "input_image", image_url: imageUrl },
-        ],
-      },
-    ],
-    response_format: { type: "json_object" },
-  };
-
-  const res = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Vision request failed: ${res.status} ${txt}`);
-  }
-
-  const json = await res.json();
-
-  // 1) intentamos output_text
-  const outputText = extractOutputText(json);
-
-  // 2) fallback: algunos outputs vienen como objeto ya
-  const maybeObj = json?.output?.[0]?.content?.[0]?.json;
-
-  if (!outputText && maybeObj && typeof maybeObj === "object") {
-    return finalizeVision(maybeObj, json);
-  }
-
-  if (!outputText || typeof outputText !== "string") {
-    throw new Error("Vision returned no parsable output");
-  }
-
-  let parsed: any;
   try {
-    parsed = JSON.parse(outputText);
-  } catch {
-    throw new Error("Vision output was not valid JSON");
-  }
+    const body = {
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "Analyze this image and extract the fields." },
+            { type: "input_image", image_url: imageUrl },
+          ],
+        },
+      ],
+      response_format: { type: "json_object" },
+    };
 
-  return finalizeVision(parsed, json);
+    const res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.warn("Vision request failed:", res.status, txt);
+      return null;
+    }
+
+    const json = await res.json();
+
+    const outputText = extractOutputText(json);
+
+    let parsed: any = null;
+
+    if (outputText) {
+      try {
+        parsed = JSON.parse(outputText);
+      } catch {
+        console.warn("Vision output was not valid JSON:", outputText);
+        return null;
+      }
+    } else {
+      // fallback: algunas variantes podrían traer json directo
+      const maybeObj = json?.output?.[0]?.content?.[0]?.json;
+      if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
+    }
+
+    if (!parsed) return null;
+
+    return finalizeVision(parsed, json);
+  } catch (err: any) {
+    console.warn("Vision failed (exception):", err?.message ?? err);
+    return null;
+  }
 }
