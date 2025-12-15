@@ -51,20 +51,19 @@ export default function WardrobePage() {
     setFile(selected);
   };
 
-  // 3) Subir a Supabase Storage + llamar /api/ingest
+  // 3) Subir imagen + llamar API ingest
   const handleUpload = async () => {
     if (!file) return;
 
     try {
       setUploading(true);
 
-      // 3.1 Crear nombre único
       const ext = file.name.split(".").pop() || "jpg";
       const fileName = `${Date.now()}-${Math.random()
         .toString(16)
         .slice(2)}.${ext}`;
 
-      // 3.2 Subir al bucket garments (público)
+      // 3.1 Subir a Storage
       const { error: uploadError } = await supabase.storage
         .from("garments")
         .upload(fileName, file, {
@@ -73,13 +72,13 @@ export default function WardrobePage() {
         });
 
       if (uploadError) {
-        console.error("Upload error:", uploadError);
-        alert("Error subiendo la imagen a Storage.");
+        console.error(uploadError);
+        alert("Error subiendo la imagen.");
         setUploading(false);
         return;
       }
 
-      // 3.3 Obtener URL pública
+      // 3.2 Obtener URL pública
       const { data: publicData } = supabase.storage
         .from("garments")
         .getPublicUrl(fileName);
@@ -87,12 +86,12 @@ export default function WardrobePage() {
       const publicUrl = publicData.publicUrl;
 
       if (!publicUrl) {
-        alert("No se pudo generar la URL pública.");
+        alert("No se pudo generar URL pública.");
         setUploading(false);
         return;
       }
 
-      // 3.4 Llamar a /api/ingest
+      // 3.3 Llamar API ingest
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -105,14 +104,14 @@ export default function WardrobePage() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         console.error("Ingest error:", err);
-        alert("Error creando la prenda (ingest).");
+        alert("Error creando la prenda.");
         setUploading(false);
         return;
       }
 
       const newGarment = (await res.json()) as Garment;
 
-      // 3.5 Actualizar UI
+      // 3.4 Actualizar UI
       setGarments((prev) => [newGarment, ...prev]);
       setFile(null);
 
@@ -121,7 +120,7 @@ export default function WardrobePage() {
 
       setUploading(false);
     } catch (err) {
-      console.error("Unexpected upload error:", err);
+      console.error("Unexpected error:", err);
       alert("Error inesperado.");
       setUploading(false);
     }
@@ -134,7 +133,7 @@ export default function WardrobePage() {
           VESTI · Wardrobe OS (Founder Edition)
         </h1>
         <p className="text-sm text-gray-500">
-          Sube una prenda por foto. Luego le inyectamos Vision AI.
+          Sube una prenda por foto. Luego conectamos Vision AI.
         </p>
       </header>
 
@@ -181,7 +180,7 @@ export default function WardrobePage() {
           <p className="text-sm text-gray-500">Cargando prendas…</p>
         ) : garments.length === 0 ? (
           <p className="text-sm text-gray-500">
-            Todavía no hay prendas. Sube tu primera foto arriba.
+            Todavía no hay prendas. Sube tu primera foto.
           </p>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
