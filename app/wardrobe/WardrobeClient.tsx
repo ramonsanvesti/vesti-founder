@@ -7,7 +7,6 @@ type Garment = {
   title: string | null;
   brand: string | null;
   category: string | null;
-  subcategory?: string | null;
   color: string | null;
   image_url: string | null;
 
@@ -23,23 +22,116 @@ type Garment = {
   updated_at?: string;
 };
 
+type UseCase =
+  | "casual"
+  | "streetwear"
+  | "work"
+  | "athletic"
+  | "formal"
+  | "winter"
+  | "summer"
+  | "travel"
+  | "lounge";
+
+type OutfitResponse = {
+  ok: boolean;
+  use_case: UseCase;
+  count: number;
+  outfits: Array<{
+    id: string;
+    use_case: UseCase;
+    confidence: number;
+    pieces: {
+      top: Garment;
+      bottom: Garment;
+      shoes: Garment;
+      outerwear?: Garment;
+      accessories: Garment[];
+      fragrance?: Garment;
+    };
+    reasoning: {
+      palette: string;
+      fit: string;
+      rules_applied: string[];
+      picks: Record<string, string[]>;
+    };
+  }>;
+};
+
 async function getSupabase() {
-  // dynamic import to avoid build-time env evaluation
   const mod = await import("@/lib/supabaseClientBrowser");
   return mod.getSupabaseBrowserClient();
+}
+
+function GarmentCard({ g, label }: { g: Garment; label?: string }) {
+  const displayName = g.catalog_name || g.title || g.category || "unknown";
+
+  const displayTags: string[] =
+    (Array.isArray(g.tags) && g.tags.length ? g.tags : null) ||
+    (Array.isArray(g.metadata?.tags) && g.metadata.tags.length ? g.metadata.tags : []) ||
+    [];
+
+  return (
+    <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
+      {label && (
+        <div className="text-[11px] uppercase tracking-wide text-gray-500">{label}</div>
+      )}
+
+      {g.image_url && (
+        <img
+          src={g.image_url}
+          alt={displayName}
+          className="w-full h-40 object-cover rounded"
+          loading="lazy"
+        />
+      )}
+
+      <div className="font-medium">{displayName}</div>
+
+      {(g.brand || g.color) && (
+        <div className="text-xs text-gray-500">
+          {g.brand ?? ""}
+          {g.brand && g.color ? " · " : ""}
+          {g.color ?? ""}
+        </div>
+      )}
+
+      {(g.fit || g.use_case) && (
+        <div className="text-xs text-gray-500">
+          {g.fit ? `fit: ${g.fit}` : ""}
+          {g.fit && g.use_case ? " · " : ""}
+          {g.use_case ? `use: ${g.use_case}` : ""}
+        </div>
+      )}
+
+      {displayTags.length > 0 && (
+        <div className="flex flex-wrap gap-2 pt-1">
+          {displayTags.slice(0, 14).map((t) => (
+            <span
+              key={t}
+              className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function WardrobeClient() {
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Upload by photo
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
-  // Add by text
-  const [query, setQuery] = useState("");
-  const [addingByText, setAddingByText] = useState(false);
+  // Outfit UI state
+  const [useCase, setUseCase] = useState<UseCase>("casual");
+  const [generating, setGenerating] = useState(false);
+  const [outfit, setOutfit] = useState<OutfitResponse["outfits"][0] | null>(null);
+  const [outfitError, setOutfitError] = useState<string | null>(null);
 
   const fetchGarments = async () => {
     try {
@@ -75,26 +167,20 @@ export default function WardrobeClient() {
     setFile(selected);
   };
 
-  const handleUploadByPhoto = async () => {
+  const handleUpload = async () => {
     if (!file) return;
 
     try {
       setUploading(true);
-
       const supabase = await getSupabase();
 
-      // 1) Unique file path
       const ext = file.name.split(".").pop() || "jpg";
       const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
       const filePath = fileName;
 
-      // 2) Upload to Storage bucket: garments
       const { error: uploadError } = await supabase.storage
         .from("garments")
-        .upload(filePath, file, {
-          cacheControl: "3600",
-          upsert: false,
-        });
+        .upload(filePath, file, { cacheControl: "3600", upsert: false });
 
       if (uploadError) {
         console.error("Upload error:", uploadError);
@@ -102,11 +188,7 @@ export default function WardrobeClient() {
         return;
       }
 
-      // 3) Public URL
-      const { data: publicData } = supabase.storage
-        .from("garments")
-        .getPublicUrl(filePath);
-
+      const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
       const publicUrl = publicData?.publicUrl;
 
       if (!publicUrl) {
@@ -115,35 +197,26 @@ export default function WardrobeClient() {
         return;
       }
 
-      // 4) Call ingest
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "photo",
-          payload: { imageUrl: publicUrl },
-        }),
+        body: JSON.stringify({ mode: "photo", payload: { imageUrl: publicUrl } }),
       });
 
-      const payload = await res.json().catch(() => ({}));
-
       if (!res.ok) {
-        console.error("Ingest error:", payload);
-        alert(payload?.error ? `Ingest error: ${payload.error}` : "Error creando la prenda (ingest).");
+        const err = await res.json().catch(() => ({}));
+        console.error("Ingest error:", err);
+        alert("Error creando la prenda (ingest).");
         return;
       }
 
-      const newGarment = payload?.garment as Garment | undefined;
+      // Tu endpoint retorna { ok:true, garment: data }
+      const payload = await res.json();
+      const newGarment = (payload?.garment ?? payload) as Garment;
 
-      // 5) Update UI optimistically
-      if (newGarment?.id) {
-        setGarments((prev) => [newGarment, ...prev]);
-      } else {
-        // fallback: refresh
-        await fetchGarments();
-      }
-
+      setGarments((prev) => [newGarment, ...prev]);
       setFile(null);
+
       const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
     } catch (err) {
@@ -154,69 +227,63 @@ export default function WardrobeClient() {
     }
   };
 
-  const handleAddByText = async () => {
-    const q = query.trim();
-    if (!q) return;
-
+  const handleGenerateOutfit = async () => {
     try {
-      setAddingByText(true);
+      setGenerating(true);
+      setOutfitError(null);
 
-      const res = await fetch("/api/ingest", {
+      const res = await fetch("/api/outfits/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          mode: "text",
-          payload: { query: q },
+          use_case: useCase,
+          count: 1,
+          include_outerwear: true,
+          accessories_max: 2,
+          include_fragrance: true,
         }),
       });
 
-      const payload = await res.json().catch(() => ({}));
+      const json = (await res.json().catch(() => null)) as OutfitResponse | any;
 
       if (!res.ok) {
-        console.error("Text ingest error:", payload);
-        alert(
-          payload?.error
-            ? `Text ingest error: ${payload.error}`
-            : "Error creando la prenda por texto."
-        );
+        console.error("Outfit generate error:", json);
+        setOutfit(null);
+        setOutfitError(json?.error || "No se pudo generar el outfit.");
         return;
       }
 
-      const newGarment = payload?.garment as Garment | undefined;
-
-      if (newGarment?.id) {
-        setGarments((prev) => [newGarment, ...prev]);
-      } else {
-        await fetchGarments();
+      const first = json?.outfits?.[0] ?? null;
+      if (!first) {
+        setOutfit(null);
+        setOutfitError("No se generó ningún outfit. Falta data (tops/bottoms/shoes).");
+        return;
       }
 
-      setQuery("");
-    } catch (err) {
-      console.error("Unexpected text ingest error:", err);
-      alert("Error inesperado.");
+      setOutfit(first);
+    } catch (e: any) {
+      console.error("Outfit generate exception:", e);
+      setOutfit(null);
+      setOutfitError(e?.message ?? "Error inesperado generando outfit.");
     } finally {
-      setAddingByText(false);
+      setGenerating(false);
     }
-  };
-
-  const onEnterAddByText = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") handleAddByText();
   };
 
   return (
     <main className="p-6 space-y-6">
-      <header>
+      <header className="space-y-1">
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
-          Sube una prenda por foto o agrégala por texto. Vision AI la clasifica automáticamente.
+          Sube una prenda por foto. Vision AI la clasifica automáticamente. Ahora también puedes generar outfits rules-based.
         </p>
       </header>
 
-      {/* Upload by photo */}
+      {/* Upload */}
       <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Upload by photo</h2>
+        <h2 className="text-lg font-medium">Agregar prenda (BY PHOTO)</h2>
 
-        <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-4">
           <input
             id="file-input"
             type="file"
@@ -226,7 +293,7 @@ export default function WardrobeClient() {
           />
 
           <button
-            onClick={handleUploadByPhoto}
+            onClick={handleUpload}
             disabled={!file || uploading}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
           >
@@ -239,32 +306,120 @@ export default function WardrobeClient() {
         </div>
       </section>
 
-      {/* Add by text */}
+      {/* Outfit Generation */}
       <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Add by text</h2>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <h2 className="text-lg font-medium">Outfit generation v1 (rules-based)</h2>
+            <p className="text-xs text-gray-500">
+              Requiere mínimo: 1 top, 1 bottom, 1 shoe. Usa fit, use_case, tags y paleta simple.
+            </p>
+          </div>
 
-        <div className="flex items-center gap-3 flex-wrap">
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={onEnterAddByText}
-            placeholder='Ej: "GAP Gray Relaxed Gap Logo Zip Hoodie"'
-            className="w-full sm:w-[520px] px-3 py-2 rounded-md border text-sm"
-          />
+          <div className="flex items-center gap-3">
+            <select
+              value={useCase}
+              onChange={(e) => setUseCase(e.target.value as UseCase)}
+              className="border rounded-md px-3 py-2 text-sm"
+            >
+              <option value="casual">casual</option>
+              <option value="streetwear">streetwear</option>
+              <option value="work">work</option>
+              <option value="athletic">athletic</option>
+              <option value="formal">formal</option>
+              <option value="winter">winter</option>
+              <option value="summer">summer</option>
+              <option value="travel">travel</option>
+              <option value="lounge">lounge</option>
+            </select>
 
-          <button
-            onClick={handleAddByText}
-            disabled={!query.trim() || addingByText}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
-          >
-            {addingByText ? "Agregando..." : "Agregar"}
-          </button>
+            <button
+              onClick={handleGenerateOutfit}
+              disabled={generating}
+              className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+            >
+              {generating ? "Generando..." : "Generate Outfit"}
+            </button>
+          </div>
         </div>
 
-        <p className="text-xs text-gray-500">
-          Esto busca una imagen en internet (Google CSE) y luego corre Vision AI sobre esa foto.
-        </p>
+        {outfitError && (
+          <div className="text-sm border rounded-md p-3 bg-white/5">
+            <div className="font-medium">No se pudo generar</div>
+            <div className="text-gray-500 text-xs mt-1">{outfitError}</div>
+          </div>
+        )}
+
+        {outfit && (
+          <div className="space-y-3">
+            {/* Reasoning */}
+            <div className="border rounded-lg p-3 text-sm">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="font-medium">Reasoning</div>
+                <div className="text-xs text-gray-500">
+                  confidence: {Math.round((outfit.confidence ?? 0) * 100)}%
+                </div>
+              </div>
+
+              <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-gray-600">
+                <div className="border rounded-md p-2">
+                  <div className="uppercase tracking-wide text-[11px] text-gray-500">use case</div>
+                  <div className="mt-1">{outfit.use_case}</div>
+                </div>
+                <div className="border rounded-md p-2">
+                  <div className="uppercase tracking-wide text-[11px] text-gray-500">fit</div>
+                  <div className="mt-1">{outfit.reasoning?.fit ?? "—"}</div>
+                </div>
+                <div className="border rounded-md p-2">
+                  <div className="uppercase tracking-wide text-[11px] text-gray-500">palette</div>
+                  <div className="mt-1">{outfit.reasoning?.palette ?? "—"}</div>
+                </div>
+              </div>
+
+              {Array.isArray(outfit.reasoning?.rules_applied) && outfit.reasoning.rules_applied.length > 0 && (
+                <div className="mt-3">
+                  <div className="uppercase tracking-wide text-[11px] text-gray-500">rules</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {outfit.reasoning.rules_applied.map((r) => (
+                      <span key={r} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
+                        {r}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <GarmentCard g={outfit.pieces.top} label="Top" />
+              <GarmentCard g={outfit.pieces.bottom} label="Bottom" />
+              <GarmentCard g={outfit.pieces.shoes} label="Shoes" />
+            </div>
+
+            {(outfit.pieces.outerwear || (outfit.pieces.accessories?.length ?? 0) > 0 || outfit.pieces.fragrance) && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {outfit.pieces.outerwear && <GarmentCard g={outfit.pieces.outerwear} label="Outerwear" />}
+
+                {/* Accessories */}
+                <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
+                  <div className="text-[11px] uppercase tracking-wide text-gray-500">Accessories</div>
+                  {outfit.pieces.accessories?.length ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {outfit.pieces.accessories.slice(0, 2).map((a) => (
+                        <GarmentCard key={a.id} g={a} />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-gray-500">—</div>
+                  )}
+                </div>
+
+                {outfit.pieces.fragrance && <GarmentCard g={outfit.pieces.fragrance} label="Fragrance" />}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Wardrobe Grid */}
@@ -280,67 +435,13 @@ export default function WardrobeClient() {
           <p className="text-sm text-gray-500">Cargando prendas…</p>
         ) : garments.length === 0 ? (
           <p className="text-sm text-gray-500">
-            Todavía no hay prendas. Sube tu primera foto o agrega por texto arriba.
+            Todavía no hay prendas. Sube tu primera foto arriba.
           </p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {garments.map((g) => {
-              const displayName = g.catalog_name || g.title || g.category || "Unknown";
-
-              const displayTags: string[] =
-                (Array.isArray(g.tags) && g.tags.length ? g.tags : null) ||
-                (Array.isArray(g.metadata?.tags) && g.metadata.tags.length ? g.metadata.tags : []) ||
-                [];
-
-              const metaVision = g.metadata?.vision;
-              const visionOk = metaVision?.ok === true;
-
-              return (
-                <div key={g.id} className="border rounded-lg p-3 text-sm flex flex-col gap-2">
-                  {g.image_url && (
-                    <img
-                      src={g.image_url}
-                      alt={displayName}
-                      className="w-full h-40 object-cover rounded"
-                      loading="lazy"
-                    />
-                  )}
-
-                  <div className="font-medium">{displayName}</div>
-
-                  <div className="text-xs text-gray-500">
-                    {(g.category ?? "unknown") + (g.subcategory ? ` · ${g.subcategory}` : "")}
-                    {g.fit ? ` · ${g.fit}` : ""}
-                    {g.use_case ? ` · ${g.use_case}` : ""}
-                  </div>
-
-                  {(g.brand || g.color) && (
-                    <div className="text-xs text-gray-500">
-                      {g.brand ?? ""}
-                      {g.brand && g.color ? " · " : ""}
-                      {g.color ?? ""}
-                    </div>
-                  )}
-
-                  <div className="text-[11px] text-gray-500">
-                    Vision: {visionOk ? "ok" : "off"}
-                  </div>
-
-                  {displayTags.length > 0 && (
-                    <div className="flex flex-wrap gap-2 pt-1">
-                      {displayTags.slice(0, 16).map((t) => (
-                        <span
-                          key={t}
-                          className="px-2 py-1 rounded-full text-xs border border-black/10 bg-black/5"
-                        >
-                          {t}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {garments.map((g) => (
+              <GarmentCard key={g.id} g={g} />
+            ))}
           </div>
         )}
       </section>
