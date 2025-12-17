@@ -152,10 +152,14 @@ Analyze ONE product photo (clothing, shoes, accessories, or fragrance).
 Return ONLY valid JSON. No markdown. No extra text.
 
 Hard requirements:
-- Produce 14 to 22 tags (concise, useful, non-duplicate).
-- tags must be simple nouns/adjectives (e.g. "hoodie", "zip", "pockets", "logo", "streetwear", "relaxed", "cotton", "winter").
-- If brand is not clearly visible, brand = null.
-- If you are unsure, prefer null instead of guessing.
+	•	Produce 12 to 25 tags.
+	•	Tags must be simple nouns/adjectives, lowercase, concise, and non-duplicate.
+	•	Tags must be visually grounded (no guessing sizes, gender, era, “designer”, “luxury”, etc.).
+	•	Include construction/details when visible (e.g., “zip”, “button”, “collar”, “hood”, “pockets”, “drawstring”, “logo”, “mesh”, “leather”, “knit”, “pleats”).
+	•	If brand is not clearly visible, “brand”: null.
+	•	If unsure about any field, prefer null over guessing.
+	•	If multiple items appear, identify the primary product and ignore background items.
+	•	If the photo is too unclear to classify, set category/subcategory/use_case to null, but still output the best tags you can from visible features.
 `;
 
   // JSON Schema estricto para que SIEMPRE venga igual
