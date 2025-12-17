@@ -271,71 +271,78 @@ export default function WardrobeClient() {
     }
   };
 
-  // ----------------------------
-  // Outfit generation
-  // ----------------------------
-  const resetOutfitUI = () => {
-    setOutfitError(null);
-    setOutfitWarnings([]);
-    setOutfitReasoning("");
-    setOutfitItems([]);
-  };
+ // ----------------------------
+// Outfit generation
+// ----------------------------
+const resetOutfitUI = () => {
+  setOutfitError(null);
+  setOutfitWarnings([]);
+  setOutfitReasoning("");
+  setOutfitItems([]);
+};
 
-  const generateOutfit = async (opts?: { regenerate?: boolean }) => {
-    try {
-      setGenerating(true);
-      resetOutfitUI();
+const generateOutfit = async (opts?: { regenerate?: boolean }) => {
+  try {
+    setGenerating(true);
+    resetOutfitUI();
 
-      const res = await fetch("/api/outfits/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          use_case: useCase,
-          include_accessory: includeAccessory,
-          include_fragrance: includeFragrance,
-          seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
-          exclude_ids: opts?.regenerate ? excludeIds : [],
-        }),
-      });
+    const res = await fetch("/api/outfits/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        use_case: useCase,
+        include_accessory: includeAccessory,
+        include_fragrance: includeFragrance,
+        seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
+        exclude_ids: opts?.regenerate ? excludeIds : [],
+      }),
+    });
 
-      const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
+    const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
 
-      if (!res.ok || !json?.ok) {
-        const msg = json?.details || json?.error || "Could not generate outfit.";
-        setOutfitError(msg);
-        console.error("Generate outfit error:", json);
-        return;
-      }
-
-      const items = Array.isArray(json.items) ? json.items : [];
-      if (items.length === 0) {
-        setOutfitError("No items returned.");
-        console.error("Generate outfit returned no items:", json);
-        return;
-      }
-
-      // IMPORTANT:
-      // outfit can be null; do NOT assume outfit.user_id exists.
-      setOutfitItems(items);
-      setOutfitReasoning(json.reasoning || "");
-      setOutfitWarnings(Array.isArray(json.warnings) ? json.warnings : []);
-
-      // Store seed outfit id if available (used for regenerate variations)
-      const newSeedId = json.outfit?.id ?? null;
-      if (newSeedId) setSeedOutfitId(newSeedId);
-
-      // Auto exclusion for next variation
-      const nextExclude = Array.isArray(json.next_exclude_ids) ? json.next_exclude_ids : [];
-      setExcludeIds(nextExclude);
-    } catch (e: any) {
-      console.error("Generate/save outfit error:", e);
-      setOutfitError(e?.message || "Unexpected error.");
-    } finally {
-      setGenerating(false);
+    if (!res.ok || !json || json.ok !== true) {
+      const msg =
+        json?.details ||
+        json?.error ||
+        "Could not generate outfit.";
+      setOutfitError(msg);
+      console.error("Generate outfit error:", json);
+      return;
     }
-  };
 
-  const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
+    // Defensive: items must exist and be array
+    const items: OutfitItem[] = Array.isArray(json.items) ? json.items : [];
+
+    if (items.length === 0) {
+      setOutfitError("No items returned. Add more garments first.");
+      console.error("Empty outfit result:", json);
+      return;
+    }
+
+    setOutfitItems(items);
+    setOutfitReasoning(typeof json.reasoning === "string" ? json.reasoning : "");
+    setOutfitWarnings(Array.isArray(json.warnings) ? json.warnings : []);
+
+    // Outfit can be null if persistence failed — that's OK
+    if (json.outfit && typeof json.outfit.id === "string") {
+      setSeedOutfitId(json.outfit.id);
+    }
+
+    // Auto exclusion for regenerate variations
+    if (Array.isArray(json.next_exclude_ids)) {
+      setExcludeIds(json.next_exclude_ids.filter((x): x is string => typeof x === "string"));
+    } else {
+      setExcludeIds([]);
+    }
+  } catch (err: any) {
+    console.error("Generate/save outfit error:", err);
+    setOutfitError(err?.message || "Unexpected error while generating outfit.");
+  } finally {
+    setGenerating(false);
+  }
+};
+
+const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
 
   // ----------------------------
   // Render helpers
