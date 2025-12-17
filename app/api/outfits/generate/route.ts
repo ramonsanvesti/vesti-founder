@@ -13,453 +13,438 @@ type UseCase =
   | "travel"
   | "lounge";
 
-type Slot = "top" | "bottom" | "shoe" | "outerwear" | "accessory";
-
-type GenerateRequest = {
-  use_case?: UseCase; // objetivo
-  exclude_ids?: string[]; // exclusión manual
-  seed_outfit_id?: string | null; // para "regenerate variation": excluye prendas de ese outfit
-  include_outerwear?: boolean; // opcional (default: false)
-};
-
 type GarmentRow = {
   id: string;
-  user_id: string;
-  category: string | null;
-  subcategory: string | null;
-  catalog_name: string | null;
-  image_url: string | null;
+  user_id: string | null;
 
-  brand: string | null;
-  color: string | null;
-  material: string | null;
-  size: string | null;
+  image_url: string | null;
+  catalog_name: string | null;
+
+  category: string | null; // tops, bottoms, outerwear, shoes, accessories, fragrance
+  subcategory: string | null;
 
   tags: string[] | null; // text[]
   fit: string | null; // text
   use_case: string | null; // text
   use_case_tags: string[] | null; // text[]
 
-  metadata: any; // jsonb
+  color: string | null;
+  material: string | null;
+
   created_at?: string;
 };
 
-function uniq<T>(arr: T[]) {
-  return Array.from(new Set(arr));
-}
+type OutfitSlot = "top" | "bottom" | "shoes" | "outerwear" | "accessory" | "fragrance";
+
+type GenerateRequestBody = {
+  use_case?: UseCase;
+  include_accessory?: boolean; // default true
+  include_fragrance?: boolean; // default false
+  seed_outfit_id?: string | null; // used for regenerate
+  exclude_ids?: unknown; // array-like, but we sanitize
+};
+
+type PickedItem = {
+  slot: OutfitSlot;
+  garment: GarmentRow;
+  reason: string; // human readable
+  score: number;
+};
 
 function norm(s: string) {
-  return s
-    .toLowerCase()
-    .trim()
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ");
+  return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
-function asArr(v: any): string[] {
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+
+function asStringArray(v: unknown): string[] {
   if (!v) return [];
-  if (Array.isArray(v)) return v.map((x) => String(x));
+  if (Array.isArray(v)) return v.filter(isString).map((x) => x.trim()).filter(Boolean);
   return [];
 }
 
-function safeStr(v: any): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  return t.length ? t : null;
+function uniqStrings(arr: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const a of arr) {
+    const s = a.trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
 }
 
-function containsAny(blob: string, needles: string[]) {
-  return needles.some((n) => blob.includes(n));
+function safeTags(g: GarmentRow): string[] {
+  return Array.isArray(g.tags) ? g.tags.filter(isString).map(norm).filter(Boolean) : [];
 }
 
-function pickPrimaryColor(color: string | null, tags: string[]) {
-  const blob = norm(`${color ?? ""} ${tags.join(" ")}`);
-  if (containsAny(blob, ["black"])) return "black";
-  if (containsAny(blob, ["white", "off white", "cream"])) return "white";
-  if (containsAny(blob, ["grey", "gray", "charcoal"])) return "grey";
-  if (containsAny(blob, ["navy"])) return "navy";
-  if (containsAny(blob, ["brown", "tan", "khaki", "beige"])) return "brown";
-  if (containsAny(blob, ["green", "olive"])) return "green";
-  if (containsAny(blob, ["red", "burgundy", "maroon"])) return "red";
-  if (containsAny(blob, ["blue"])) return "blue";
-  return "neutral";
+function safeUseCaseTags(g: GarmentRow): string[] {
+  return Array.isArray(g.use_case_tags)
+    ? g.use_case_tags.filter(isString).map(norm).filter(Boolean)
+    : [];
 }
 
-function colorCompatScore(a: string, b: string) {
-  // súper simple para v1:
-  // neutrals combinan con todo; mismo color suma; colores cercanos leve.
-  if (a === "neutral" || b === "neutral") return 1.0;
-  if (a === b) return 1.2;
-
-  const neutralish = new Set(["black", "white", "grey", "navy", "brown"]);
-  if (neutralish.has(a) && neutralish.has(b)) return 1.05;
-
-  // combos comunes
-  const goodPairs = new Set([
-    "black+red",
-    "red+black",
-    "black+green",
-    "green+black",
-    "navy+white",
-    "white+navy",
-    "brown+white",
-    "white+brown",
-    "grey+black",
-    "black+grey",
-  ]);
-  if (goodPairs.has(`${a}+${b}`)) return 1.05;
-
-  return 0.9;
+function displayName(g: GarmentRow): string {
+  return g.catalog_name?.trim() || "Unknown Item";
 }
 
-function useCaseMatchScore(item: GarmentRow, target: UseCase) {
-  // fallback inteligente:
-  // 1) match exacto
-  // 2) match en use_case_tags
-  // 3) casual es comodín
-  // 4) null no bloquea
-  const uc = norm(item.use_case ?? "");
-  const tags = asArr(item.use_case_tags).map(norm);
-
-  if (uc === norm(target)) return 3.0;
-  if (tags.includes(norm(target))) return 2.2;
-  if (uc === "casual") return 1.4;
-  if (!uc) return 1.1;
-
-  // si no matchea, no lo mates: solo baja score
-  return 0.6;
+function isHeadwear(g: GarmentRow): boolean {
+  const blob = `${norm(g.subcategory ?? "")} ${safeTags(g).join(" ")}`;
+  return (
+    blob.includes("beanie") ||
+    blob.includes("cap") ||
+    blob.includes("hat") ||
+    blob.includes("headwear")
+  );
 }
 
-function fitAffinityScore(item: GarmentRow, targetFit: string | null) {
-  const f = norm(item.fit ?? "");
-  if (!targetFit) return 1.0;
-  if (!f) return 0.95;
-  if (f === norm(targetFit)) return 1.15;
+function scoreGarment(g: GarmentRow, targetUseCase: UseCase, slot: OutfitSlot): { score: number; reasonBits: string[] } {
+  const reasonBits: string[] = [];
+  let score = 0;
 
-  // streetwear tolera relaxed/oversized
-  const loose = new Set(["relaxed", "oversized"]);
-  if (loose.has(f) && loose.has(norm(targetFit))) return 1.08;
+  const fit = norm(g.fit ?? "");
+  const gUseCase = norm(g.use_case ?? "");
+  const uct = safeUseCaseTags(g);
+  const tags = safeTags(g);
+  const blob = `${displayName(g)} ${gUseCase} ${fit} ${tags.join(" ")} ${uct.join(" ")}`.toLowerCase();
 
-  return 0.95;
-}
-
-function baseItemScore(item: GarmentRow, targetUseCase: UseCase, targetFit: string | null) {
-  const tags = asArr(item.tags).map(norm);
-  const title = norm(item.catalog_name ?? "");
-  const blob = `${title} ${tags.join(" ")}`;
-
-  let score = 10; // base
-  score *= useCaseMatchScore(item, targetUseCase);
-  score *= fitAffinityScore(item, targetFit);
-
-  // bonus: “clean” basics para work/casual
-  if (targetUseCase === "work" || targetUseCase === "casual") {
-    if (containsAny(blob, ["basic", "solid", "minimal"])) score *= 1.05;
+  // Strong match: explicit use_case field
+  if (gUseCase === targetUseCase) {
+    score += 40;
+    reasonBits.push(`Matches use_case "${targetUseCase}"`);
   }
 
-  // bonus: streetwear
-  if (targetUseCase === "streetwear") {
-    if (containsAny(blob, ["logo", "graphic", "hoodie", "drawstring", "cargo"])) score *= 1.05;
+  // Secondary match: use_case_tags contains target
+  if (uct.includes(targetUseCase)) {
+    score += 25;
+    reasonBits.push(`Has use_case_tag "${targetUseCase}"`);
   }
 
-  // winter
-  if (targetUseCase === "winter") {
-    if (containsAny(blob, ["fleece", "wool", "puffer", "beanie"])) score *= 1.05;
+  // Fallback: if not tagged for any use case, do not penalize too much
+  if (!gUseCase && uct.length === 0) {
+    score += 8;
+    reasonBits.push("No use_case data (fallback)");
   }
 
-  return score;
-}
-
-function chooseTargetFit(useCase: UseCase) {
-  // v1 simple
-  if (useCase === "streetwear") return "relaxed";
-  if (useCase === "work") return "regular";
-  if (useCase === "athletic") return "regular";
-  if (useCase === "lounge") return "relaxed";
-  return "regular";
-}
-
-function isHeadwear(item: GarmentRow) {
-  const tags = asArr(item.tags).map(norm);
-  const title = norm(item.catalog_name ?? "");
-  const blob = `${title} ${tags.join(" ")}`;
-  return containsAny(blob, ["beanie", "cap", "hat", "headwear"]);
-}
-
-function accessoryAllowed(item: GarmentRow, targetUseCase: UseCase) {
-  // Control: no “beanie always-on”
-  // Headwear solo si winter (o si el item explícitamente es winter)
-  if (isHeadwear(item)) {
-    if (targetUseCase === "winter") return true;
-    const uctags = asArr(item.use_case_tags).map(norm);
-    if (uctags.includes("winter") || norm(item.use_case ?? "") === "winter") return true;
-    return false;
+  // Fit relevance (light weight)
+  if (fit) {
+    score += 6;
+    reasonBits.push(`Fit: ${fit}`);
   }
-  return true;
+
+  // Slot heuristics
+  if (slot === "outerwear") {
+    if (blob.includes("jacket") || blob.includes("coat") || blob.includes("hoodie") || blob.includes("zip")) score += 8;
+    if (targetUseCase === "winter") score += 10;
+  }
+
+  if (slot === "shoes") {
+    if (blob.includes("sneaker") || blob.includes("shoe") || blob.includes("trainer")) score += 6;
+    if (targetUseCase === "athletic" && (blob.includes("running") || blob.includes("training"))) score += 10;
+  }
+
+  if (slot === "top") {
+    if (blob.includes("tee") || blob.includes("t shirt") || blob.includes("shirt") || blob.includes("crewneck") || blob.includes("sweater"))
+      score += 4;
+  }
+
+  if (slot === "bottom") {
+    if (blob.includes("jean") || blob.includes("denim") || blob.includes("pant") || blob.includes("trouser") || blob.includes("jogger"))
+      score += 4;
+  }
+
+  if (slot === "accessory") {
+    // Accessories are optional; keep weight low and avoid headwear dominance
+    score += 2;
+    if (isHeadwear(g)) score -= 12; // de-weight headwear so it doesn't appear in every outfit
+    if (targetUseCase === "winter" && isHeadwear(g)) score += 3; // still possible, just not guaranteed
+  }
+
+  if (slot === "fragrance") {
+    score += 1;
+    if (blob.includes("parfum") || blob.includes("cologne") || blob.includes("fragrance") || blob.includes("perfume")) score += 10;
+  }
+
+  // Small diversity bonus: newer items slightly preferred
+  if (g.created_at) score += 1;
+
+  return { score, reasonBits };
 }
 
-async function loadSeedExclusions(supabase: any, seedOutfitId: string) {
+function pickBest(candidates: GarmentRow[], targetUseCase: UseCase, slot: OutfitSlot): PickedItem | null {
+  let best: PickedItem | null = null;
+
+  for (const g of candidates) {
+    const { score, reasonBits } = scoreGarment(g, targetUseCase, slot);
+    const reason = `${displayName(g)}: ${reasonBits.join(" · ") || "Selected by fallback rules"}`;
+
+    if (!best || score > best.score) {
+      best = { slot, garment: g, score, reason };
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Loads garment_ids from a previous outfit to auto-exclude them for regenerate.
+ * This prevents repeats when the user clicks "Regenerate Variation".
+ */
+async function loadSeedExclusions(
+  supabase: ReturnType<typeof getSupabaseServerClient>,
+  seedOutfitId: string
+): Promise<string[]> {
   const { data, error } = await supabase
     .from("outfit_items")
     .select("garment_id")
     .eq("outfit_id", seedOutfitId);
 
-  if (error) return [];
-  return uniq((data ?? []).map((r: any) => String(r.garment_id)));
+  if (error || !data) return [];
+
+  return data
+    .map((row: any) => (typeof row?.garment_id === "string" ? row.garment_id : ""))
+    .filter(Boolean);
+}
+
+function bucketByCategory(garments: GarmentRow[]) {
+  const by: Record<string, GarmentRow[]> = {
+    tops: [],
+    bottoms: [],
+    outerwear: [],
+    shoes: [],
+    accessories: [],
+    fragrance: [],
+    unknown: [],
+  };
+
+  for (const g of garments) {
+    const c = norm(g.category ?? "");
+    if (c === "tops") by.tops.push(g);
+    else if (c === "bottoms") by.bottoms.push(g);
+    else if (c === "outerwear") by.outerwear.push(g);
+    else if (c === "shoes") by.shoes.push(g);
+    else if (c === "accessories") by.accessories.push(g);
+    else if (c === "fragrance") by.fragrance.push(g);
+    else by.unknown.push(g);
+  }
+  return by;
+}
+
+async function persistOutfit(args: {
+  supabase: ReturnType<typeof getSupabaseServerClient>;
+  userId: string;
+  useCase: UseCase;
+  picked: PickedItem[];
+  reasoning: string;
+  seedOutfitId?: string | null;
+}) {
+  const { supabase, userId, useCase, picked, reasoning, seedOutfitId } = args;
+
+  // Insert outfit
+  const { data: outfit, error: outfitErr } = await supabase
+    .from("outfits")
+    .insert({
+      user_id: userId,
+      use_case: useCase,
+      seed_outfit_id: seedOutfitId ?? null,
+      reasoning,
+    })
+    .select("*")
+    .single();
+
+  if (outfitErr || !outfit) {
+    return { outfit: null, error: outfitErr?.message ?? "Failed to save outfit" };
+  }
+
+  // Insert items
+  const itemsPayload = picked.map((p) => ({
+    outfit_id: outfit.id,
+    garment_id: p.garment.id,
+    slot: p.slot,
+    reason: p.reason,
+    score: p.score,
+  }));
+
+  const { error: itemsErr } = await supabase.from("outfit_items").insert(itemsPayload);
+
+  if (itemsErr) {
+    // Outfit exists; items failed. Return outfit anyway so UI can still render.
+    return { outfit, error: `Outfit saved but items failed: ${itemsErr.message}` };
+  }
+
+  return { outfit, error: null };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json().catch(() => ({}))) as GenerateRequest;
+    const body = (await req.json().catch(() => ({}))) as GenerateRequestBody;
 
     const targetUseCase: UseCase = (body.use_case ?? "casual") as UseCase;
-    const includeOuterwear = Boolean(body.include_outerwear);
-
-    // Founder Edition fake user_id
-    const fakeUserId = "00000000-0000-0000-0000-000000000001";
+    const includeAccessory = body.include_accessory !== false; // default true
+    const includeFragrance = body.include_fragrance === true; // default false
 
     const supabase = getSupabaseServerClient();
 
-    // Exclusions: manual + seed outfit (variations)
-    const manualExclude = uniq(asArr(body.exclude_ids));
-    const seedExclude = body.seed_outfit_id ? await loadSeedExclusions(supabase, body.seed_outfit_id) : [];
+    // Founder Edition fake user_id (replace with auth later)
+    const fakeUserId = "00000000-0000-0000-0000-000000000001";
+
+    // Build exclusion set (manual + seed outfit items)
+    const manualExclude = uniqStrings(asStringArray(body.exclude_ids));
+    const seedExclude = body.seed_outfit_id
+      ? await loadSeedExclusions(supabase, String(body.seed_outfit_id))
+      : [];
     const excludeSet = new Set<string>([...manualExclude, ...seedExclude]);
 
     // Pull wardrobe
-    const { data: garments, error } = await supabase
+    const { data: garmentsRaw, error } = await supabase
       .from("garments")
       .select(
-        "id,user_id,category,subcategory,catalog_name,image_url,brand,color,material,size,tags,fit,use_case,use_case_tags,metadata,created_at"
+        "id,user_id,image_url,catalog_name,category,subcategory,tags,fit,use_case,use_case_tags,color,material,created_at"
       )
       .eq("user_id", fakeUserId)
       .order("created_at", { ascending: false });
 
     if (error) {
-      return NextResponse.json({ error: "Failed to load garments", details: error.message }, { status: 500 });
-    }
-
-    const rows = (garments ?? []) as GarmentRow[];
-
-    // Candidates by category (exclude ids + must have image)
-    const tops = rows.filter((g) => g.category === "tops" && !excludeSet.has(g.id));
-    const bottoms = rows.filter((g) => g.category === "bottoms" && !excludeSet.has(g.id));
-    const shoes = rows.filter((g) => g.category === "shoes" && !excludeSet.has(g.id));
-    const outerwear = rows.filter((g) => g.category === "outerwear" && !excludeSet.has(g.id));
-    const accessories = rows.filter((g) => g.category === "accessories" && !excludeSet.has(g.id));
-
-    // Min requirements
-    if (tops.length === 0 || bottoms.length === 0 || shoes.length === 0) {
       return NextResponse.json(
-        {
-          ok: false,
-          reason: "No se generó ningún outfit. Falta data (tops/bottoms/shoes) después de aplicar exclusions.",
-          counts: { tops: tops.length, bottoms: bottoms.length, shoes: shoes.length },
-          debug: { excluded_manual: manualExclude.length, excluded_seed: seedExclude.length },
-        },
-        { status: 200 }
+        { ok: false, error: "Failed to load garments", details: error.message },
+        { status: 500 }
       );
     }
 
-    const targetFit = chooseTargetFit(targetUseCase);
+    const garments = (garmentsRaw ?? []) as GarmentRow[];
 
-    // Pick top
-    const topScored = tops
-      .map((g) => ({ g, s: baseItemScore(g, targetUseCase, targetFit) }))
-      .sort((a, b) => b.s - a.s);
+    // Filter exclusions
+    const wardrobe = garments.filter((g) => g?.id && !excludeSet.has(g.id));
 
-    const top = topScored[0].g;
-    excludeSet.add(top.id);
+    const by = bucketByCategory(wardrobe);
 
-    // Pick bottom with color compatibility to top
-    const topColor = pickPrimaryColor(top.color, asArr(top.tags));
-    const bottomScored = bottoms
-      .filter((g) => !excludeSet.has(g.id))
-      .map((g) => {
-        const c = pickPrimaryColor(g.color, asArr(g.tags));
-        const compat = colorCompatScore(topColor, c);
-        const s = baseItemScore(g, targetUseCase, targetFit) * compat;
-        return { g, s, compat, c };
-      })
-      .sort((a, b) => b.s - a.s);
+    // Minimum required: top + bottom + shoes
+    // Intelligent fallback: if category buckets are empty but we have unknown, try to reuse unknown.
+    const topsPool = by.tops.length ? by.tops : by.unknown;
+    const bottomsPool = by.bottoms.length ? by.bottoms : by.unknown;
+    const shoesPool = by.shoes.length ? by.shoes : by.unknown;
 
-    const bottom = bottomScored[0].g;
-    excludeSet.add(bottom.id);
+    if (!topsPool.length || !bottomsPool.length || !shoesPool.length) {
+      const missing = [
+        !topsPool.length ? "tops" : null,
+        !bottomsPool.length ? "bottoms" : null,
+        !shoesPool.length ? "shoes" : null,
+      ].filter(Boolean);
 
-    // Pick shoes with compatibility to top+bottom
-    const bottomColor = pickPrimaryColor(bottom.color, asArr(bottom.tags));
-    const shoeScored = shoes
-      .filter((g) => !excludeSet.has(g.id))
-      .map((g) => {
-        const c = pickPrimaryColor(g.color, asArr(g.tags));
-        const compat =
-          (colorCompatScore(topColor, c) + colorCompatScore(bottomColor, c)) / 2;
-        const s = baseItemScore(g, targetUseCase, targetFit) * compat;
-        return { g, s, compat, c };
-      })
-      .sort((a, b) => b.s - a.s);
-
-    if (shoeScored.length === 0) {
       return NextResponse.json(
         {
           ok: false,
-          reason: "No se generó ningún outfit. Tus shoes existen, pero quedaron fuera por exclusions o filtros.",
-          counts: { tops: tops.length, bottoms: bottoms.length, shoes: shoes.length },
+          error: "No outfit generated",
+          details: `Missing required categories: ${missing.join(", ")}`,
+          counts: {
+            tops: by.tops.length,
+            bottoms: by.bottoms.length,
+            shoes: by.shoes.length,
+            outerwear: by.outerwear.length,
+            accessories: by.accessories.length,
+            fragrance: by.fragrance.length,
+            unknown: by.unknown.length,
+          },
         },
-        { status: 200 }
+        { status: 400 }
       );
     }
 
-    const shoe = shoeScored[0].g;
-    excludeSet.add(shoe.id);
+    const picked: PickedItem[] = [];
 
-    // Optional outerwear (only if requested or use case winter)
-    let pickedOuterwear: GarmentRow | null = null;
-    if (includeOuterwear || targetUseCase === "winter") {
-      const owScored = outerwear
-        .filter((g) => !excludeSet.has(g.id))
-        .map((g) => {
-          const c = pickPrimaryColor(g.color, asArr(g.tags));
-          const compat =
-            (colorCompatScore(topColor, c) + colorCompatScore(bottomColor, c)) / 2;
-          const s = baseItemScore(g, targetUseCase, targetFit) * compat;
-          return { g, s };
-        })
-        .sort((a, b) => b.s - a.s);
+    const topPick = pickBest(topsPool, targetUseCase, "top");
+    const bottomPick = pickBest(bottomsPool, targetUseCase, "bottom");
+    const shoesPick = pickBest(shoesPool, targetUseCase, "shoes");
 
-      if (owScored.length) {
-        pickedOuterwear = owScored[0].g;
-        excludeSet.add(pickedOuterwear.id);
-      }
+    if (!topPick || !bottomPick || !shoesPick) {
+      return NextResponse.json(
+        { ok: false, error: "No outfit generated", details: "Could not pick required pieces." },
+        { status: 400 }
+      );
     }
 
-    // Accessory control: max 1, and block headwear unless allowed
-    let pickedAccessory: GarmentRow | null = null;
-    const accCandidates = accessories.filter((g) => !excludeSet.has(g.id)).filter((g) => accessoryAllowed(g, targetUseCase));
+    picked.push(topPick, bottomPick, shoesPick);
 
-    // only add accessory if it increases coherence:
-    // - winter: likely yes
-    // - otherwise: only if not headwear + matches palette
-    if (accCandidates.length) {
-      const accScored = accCandidates
-        .map((g) => {
-          const c = pickPrimaryColor(g.color, asArr(g.tags));
-          const compat =
-            (colorCompatScore(topColor, c) + colorCompatScore(bottomColor, c)) / 2;
-          const s = baseItemScore(g, targetUseCase, targetFit) * compat;
-          return { g, s };
-        })
-        .sort((a, b) => b.s - a.s);
+    // Optional outerwear: prefer in winter/work/travel or if wardrobe has plenty
+    const shouldAddOuterwear =
+      targetUseCase === "winter" ||
+      targetUseCase === "work" ||
+      targetUseCase === "travel" ||
+      by.outerwear.length >= 3;
 
-      const best = accScored[0]?.g ?? null;
-
-      if (best) {
-        const isHW = isHeadwear(best);
-        if (targetUseCase === "winter") {
-          pickedAccessory = best;
-          excludeSet.add(best.id);
-        } else if (!isHW) {
-          // for non-winter, only non-headwear accessories
-          pickedAccessory = best;
-          excludeSet.add(best.id);
-        }
-      }
+    if (shouldAddOuterwear && by.outerwear.length > 0) {
+      // Avoid picking an outerwear that is basically the same item as the top (rare, but helpful)
+      const outerPick = pickBest(by.outerwear, targetUseCase, "outerwear");
+      if (outerPick) picked.push(outerPick);
     }
 
-    // Reasoning (humano)
-    const topName = top.catalog_name ?? "Top";
-    const bottomName = bottom.catalog_name ?? "Bottom";
-    const shoeName = shoe.catalog_name ?? "Shoes";
-    const owName = pickedOuterwear?.catalog_name ?? null;
-    const accName = pickedAccessory?.catalog_name ?? null;
-
-    const reasoningLines: string[] = [];
-
-    reasoningLines.push(`Objetivo: **${targetUseCase}** con fit preferido **${targetFit}**.`);
-    reasoningLines.push(`Elegí **${topName}** como base por compatibilidad de uso y tags.`);
-    reasoningLines.push(`Luego **${bottomName}** para balancear el look y mantener una paleta coherente.`);
-    reasoningLines.push(`Cerré con **${shoeName}** como ancla: match por use case o fallback (casual/tags) sin bloquear el outfit.`);
-
-    if (pickedOuterwear) reasoningLines.push(`Añadí outerwear: **${owName}** para completar la silueta.`);
-    if (pickedAccessory) {
-      if (isHeadwear(pickedAccessory)) {
-        reasoningLines.push(`Accessory: **${accName}** permitido porque estamos en **winter** (headwear control).`);
-      } else {
-        reasoningLines.push(`Accessory: **${accName}** porque suma sin ruido y respeta la paleta.`);
-      }
-    } else {
-      reasoningLines.push(`No agregué accessory para evitar repetición o ruido (control de accesorios activo).`);
+    // Optional accessory: controlled and de-weight headwear so it doesn't show up everywhere
+    if (includeAccessory && by.accessories.length > 0) {
+      // If winter, allow accessories but do not force headwear
+      // Also: only one accessory max in v1
+      const accessoryPick = pickBest(by.accessories, targetUseCase, "accessory");
+      if (accessoryPick && accessoryPick.score >= 0) picked.push(accessoryPick);
     }
 
-    const reasoning = reasoningLines.join(" ");
+    // Optional fragrance: only if explicitly enabled
+    if (includeFragrance && by.fragrance.length > 0) {
+      const fragPick = pickBest(by.fragrance, targetUseCase, "fragrance");
+      if (fragPick) picked.push(fragPick);
+    }
 
-    // Persist to outfits + outfit_items
-    const outfitInsert = {
-      user_id: fakeUserId,
-      use_case: targetUseCase,
-      fit: targetFit,
+    // Build coherent, human reasoning
+    const lines: string[] = [];
+    lines.push(
+      `Rules-based outfit generated for "${targetUseCase}" with diversity controls (auto-exclude on regenerate, accessories optional, headwear de-weighted).`
+    );
+    for (const p of picked) {
+      const cat = norm(p.garment.category ?? "");
+      const fit = norm(p.garment.fit ?? "");
+      const use = norm(p.garment.use_case ?? "");
+      lines.push(
+        `• ${p.slot.toUpperCase()}: ${displayName(p.garment)} (${cat || "unknown"}) — use_case: ${use || "n/a"}, fit: ${fit || "n/a"}`
+      );
+    }
+
+    const reasoning = lines.join("\n");
+
+    // Persist outfit + items for history and regenerate variations
+    const { outfit, error: persistError } = await persistOutfit({
+      supabase,
+      userId: fakeUserId,
+      useCase: targetUseCase,
+      picked,
       reasoning,
-      metadata: {
-        generator: "rules_v1",
-        include_outerwear: includeOuterwear,
-        exclusions: {
-          manual: manualExclude,
-          seed_outfit_id: body.seed_outfit_id ?? null,
-          seed: seedExclude,
-        },
-        palette: { top: topColor, bottom: bottomColor },
-      },
-    };
+      seedOutfitId: body.seed_outfit_id ?? null,
+    });
 
-    const { data: outfit, error: outfitErr } = await supabase
-      .from("outfits")
-      .insert(outfitInsert)
-      .select("*")
-      .single();
+    // Build exclude_ids for next variation automatically (everything used in this outfit)
+    const nextExcludeIds = uniqStrings(picked.map((p) => p.garment.id));
 
-    if (outfitErr) {
-      return NextResponse.json({ error: "Failed to insert outfit", details: outfitErr.message }, { status: 500 });
-    }
-
-    const outfitId = outfit.id;
-
-    const items: Array<{ outfit_id: string; garment_id: string; slot: Slot; position: number }> = [
-      { outfit_id: outfitId, garment_id: top.id, slot: "top", position: 1 },
-      { outfit_id: outfitId, garment_id: bottom.id, slot: "bottom", position: 2 },
-      { outfit_id: outfitId, garment_id: shoe.id, slot: "shoe", position: 3 },
-    ];
-
-    if (pickedOuterwear) items.push({ outfit_id: outfitId, garment_id: pickedOuterwear.id, slot: "outerwear", position: 4 });
-    if (pickedAccessory) items.push({ outfit_id: outfitId, garment_id: pickedAccessory.id, slot: "accessory", position: 5 });
-
-    const { error: itemsErr } = await supabase.from("outfit_items").insert(items);
-
-    if (itemsErr) {
-      return NextResponse.json({ error: "Failed to insert outfit_items", details: itemsErr.message }, { status: 500 });
-    }
-
-    // Return full payload (ready for UI)
     return NextResponse.json(
       {
         ok: true,
-        outfit: {
-          ...outfit,
-          items: [
-            { slot: "top", garment: top },
-            { slot: "bottom", garment: bottom },
-            { slot: "shoe", garment: shoe },
-            ...(pickedOuterwear ? [{ slot: "outerwear", garment: pickedOuterwear }] : []),
-            ...(pickedAccessory ? [{ slot: "accessory", garment: pickedAccessory }] : []),
-          ],
-          reasoning,
-          exclude_ids_next: uniq(items.map((x) => x.garment_id)), // útil para "regenerate variation"
-        },
+        outfit,
+        items: picked.map((p) => ({
+          slot: p.slot,
+          garment: p.garment,
+          reason: p.reason,
+          score: p.score,
+        })),
+        reasoning,
+        next_exclude_ids: nextExcludeIds,
+        warnings: persistError ? [persistError] : [],
       },
       { status: 200 }
     );
   } catch (err: any) {
     console.error("Error in /api/outfits/generate:", err);
     return NextResponse.json(
-      { error: "Server error", details: err?.message ?? "unknown" },
+      { ok: false, error: "Server error", details: err?.message ?? "unknown" },
       { status: 500 }
     );
   }
