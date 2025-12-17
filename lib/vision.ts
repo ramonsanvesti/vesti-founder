@@ -2,42 +2,26 @@
 import "server-only";
 
 export type VisionResult = {
-  // Lo que tu UI y DB necesitan
   catalog_name: string;
 
-  // Raw-ish para luego normalizar category/subcategory
   garmentType: string | null;
   subcategory: string | null;
 
-  // Atributos
   brand: string | null;
   color: string | null;
   material: string | null;
   size: string | null;
 
-  // Jerarquía nueva
-  fit: string | null; // oversized, relaxed, slim, regular
-  use_case: string | null; // casual, streetwear, work, athletic
-  use_case_tags: string[]; // text[]
-
-  // Modelo “humano”
-  model: string | null; // "Gap Logo Zip Hoodie", etc.
-
-  // Tags final (normalizados)
   tags: string[];
 
-  // Extra
-  confidence: number; // 0..1
+  confidence: number;
   raw_text: string | null;
 
-  // Para metadata.vision
   metadata: Record<string, any>;
 
-  // Para trazabilidad
   provider: "openai";
-  model_id: string | null;
+  model: string | null;
 
-  // Respuesta raw completa
   raw: any;
 };
 
@@ -59,124 +43,88 @@ function safeString(v: any): string | null {
   return t.length ? t : null;
 }
 
-function clamp01(n: any, fallback = 0.6) {
+function clamp01(n: any, fallback = 0.65) {
   if (typeof n !== "number" || Number.isNaN(n)) return fallback;
   return Math.max(0, Math.min(1, n));
 }
 
-function titleCaseLoose(s: string) {
+function titleCase(s: string) {
   return s
     .toLowerCase()
     .split(" ")
     .filter(Boolean)
-    .map((w) => w[0]?.toUpperCase() + w.slice(1))
+    .map((w) => (w[0] ? w[0].toUpperCase() + w.slice(1) : w))
     .join(" ");
 }
 
-function joinParts(parts: Array<string | null | undefined>) {
-  return parts.map((p) => (p ?? "").trim()).filter(Boolean).join(" ");
-}
-
-function cleanBrand(b: string | null) {
-  if (!b) return null;
-  const t = b.trim();
-  if (!t) return null;
-  if (t.toLowerCase() === "gap") return "GAP";
-  return t;
-}
-
-function normEnumLike(s: string | null) {
-  if (!s) return null;
-  return s.toLowerCase().trim().replace(/\s+/g, " ");
-}
-
 function extractOutputText(resJson: any): string | null {
-  // Responses API puede devolver output_text o dentro de output[0].content[0].text
+  // Responses API (texto agregado)
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
+  // Fallbacks
   const first = resJson?.output?.[0];
   const c0 = first?.content?.[0];
-
   if (typeof c0?.text === "string") return c0.text;
   if (typeof c0?.value === "string") return c0.value;
 
   return null;
 }
 
-function extractModelId(resJson: any): string | null {
-  return safeString(resJson?.model);
-}
-
 function finalizeVision(parsed: any, rawResponse: any): VisionResult {
-  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t)))).slice(
-    0,
-    30
-  );
+  const tags = uniq((parsed?.tags ?? []).map((t: any) => normTag(String(t))))
+    .filter(Boolean)
+    .slice(0, 30);
 
-  const brand = cleanBrand(safeString(parsed?.brand));
-  const colorRaw = safeString(parsed?.color);
-  const color = colorRaw ? titleCaseLoose(colorRaw) : null;
+  const brand = safeString(parsed?.brand);
+  const color = safeString(parsed?.color);
+  const garmentType = safeString(parsed?.garmentType);
+  const subcategory = safeString(parsed?.subcategory);
 
-  const fitRaw = safeString(parsed?.fit);
-  const fit = fitRaw ? titleCaseLoose(fitRaw) : null;
-
-  const useCaseRaw = safeString(parsed?.use_case);
-  const use_case = useCaseRaw ? normEnumLike(useCaseRaw) : null;
-
-  const useCaseTags = uniq(
-    (parsed?.use_case_tags ?? [])
-      .map((t: any) => normTag(String(t)))
-      .filter(Boolean)
-  ).slice(0, 20);
-
-  const modelRaw =
-    safeString(parsed?.model) ||
-    safeString(parsed?.subcategory) ||
-    safeString(parsed?.garmentType) ||
-    "Item";
-  const model = titleCaseLoose(modelRaw);
-
-  // Brand + Color + Fit + Model
-  const catalog_name = joinParts([brand, color, fit, model]) || "Unknown Item";
+  // Si Vision devuelve "catalog_name", bien. Si no, lo armamos.
+  const catalogRaw =
+    safeString(parsed?.catalog_name) ||
+    safeString(parsed?.title) ||
+    "Unknown Item";
 
   const rawNotes = safeString(parsed?.raw_notes);
 
+  // Reforzar: si faltan tags, metemos algunos básicos útiles
+  const boost: string[] = [];
+  if (garmentType) boost.push(garmentType);
+  if (subcategory) boost.push(subcategory);
+  if (brand) boost.push(brand);
+  if (color) boost.push(color);
+
+  const finalTags = uniq([...tags, ...boost].map(normTag)).slice(0, 30);
+
   return {
     provider: "openai",
-    model_id: extractModelId(rawResponse) ?? "unknown",
+    model: safeString(rawResponse?.model) ?? "unknown",
 
-    catalog_name,
+    catalog_name: titleCase(catalogRaw),
 
-    garmentType: safeString(parsed?.garmentType),
-    subcategory: safeString(parsed?.subcategory),
+    garmentType,
+    subcategory,
 
     brand,
-    color: colorRaw,
+    color,
     material: safeString(parsed?.material),
     size: safeString(parsed?.size),
 
-    fit: fitRaw ? normEnumLike(fitRaw) : null,
-    use_case,
-    use_case_tags: useCaseTags,
+    tags: finalTags,
 
-    model: modelRaw,
-
-    tags,
-
-    confidence: clamp01(parsed?.confidence, 0.6),
+    confidence: clamp01(parsed?.confidence, 0.65),
     raw_text: rawNotes,
 
     metadata: {
       raw_notes: rawNotes,
-      tags,
       brand,
-      color: colorRaw,
+      color,
       material: safeString(parsed?.material),
       size: safeString(parsed?.size),
-      model: modelRaw,
-      fit: fitRaw ? normEnumLike(fitRaw) : null,
-      use_case,
-      use_case_tags: useCaseTags,
+      garmentType,
+      subcategory,
+      tags: finalTags,
     },
 
     raw: {
@@ -194,27 +142,45 @@ export async function analyzeGarmentFromImageUrl(
   imageUrl: string
 ): Promise<VisionResult | null> {
   const apiKey = process.env.OPENAI_API_KEY;
+
   if (!apiKey) return null;
 
   const system = `
-You are VESTI Vision AI. Analyze a single product photo (clothing, shoes, accessories, or fragrance).
-Return ONLY valid JSON (no markdown, no commentary).
+You are VESTI Vision AI.
+Analyze ONE product photo (clothing, shoes, accessories, or fragrance).
 
-Return JSON with these keys:
-- brand: string|null (only if clearly visible)
-- color: string|null (main color(s) in simple terms)
-- garmentType: string|null (e.g. "hoodie", "sneakers", "trousers", "beanie", "perfume bottle")
-- subcategory: string|null (more specific type if possible)
-- model: string|null (concise model name with distinguishing features; e.g. "Gap Logo Zip Hoodie")
-- fit: one of ["oversized","relaxed","slim","regular"] or null
-- use_case: one of ["casual","streetwear","work","athletic"] or null
-- use_case_tags: array of 3-8 tags aligned to use_case (e.g. ["layering","everyday","errands"])
-- material: string|null
-- size: string|null (only if visible)
-- tags: 6-14 concise tags (nouns/adjectives). No duplicates.
-- confidence: number 0..1
-- raw_notes: one short sentence about what you saw.
+Return ONLY valid JSON. No markdown. No extra text.
+
+Hard requirements:
+- Produce 14 to 22 tags (concise, useful, non-duplicate).
+- tags must be simple nouns/adjectives (e.g. "hoodie", "zip", "pockets", "logo", "streetwear", "relaxed", "cotton", "winter").
+- If brand is not clearly visible, brand = null.
+- If you are unsure, prefer null instead of guessing.
 `;
+
+  // JSON Schema estricto para que SIEMPRE venga igual
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      catalog_name: { type: "string" },
+      garmentType: { type: ["string", "null"] },
+      subcategory: { type: ["string", "null"] },
+      brand: { type: ["string", "null"] },
+      color: { type: ["string", "null"] },
+      material: { type: ["string", "null"] },
+      size: { type: ["string", "null"] },
+      tags: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 14,
+        maxItems: 22,
+      },
+      confidence: { type: "number" },
+      raw_notes: { type: ["string", "null"] },
+    },
+    required: ["catalog_name", "garmentType", "subcategory", "brand", "color", "material", "size", "tags", "confidence", "raw_notes"],
+  };
 
   try {
     const body = {
@@ -224,13 +190,25 @@ Return JSON with these keys:
         {
           role: "user",
           content: [
-            { type: "input_text", text: "Analyze this image and extract the fields as JSON." },
+            {
+              type: "input_text",
+              text:
+                "Extract fields. catalog_name must be short, catalog style, Title Case. Prefer: Brand + Color + Model when possible.",
+            },
             { type: "input_image", image_url: imageUrl },
           ],
         },
       ],
-      // IMPORTANT: Responses API usa text.format (no response_format)
-      text: { format: { type: "json_object" } },
+
+      // ✅ Nuevo formato para Responses API
+      text: {
+        format: {
+          type: "json_schema",
+          name: "vesti_vision",
+          schema,
+          strict: true,
+        },
+      },
     };
 
     const res = await fetch("https://api.openai.com/v1/responses", {
@@ -251,23 +229,23 @@ Return JSON with these keys:
     const json = await res.json();
 
     const outputText = extractOutputText(json);
-
-    let parsed: any = null;
-
-    if (outputText) {
-      try {
-        parsed = JSON.parse(outputText);
-      } catch {
-        console.warn("Vision output was not valid JSON:", outputText);
-        return null;
-      }
-    } else {
-      // fallback: algunas variantes podrían traer json directo
+    if (!outputText) {
+      // rarísimo, pero por si acaso
       const maybeObj = json?.output?.[0]?.content?.[0]?.json;
-      if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
+      if (maybeObj && typeof maybeObj === "object") {
+        return finalizeVision(maybeObj, json);
+      }
+      console.warn("Vision: no output_text");
+      return null;
     }
 
-    if (!parsed) return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(outputText);
+    } catch {
+      console.warn("Vision output was not valid JSON:", outputText);
+      return null;
+    }
 
     return finalizeVision(parsed, json);
   } catch (err: any) {
