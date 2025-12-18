@@ -72,18 +72,7 @@ type IngestBatchResponse = {
   mode?: string;
   multi?: boolean;
   okCount?: number;
-  inserted: Array<{
-    imageUrl: string;
-    webpUrl?: string;
-    ok: boolean;
-    garment?: Garment | null;
-    garments?: Garment[];
-    skipped?: boolean;
-    fallback?: boolean;
-    count?: number;
-    error?: string | null;
-    details?: string;
-  }>;
+  inserted?: Array<any>;
   error?: string;
   details?: string;
 };
@@ -107,6 +96,7 @@ async function getSupabase() {
 }
 
 function httpsify(url?: string | null) {
+  // Ensure we never render http:// assets (mixed content)
   if (!url) return null;
   const u = String(url).trim();
   if (!u) return null;
@@ -121,29 +111,83 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
-function dedupeById<T extends { id: string }>(arr: T[]): T[] {
-  const seen = new Set<string>();
-  const out: T[] = [];
-  for (const item of arr) {
-    const id = item?.id;
-    if (!id) continue;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
+/**
+ * Fetch JSON safely:
+ * - surfaces non-OK server errors with useful message
+ * - prevents silent "failed to fetch" ambiguity
+ * - supports abort timeout
+ */
+async function safeFetchJSON(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 180000
+): Promise<any> {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+
+    const text = await res.text().catch(() => "");
+    let json: any = {};
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+
+    if (!res.ok) {
+      const msg = json?.details || json?.error || `HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+
+    return json;
+  } finally {
+    clearTimeout(t);
   }
-  return out;
 }
 
-function prependUniqueById<T extends { id: string }>(prev: T[], next: T[]): T[] {
-  const seen = new Set<string>(prev.map((x) => x.id));
-  const outNext: T[] = [];
-  for (const item of next) {
-    if (!item?.id) continue;
-    if (seen.has(item.id)) continue;
-    seen.add(item.id);
-    outNext.push(item);
+/**
+ * Normalize batch response rows into a flat array of garments.
+ * This is intentionally tolerant because the server payload may evolve.
+ */
+function extractGarmentsFromBatch(inserted: any[]): Garment[] {
+  const out: Garment[] = [];
+
+  for (const r of inserted || []) {
+    if (!r) continue;
+
+    // Common patterns:
+    // r.garments (multi)
+    // r.garment  (single)
+    // r.data / r.result / r.inserted_garments (future)
+    const maybeArrays = [
+      r.garments,
+      r.inserted_garments,
+      r.data?.garments,
+      r.result?.garments,
+    ];
+
+    let added = false;
+    for (const arr of maybeArrays) {
+      if (Array.isArray(arr) && arr.length) {
+        out.push(...(arr.filter(Boolean) as Garment[]));
+        added = true;
+      }
+    }
+
+    if (added) continue;
+
+    const maybeSingles = [r.garment, r.data?.garment, r.result?.garment];
+    for (const g of maybeSingles) {
+      if (g && typeof g === "object" && typeof g.id === "string") {
+        out.push(g as Garment);
+        break;
+      }
+    }
   }
-  return [...outNext, ...prev];
+
+  return out;
 }
 
 export default function WardrobeClient() {
@@ -332,30 +376,32 @@ export default function WardrobeClient() {
 
       const publicUrl = await uploadOneToStorage(file);
 
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "photo",
-          payload: { imageUrl: publicUrl },
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "photo",
+            payload: { imageUrl: publicUrl },
+          }),
+        },
+        180000
+      )) as IngestSingleResponse;
 
-      const json = (await res.json().catch(() => ({}))) as IngestSingleResponse;
-
-      if (!res.ok || !json?.ok || !json.garment) {
+      if (!json?.ok || !json.garment) {
         console.error("Ingest error:", json);
         alert(json?.details || json?.error || "Error creating garment (ingest).");
         return;
       }
 
-      setGarments((prev) => prependUniqueById(prev, [json.garment as Garment]));
-      setFile(null);
+      // Add optimistically + refresh for truth
+      setGarments((prev) => [json.garment as Garment, ...prev]);
+      await fetchGarments();
 
+      setFile(null);
       const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -387,72 +433,53 @@ export default function WardrobeClient() {
         setBatchProgress((p) => ({ ...p, done: i + 1 }));
       }
 
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "batch",
-          payload: {
-            imageUrls: urls,
-            multi: batchMulti,
-            maxItemsPerPhoto: Math.min(5, Math.max(1, Number(batchMaxItemsPerPhoto || 5))),
-          },
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "batch",
+            payload: {
+              imageUrls: urls,
+              multi: batchMulti,
+              maxItemsPerPhoto: Math.min(5, Math.max(1, Number(batchMaxItemsPerPhoto || 5))),
+            },
+          }),
+        },
+        240000
+      )) as IngestBatchResponse;
 
-      const json = (await res.json().catch(() => ({}))) as IngestBatchResponse;
-
-      if (!res.ok || !json?.ok) {
+      if (!json?.ok) {
         console.error("Batch ingest error:", json);
         alert(json?.details || json?.error || "Error batch ingest.");
         return;
       }
 
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
+      const allNew = extractGarmentsFromBatch(inserted);
 
-      // Collect garments from either `garment` (single) or `garments` (multi)
-      // Note: count OK by garments created (not by photos), so UI reflects reality.
-      const allNewRaw: Garment[] = [];
-      let okGarments = 0;
-      let failedPhotos = 0;
-
+      // Update counters (best-effort)
+      let ok = 0;
+      let failed = 0;
       for (const r of inserted) {
-        if (!r || !r.ok) {
-          failedPhotos++;
-          continue;
-        }
-
-        const gs = Array.isArray(r.garments) ? (r.garments.filter(Boolean) as Garment[]) : [];
-        if (gs.length) {
-          allNewRaw.push(...gs);
-          okGarments += gs.length;
-          continue;
-        }
-
-        if (r.garment) {
-          allNewRaw.push(r.garment as Garment);
-          okGarments += 1;
-        } else {
-          // Photo was marked ok but returned no garment(s)
-          failedPhotos++;
-        }
+        if (r?.ok) ok++;
+        else failed++;
       }
+      setBatchProgress((p) => ({ ...p, ok, failed }));
 
-      const allNew = dedupeById(allNewRaw);
-
-      setBatchProgress((p) => ({ ...p, ok: okGarments, failed: failedPhotos }));
-
-      // Optimistic UI update (fast). Then refresh from DB for absolute consistency.
+      // Optimistic add if we have them
       if (allNew.length) {
-        setGarments((prev) => prependUniqueById(prev, allNew));
+        setGarments((prev) => [...allNew, ...prev]);
       }
+
+      // IMPORTANT: Always refresh from DB after batch.
+      // This guarantees the closet shows what was actually inserted (dedupe, grouping, etc.)
+      await fetchGarments();
 
       setBatchFiles([]);
-
       const input = document.getElementById("batch-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected batch upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -480,35 +507,35 @@ export default function WardrobeClient() {
 
       const publicUrl = await uploadOneToStorage(multiFile);
 
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "multi_photo",
-          payload: { imageUrl: publicUrl },
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "multi_photo",
+            payload: { imageUrl: publicUrl },
+          }),
+        },
+        240000
+      )) as IngestMultiResponse;
 
-      const json = (await res.json().catch(() => ({}))) as IngestMultiResponse;
-
-      if (!res.ok || !json?.ok) {
+      if (!json?.ok) {
         console.error("Multi ingest error:", json);
         alert(json?.details || json?.error || "Error ingesting multi photo.");
         return;
       }
 
-      const newGarments = Array.isArray(json.garments) ? (json.garments as Garment[]) : [];
-      const deduped = dedupeById(newGarments);
-      if (deduped.length) {
-        setGarments((prev) => prependUniqueById(prev, deduped));
+      const newGarments = Array.isArray(json.garments) ? json.garments : [];
+      if (newGarments.length) {
+        setGarments((prev) => [...newGarments, ...prev]);
       }
 
-      setMultiFile(null);
+      await fetchGarments();
 
+      setMultiFile(null);
       const input = document.getElementById("multi-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected multi upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -534,27 +561,28 @@ export default function WardrobeClient() {
 
       const publicUrl = await uploadOneToStorage(outfitFile);
 
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "outfit_photo",
-          payload: { imageUrl: publicUrl },
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "outfit_photo",
+            payload: { imageUrl: publicUrl },
+          }),
+        },
+        240000
+      )) as IngestMultiResponse;
 
-      const json = (await res.json().catch(() => ({}))) as IngestMultiResponse;
-
-      if (!res.ok || !json?.ok) {
+      if (!json?.ok) {
         console.error("Outfit photo ingest error:", json);
         alert(json?.details || json?.error || "Error loading outfit photo.");
         return;
       }
 
-      const newGarments = Array.isArray(json.garments) ? (json.garments as Garment[]) : [];
-      const deduped = dedupeById(newGarments);
-      if (deduped.length) {
-        setGarments((prev) => prependUniqueById(prev, deduped));
+      const newGarments = Array.isArray(json.garments) ? json.garments : [];
+      if (newGarments.length) {
+        setGarments((prev) => [...newGarments, ...prev]);
       }
 
       const notesParts: string[] = [];
@@ -567,15 +595,14 @@ export default function WardrobeClient() {
       setOutfitLoadNotes(
         notesParts.length
           ? notesParts.join(" · ")
-          : `Loaded ${deduped.length} item(s) from outfit photo.`
+          : `Loaded ${newGarments.length} item(s) from outfit photo.`
       );
 
-      setOutfitFile(null);
+      await fetchGarments();
 
+      setOutfitFile(null);
       const input = document.getElementById("outfit-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected outfit load error:", err);
       alert(err?.message || "Unexpected error.");
@@ -594,27 +621,29 @@ export default function WardrobeClient() {
     try {
       setAddingText(true);
 
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "text",
-          payload: { query: q },
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "text",
+            payload: { query: q },
+          }),
+        },
+        180000
+      )) as IngestSingleResponse;
 
-      const json = (await res.json().catch(() => ({}))) as IngestSingleResponse;
-
-      if (!res.ok || !json?.ok || !json.garment) {
+      if (!json?.ok || !json.garment) {
         console.error("Text ingest error:", json);
         alert(json?.details || json?.error || "Error adding item by text.");
         return;
       }
 
-      setGarments((prev) => prependUniqueById(prev, [json.garment as Garment]));
-      setTextQuery("");
-
+      setGarments((prev) => [json.garment as Garment, ...prev]);
       await fetchGarments();
+
+      setTextQuery("");
     } catch (e: any) {
       console.error("Unexpected add-by-text error:", e);
       alert(e?.message || "Unexpected error.");
@@ -638,21 +667,23 @@ export default function WardrobeClient() {
       setGenerating(true);
       resetOutfitUI();
 
-      const res = await fetch("/api/outfits/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          use_case: useCase,
-          include_accessory: includeAccessory,
-          include_fragrance: includeFragrance,
-          seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
-          exclude_ids: opts?.regenerate ? excludeIds : [],
-        }),
-      });
+      const json = (await safeFetchJSON(
+        "/api/outfits/generate",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            use_case: useCase,
+            include_accessory: includeAccessory,
+            include_fragrance: includeFragrance,
+            seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
+            exclude_ids: opts?.regenerate ? excludeIds : [],
+          }),
+        },
+        180000
+      )) as GenerateOutfitResponse;
 
-      const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
-
-      if (!res.ok || !json?.ok) {
+      if (!json?.ok) {
         const msg = json?.details || json?.error || "Could not generate outfit.";
         setOutfitError(msg);
         console.error("Generate outfit error:", json);
