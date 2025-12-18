@@ -121,6 +121,31 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
+function dedupeById<T extends { id: string }>(arr: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of arr) {
+    const id = item?.id;
+    if (!id) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function prependUniqueById<T extends { id: string }>(prev: T[], next: T[]): T[] {
+  const seen = new Set<string>(prev.map((x) => x.id));
+  const outNext: T[] = [];
+  for (const item of next) {
+    if (!item?.id) continue;
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    outNext.push(item);
+  }
+  return [...outNext, ...prev];
+}
+
 export default function WardrobeClient() {
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -324,11 +349,13 @@ export default function WardrobeClient() {
         return;
       }
 
-      setGarments((prev) => [json.garment as Garment, ...prev]);
+      setGarments((prev) => prependUniqueById(prev, [json.garment as Garment]));
       setFile(null);
 
       const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
+
+      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -384,41 +411,48 @@ export default function WardrobeClient() {
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
 
       // Collect garments from either `garment` (single) or `garments` (multi)
-      const allNew: Garment[] = [];
-      let ok = 0;
-      let failed = 0;
+      // Note: count OK by garments created (not by photos), so UI reflects reality.
+      const allNewRaw: Garment[] = [];
+      let okGarments = 0;
+      let failedPhotos = 0;
 
       for (const r of inserted) {
         if (!r || !r.ok) {
-          failed++;
+          failedPhotos++;
           continue;
         }
 
-        const gs = Array.isArray(r.garments) ? r.garments.filter(Boolean) : [];
+        const gs = Array.isArray(r.garments) ? (r.garments.filter(Boolean) as Garment[]) : [];
         if (gs.length) {
-          ok++;
-          allNew.push(...(gs as Garment[]));
+          allNewRaw.push(...gs);
+          okGarments += gs.length;
           continue;
         }
 
         if (r.garment) {
-          ok++;
-          allNew.push(r.garment as Garment);
+          allNewRaw.push(r.garment as Garment);
+          okGarments += 1;
         } else {
-          failed++;
+          // Photo was marked ok but returned no garment(s)
+          failedPhotos++;
         }
       }
 
-      setBatchProgress((p) => ({ ...p, ok, failed }));
+      const allNew = dedupeById(allNewRaw);
 
+      setBatchProgress((p) => ({ ...p, ok: okGarments, failed: failedPhotos }));
+
+      // Optimistic UI update (fast). Then refresh from DB for absolute consistency.
       if (allNew.length) {
-        setGarments((prev) => [...allNew, ...prev]);
+        setGarments((prev) => prependUniqueById(prev, allNew));
       }
 
       setBatchFiles([]);
 
       const input = document.getElementById("batch-input") as HTMLInputElement | null;
       if (input) input.value = "";
+
+      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected batch upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -463,15 +497,18 @@ export default function WardrobeClient() {
         return;
       }
 
-      const newGarments = Array.isArray(json.garments) ? json.garments : [];
-      if (newGarments.length) {
-        setGarments((prev) => [...newGarments, ...prev]);
+      const newGarments = Array.isArray(json.garments) ? (json.garments as Garment[]) : [];
+      const deduped = dedupeById(newGarments);
+      if (deduped.length) {
+        setGarments((prev) => prependUniqueById(prev, deduped));
       }
 
       setMultiFile(null);
 
       const input = document.getElementById("multi-input") as HTMLInputElement | null;
       if (input) input.value = "";
+
+      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected multi upload error:", err);
       alert(err?.message || "Unexpected error.");
@@ -514,9 +551,10 @@ export default function WardrobeClient() {
         return;
       }
 
-      const newGarments = Array.isArray(json.garments) ? json.garments : [];
-      if (newGarments.length) {
-        setGarments((prev) => [...newGarments, ...prev]);
+      const newGarments = Array.isArray(json.garments) ? (json.garments as Garment[]) : [];
+      const deduped = dedupeById(newGarments);
+      if (deduped.length) {
+        setGarments((prev) => prependUniqueById(prev, deduped));
       }
 
       const notesParts: string[] = [];
@@ -529,13 +567,15 @@ export default function WardrobeClient() {
       setOutfitLoadNotes(
         notesParts.length
           ? notesParts.join(" · ")
-          : `Loaded ${newGarments.length} item(s) from outfit photo.`
+          : `Loaded ${deduped.length} item(s) from outfit photo.`
       );
 
       setOutfitFile(null);
 
       const input = document.getElementById("outfit-input") as HTMLInputElement | null;
       if (input) input.value = "";
+
+      await fetchGarments();
     } catch (err: any) {
       console.error("Unexpected outfit load error:", err);
       alert(err?.message || "Unexpected error.");
@@ -571,8 +611,10 @@ export default function WardrobeClient() {
         return;
       }
 
-      setGarments((prev) => [json.garment as Garment, ...prev]);
+      setGarments((prev) => prependUniqueById(prev, [json.garment as Garment]));
       setTextQuery("");
+
+      await fetchGarments();
     } catch (e: any) {
       console.error("Unexpected add-by-text error:", e);
       alert(e?.message || "Unexpected error.");
