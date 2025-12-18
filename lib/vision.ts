@@ -12,20 +12,24 @@ export type VisionResult = {
   // Attributes
   brand: string | null;
   color: string | null;
+  model_name: string | null;
   material: string | null;
   pattern: string | null;
-  seasons: string[]; // e.g. ["winter","fall"]
+  seasons: string[]; // ["winter","fall"]
   size: string | null;
 
-  // Final tags (normalized)
+  // Tags (final)
   tags: string[];
 
-  // Extra
-  confidence: number; // 0..1
+  // Confidence 0..1 (overall certainty across key fields)
+  confidence: number;
+
+  // One short visually-grounded sentence (raw_notes mapped to raw_text for storage/UI)
   raw_text: string | null;
 
-  // Clean metadata for storage
+  // Clean metadata for storage + optional structured extras (closure, neckline, etc.)
   metadata: Record<string, any>;
+  extras: Record<string, any> | null;
 
   // Tracing
   provider: "openai";
@@ -33,6 +37,41 @@ export type VisionResult = {
 
   // Full raw response
   raw: any;
+};
+
+type MultiVisionResponse = {
+  items: Array<{
+    brand: string | null;
+    color: string | null;
+    model_name: string | null;
+    catalog_name: string | null;
+    garmentType: string | null;
+    subcategory: string | null;
+    material: string | null;
+    pattern: string | null;
+    seasons: string[];
+    size: string | null;
+    tags: string[];
+    confidence: number;
+    raw_notes: string;
+    extras: Record<string, any>;
+  }>;
+  confidence: number; // overall
+  raw_notes: string;
+};
+
+type OutfitVisionResponse = {
+  slots: {
+    top?: any | null;
+    bottom?: any | null;
+    shoes?: any | null;
+    outerwear?: any | null;
+    accessory?: any | null;
+    fragrance?: any | null;
+    other?: any[] | null; // extra detections
+  };
+  confidence: number;
+  raw_notes: string;
 };
 
 function uniq(arr: string[]) {
@@ -53,7 +92,7 @@ function safeString(v: any): string | null {
   return t.length ? t : null;
 }
 
-function clamp01(n: any, fallback = 0.6) {
+function clamp01(n: any, fallback = 0.5) {
   if (typeof n !== "number" || Number.isNaN(n)) return fallback;
   return Math.max(0, Math.min(1, n));
 }
@@ -63,7 +102,7 @@ function titleCase(s: string) {
     .toLowerCase()
     .split(" ")
     .filter(Boolean)
-    .map((w) => (w[0] ? w[0].toUpperCase() + w.slice(1) : w))
+    .map((w) => w[0]?.toUpperCase() + w.slice(1))
     .join(" ");
 }
 
@@ -83,7 +122,6 @@ function normalizeSeason(s: string) {
 }
 
 function extractOutputText(resJson: any): string | null {
-  // Typical Responses API locations
   if (typeof resJson?.output_text === "string") return resJson.output_text;
 
   const first = resJson?.output?.[0];
@@ -95,195 +133,131 @@ function extractOutputText(resJson: any): string | null {
   return null;
 }
 
-function safeBaseColor(v: any): string | null {
-  const c = safeString(v);
-  if (!c) return null;
+function clampTags(tags: string[], min = 12, max = 25) {
+  const uniqed = uniq(tags.map(normTag));
+  if (uniqed.length >= min) return uniqed.slice(0, max);
 
-  const t = normTag(c);
-  // Keep only allowed base colors (hard rule from your spec)
-  const allowed = new Set([
-    "black",
-    "white",
-    "gray",
-    "navy",
-    "brown",
-    "beige",
-    "green",
-    "red",
-    "yellow",
-    "purple",
-    "pink",
-    "orange",
-    "blue",
-  ]);
-
-  // Some common normalizations
-  if (t.includes("grey")) return "gray";
-  if (t.includes("navy")) return "navy";
-
-  // If model returns something like "light gray", collapse to "gray"
-  for (const a of allowed) {
-    if (t.includes(a)) return a;
+  // Ultra-generic fillers (non-speculative) only if needed to meet minimum tag count.
+  const fillers = ["wearable", "item", "apparel", "wardrobe", "clothing"];
+  const out = [...uniqed];
+  for (const f of fillers) {
+    if (out.length >= min) break;
+    if (!out.includes(f)) out.push(f);
   }
 
-  // If not in allowed list, return null (do not guess)
-  return null;
+  return out.slice(0, max);
 }
 
 function buildCatalogName(parsed: any) {
-  // Desired: Brand + Color + Model (example: GAP Gray Relaxed Gap Logo Zip Hoodie)
-  // If brand is null, skip it (no guessing).
+  // Brand + Color + Model
   const brand = safeString(parsed?.brand);
-  const color = safeBaseColor(parsed?.color);
-
-  // model_name ONLY if clearly inferable, but we trust the model to obey the rule.
-  // If null, we fall back to subcategory (still visually grounded).
-  const model =
-    safeString(parsed?.model_name) ||
-    safeString(parsed?.subcategory) ||
-    safeString(parsed?.garmentType);
+  const color = safeString(parsed?.color);
+  const model = safeString(parsed?.model_name) || safeString(parsed?.subcategory) || safeString(parsed?.garmentType);
 
   const parts = [brand, color, model].filter(Boolean) as string[];
   if (parts.length) return titleCase(parts.join(" "));
 
-  // Fallback: if everything is missing
   const fallback =
     safeString(parsed?.catalog_name) ||
     safeString(parsed?.title) ||
     "Unknown Item";
-
   return titleCase(fallback);
 }
 
-function normalizePattern(v: any): string | null {
-  const p = safeString(v);
-  if (!p) return null;
-  const t = normTag(p);
+function tokenize(s: string): string[] {
+  return normTag(s)
+    .split(" ")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
 
-  const allowed = new Set([
-    "solid",
-    "stripes",
-    "plaid",
-    "camo",
-    "logo/graphic",
-    "check",
-    "floral",
-    "abstract",
-    "heather",
-    "colorblock",
-    "text",
-  ]);
+function buildDerivedTags(parsed: any): string[] {
+  const base = asStringArray(parsed?.tags).map(normTag).filter(Boolean);
 
-  // Some common normalizations
-  if (t.includes("logo") || t.includes("graphic")) return "logo/graphic";
-  if (t.includes("stripe")) return "stripes";
-  if (t.includes("camouflage")) return "camo";
+  const derived: string[] = [];
 
-  for (const a of allowed) {
-    if (t === a) return a;
+  const garmentType = safeString(parsed?.garmentType);
+  const subcategory = safeString(parsed?.subcategory);
+  const color = safeString(parsed?.color);
+  const material = safeString(parsed?.material);
+  const pattern = safeString(parsed?.pattern);
+
+  if (garmentType) derived.push(...tokenize(garmentType));
+  if (subcategory) derived.push(...tokenize(subcategory));
+  if (color) derived.push(normTag(color));
+  if (material) derived.push(normTag(material));
+  if (pattern) derived.push(normTag(pattern));
+
+  const seasons = uniq(asStringArray(parsed?.seasons).map(normalizeSeason).filter(Boolean));
+  for (const s of seasons) derived.push(s);
+
+  // Pull a few safe structured extras if present (visually grounded)
+  const extras = parsed?.extras && typeof parsed.extras === "object" ? parsed.extras : null;
+  const extraKeys = ["closure", "neckline", "length", "pockets", "logo_placement", "hardware"];
+  if (extras) {
+    for (const k of extraKeys) {
+      const v = (extras as any)[k];
+      if (typeof v === "string") derived.push(...tokenize(v));
+    }
+
+    const secondary = (extras as any)?.secondary_colors;
+    if (Array.isArray(secondary)) {
+      for (const c of secondary) {
+        if (typeof c === "string") derived.push(normTag(c));
+      }
+    }
   }
 
-  // If it is not one of the allowed patterns, do not guess.
-  return null;
+  return uniq([...base, ...derived].map(normTag).filter(Boolean));
 }
 
-function enforceTagRules(tagsIn: string[]): string[] {
-  // Enforce: lowercase, concise, nouns/adjectives, non-duplicate
-  // We can't perfectly validate POS, but we can enforce format and dedupe.
-  const cleaned = tagsIn
-    .map((t) => normTag(String(t)))
-    .filter(Boolean)
-    .map((t) => t.replace(/[^\w\s/]+/g, "").trim()) // strip odd punctuation
-    .filter(Boolean);
+function finalizeSingle(parsed: any, rawResponse: any): VisionResult {
+  const derivedTags = buildDerivedTags(parsed);
+  const tags = clampTags(derivedTags, 12, 25);
 
-  return uniq(cleaned);
-}
-
-function finalizeVision(parsed: any, rawResponse: any): VisionResult {
+  const seasons = uniq(asStringArray(parsed?.seasons).map(normalizeSeason).filter(Boolean));
   const rawNotes = safeString(parsed?.raw_notes);
 
-  const pattern = normalizePattern(parsed?.pattern);
-  const seasons = uniq(asStringArray(parsed?.seasons).map(normalizeSeason).filter(Boolean));
-
-  // Base tags from model (12..25 required by prompt, but we enforce in code too)
-  const baseTags = enforceTagRules(asStringArray(parsed?.tags));
-
-  // Derived tags: keep these useful and consistent
-  const derivedTags: string[] = [];
-
-  if (pattern) derivedTags.push(pattern); // simple and useful
-  for (const s of seasons) derivedTags.push(s); // "winter" instead of "season winter"
-
-  // Include a few structured extras as tags (only if present)
   const extras = parsed?.extras && typeof parsed.extras === "object" ? parsed.extras : null;
-
-  const closure = safeString(extras?.closure);
-  const neckline = safeString(extras?.neckline);
-  const length = safeString(extras?.length);
-  const pockets = safeString(extras?.pockets);
-  const logoPlacement = safeString(extras?.logo_placement);
-  const hardware = safeString(extras?.hardware);
-
-  const extraTags = enforceTagRules(
-    [closure, neckline, length, pockets, logoPlacement, hardware].filter(Boolean) as string[]
-  );
-
-  // Combine tags and enforce size window (12..25)
-  const combined = uniq([...baseTags, ...derivedTags, ...extraTags]);
-
-  // If too few tags, add safe structural tags from garmentType/subcategory/material/color
-  const fill: string[] = [];
-  const gt = safeString(parsed?.garmentType);
-  const sub = safeString(parsed?.subcategory);
-  const mat = safeString(parsed?.material);
-  const col = safeBaseColor(parsed?.color);
-
-  if (gt) fill.push(normTag(gt));
-  if (sub) fill.push(normTag(sub));
-  if (mat) fill.push(normTag(mat));
-  if (col) fill.push(normTag(col));
-
-  const tags = uniq([...combined, ...fill]).slice(0, 25);
-
-  // If still less than 12, keep what we have (do not invent)
-  // (This should be rare if the prompt is followed.)
-  const catalog_name = buildCatalogName(parsed);
 
   return {
     provider: "openai",
     model: safeString(rawResponse?.model) ?? "unknown",
 
-    catalog_name,
+    catalog_name: buildCatalogName(parsed),
 
     garmentType: safeString(parsed?.garmentType),
     subcategory: safeString(parsed?.subcategory),
 
     brand: safeString(parsed?.brand),
-    color: safeBaseColor(parsed?.color),
+    color: safeString(parsed?.color),
+    model_name: safeString(parsed?.model_name),
     material: safeString(parsed?.material),
-    pattern,
+    pattern: safeString(parsed?.pattern),
     seasons,
     size: safeString(parsed?.size),
 
     tags,
 
-    confidence: clamp01(parsed?.confidence, 0.6),
+    confidence: clamp01(parsed?.confidence, 0.5),
     raw_text: rawNotes,
 
     metadata: {
-      raw_notes: rawNotes,
       brand: safeString(parsed?.brand),
-      color: safeBaseColor(parsed?.color),
-      model_name: safeString(parsed?.model_name) ?? null,
+      color: safeString(parsed?.color),
+      model_name: safeString(parsed?.model_name),
       garmentType: safeString(parsed?.garmentType),
       subcategory: safeString(parsed?.subcategory),
       material: safeString(parsed?.material),
-      pattern,
+      pattern: safeString(parsed?.pattern),
       seasons,
       size: safeString(parsed?.size),
       tags,
-      extras: parsed?.extras ?? {},
+      raw_notes: rawNotes,
+      extras,
     },
+
+    extras,
 
     raw: {
       parsed,
@@ -292,19 +266,8 @@ function finalizeVision(parsed: any, rawResponse: any): VisionResult {
   };
 }
 
-/**
- * Official entry point used by /api/ingest
- * - If OPENAI_API_KEY missing or Vision fails: return null (ingest continues)
- */
-export async function analyzeGarmentFromImageUrl(
-  imageUrl: string
-): Promise<VisionResult | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  // If missing key, do not break ingest. Return null.
-  if (!apiKey) return null;
-
-  const system = `
+function buildSystemPromptSingle(): string {
+  return `
 You are VESTI Vision AI.
 
 Analyze ONE product photo (clothing, shoes, accessories, or fragrance). Extract only what is visually evident. If uncertain, output null instead of guessing.
@@ -331,102 +294,269 @@ Output schema (use these exact keys)
 }
 
 Hard rules
-- brand: ONLY if clearly readable/identifiable from the image (logo text, unmistakable brand mark). Otherwise null.
-- model_name: ONLY if clearly inferable (e.g., readable model text, iconic and unambiguous silhouette). Otherwise null (do NOT downgrade to a generic name here).
-- catalog_name: optional; if unknown, set null (we will rebuild it).
-- garmentType: the primary item type (examples: "hoodie", "t-shirt", "trousers", "sneakers", "handbag", "fragrance").
-- subcategory: more specific than garmentType (examples: "zip hoodie", "crewneck sweatshirt", "running sneaker", "chelsea boot", "crossbody bag").
-- color: simple base color only (e.g., "black", "white", "gray", "navy", "brown", "beige", "green", "red", "yellow", "purple", "pink", "orange", "blue"). If multicolor, use the dominant base color and note secondary colors in tags or extras.
-- material: only if reasonably inferable (e.g., "denim", "leather", "suede", "knit", "mesh", "canvas"). Otherwise null.
-- pattern: one of: "solid", "stripes", "plaid", "camo", "logo/graphic", "check", "floral", "abstract", "heather", "colorblock", "text". If unsure, null.
-- seasons: choose 1–4 from the allowed list. Use best judgment based on warmth/coverage. If unknown, return an empty array [].
-- size: ONLY if visible on a tag/label in the image. Otherwise null.
+- brand: ONLY if clearly readable/identifiable from the image. Otherwise null.
+- model_name: ONLY if clearly inferable. Otherwise null.
+- catalog_name: optional; if unknown, set null (we rebuild it later).
+- garmentType: primary type.
+- subcategory: more specific than garmentType.
+- color: base color only. Secondary colors go in tags/extras.
+- material: only if reasonably inferable.
+- pattern: one of: solid, stripes, plaid, camo, logo/graphic, check, floral, abstract, heather, colorblock, text. If unsure: null.
+- seasons: 0–4. If unknown: [].
+- size: ONLY if visible on tag/label.
 
-Tags requirements
+Tags
 - 12 to 25 tags.
-- Tags must be lowercase, concise, nouns/adjectives, non-duplicate.
-- Tags must be visually grounded (no "luxury", "designer", "limited", gender, or size guesses).
-- Prefer useful details: silhouette, closures, neckline, sleeve length, sole type, hardware, pockets, logo placement, texture, finish.
+- lowercase, concise, no duplicates.
+- visually grounded only. No gender. No “luxury/designer/limited”.
+- prefer useful details: silhouette, closures, neckline, sleeve length, sole type, hardware, pockets, logo placement, texture.
 
 Confidence
-- confidence is a float 0.00–1.00 reflecting overall certainty across key fields.
-- 0.90+ clear and unambiguous
-- 0.60–0.89 mostly clear, some uncertainty
-- 0.30–0.59 limited clarity
-- <0.30 very unclear
+- float 0.00–1.00.
 
 raw_notes
-- One short sentence describing what you saw (max ~20 words). No speculation.
+- One short sentence describing what you saw. No speculation.
 
 extras
-- Optional object for additional structured details when visible. Suggested keys:
-  - "closure" (zip, buttons, lace-up, buckle, none)
-  - "neckline" (crew, v-neck, collar, hood)
-  - "length" (cropped, regular, longline)
-  - "pockets" (none, side, chest, cargo)
-  - "logo_placement" (chest, sleeve, heel, tongue, back, all-over)
-  - "secondary_colors" (array)
-  - "hardware" (gold, silver, matte, none)
+- optional structured details when visible:
+  closure, neckline, length, pockets, logo_placement, secondary_colors[], hardware.
 
 Multi-item rule
-If multiple products appear, analyze the primary item in focus and ignore the rest.
+- If multiple products appear, analyze the primary item in focus and ignore the rest.
 `.trim();
+}
 
-  try {
-    const body = {
-      model: "gpt-4o-mini",
-      input: [
-        { role: "system", content: system },
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: "Analyze this product photo and fill the JSON fields." },
-            { type: "input_image", image_url: imageUrl },
-          ],
-        },
-      ],
-      // Responses API JSON formatting (replaces response_format)
-      text: { format: { type: "json_object" } },
-    };
+function buildSystemPromptMulti(): string {
+  return `
+You are VESTI Vision AI.
 
-    const res = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+Analyze ONE photo that may contain multiple apparel items (up to 5 distinct wearable products).
+Extract only what is visually evident. If uncertain, output null.
+
+Return ONLY valid JSON. No markdown. No commentary. No trailing commas.
+
+Output schema (use these exact keys)
+
+{
+"items": [
+  {
+    "brand": "string|null",
+    "color": "string|null",
+    "model_name": "string|null",
+    "catalog_name": "string|null",
+    "garmentType": "string|null",
+    "subcategory": "string|null",
+    "material": "string|null",
+    "pattern": "string|null",
+    "seasons": ["spring|summer|fall|winter"],
+    "size": "string|null",
+    "tags": ["string"],
+    "confidence": 0.0,
+    "raw_notes": "string",
+    "extras": {}
+  }
+],
+"confidence": 0.0,
+"raw_notes": "string"
+}
+
+Rules
+- items: 1 to 5 items max. Do NOT exceed 5.
+- If the photo is a full outfit, include top/bottom/shoes/outerwear/accessory if visible.
+- Same hard rules for brand/model_name/size/tags as single-item mode.
+- tags must be 12–25 per item.
+- confidence: overall confidence for the whole response. Each item also has its own confidence.
+- raw_notes: one short sentence about what you saw overall.
+`.trim();
+}
+
+function buildSystemPromptOutfit(): string {
+  return `
+You are VESTI Vision AI.
+
+Analyze ONE outfit photo and extract as many distinct wearable elements as possible into slots.
+
+Return ONLY valid JSON. No markdown. No commentary. No trailing commas.
+
+Output schema:
+
+{
+"slots": {
+  "top": { ...item|null },
+  "bottom": { ...item|null },
+  "shoes": { ...item|null },
+  "outerwear": { ...item|null },
+  "accessory": { ...item|null },
+  "fragrance": { ...item|null },
+  "other": [ ...item ]|null
+},
+"confidence": 0.0,
+"raw_notes": "string"
+}
+
+Where item follows:
+
+{
+"brand": "string|null",
+"color": "string|null",
+"model_name": "string|null",
+"catalog_name": "string|null",
+"garmentType": "string|null",
+"subcategory": "string|null",
+"material": "string|null",
+"pattern": "string|null",
+"seasons": ["spring|summer|fall|winter"],
+"size": "string|null",
+"tags": ["string"],
+"confidence": 0.0,
+"raw_notes": "string",
+"extras": {}
+}
+
+Rules
+- Populate slots only if the element is clearly visible. Otherwise null.
+- Do not invent accessories/fragrance.
+- If multiple accessories exist, put the primary one in "accessory" and the rest in "other".
+- tags 12–25 per item, visually grounded.
+- confidence is overall.
+`.trim();
+}
+
+async function callOpenAIJson(system: string, imageUrl: string): Promise<{ parsed: any; raw: any } | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const body = {
+    model: "gpt-4o-mini",
+    input: [
+      { role: "system", content: system },
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Analyze this image and return JSON that matches the schema exactly." },
+          { type: "input_image", image_url: imageUrl },
+        ],
       },
-      body: JSON.stringify(body),
-    });
+    ],
+    text: { format: { type: "json_object" } },
+  };
 
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.warn("Vision request failed:", res.status, txt);
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.warn("Vision request failed:", res.status, txt);
+    return null;
+  }
+
+  const json = await res.json();
+  const outputText = extractOutputText(json);
+
+  let parsed: any = null;
+
+  if (outputText) {
+    try {
+      parsed = JSON.parse(outputText);
+    } catch {
+      console.warn("Vision output was not valid JSON:", outputText);
       return null;
     }
+  } else {
+    const maybeObj = json?.output?.[0]?.content?.[0]?.json;
+    if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
+  }
 
-    const json = await res.json();
+  if (!parsed) return null;
+  return { parsed, raw: json };
+}
 
-    const outputText = extractOutputText(json);
-    let parsed: any = null;
+/**
+ * Single-item analysis (existing behavior).
+ * Returns null if Vision is unavailable or fails.
+ */
+export async function analyzeGarmentFromImageUrl(imageUrl: string): Promise<VisionResult | null> {
+  try {
+    const system = buildSystemPromptSingle();
+    const out = await callOpenAIJson(system, imageUrl);
+    if (!out) return null;
+    return finalizeSingle(out.parsed, out.raw);
+  } catch (err: any) {
+    console.warn("Vision single failed:", err?.message ?? err);
+    return null;
+  }
+}
 
-    if (outputText) {
-      try {
-        parsed = JSON.parse(outputText);
-      } catch {
-        console.warn("Vision output was not valid JSON:", outputText);
-        return null;
-      }
-    } else {
-      // Some variants may return JSON object directly
-      const maybeObj = json?.output?.[0]?.content?.[0]?.json;
-      if (maybeObj && typeof maybeObj === "object") parsed = maybeObj;
+/**
+ * Multi-item analysis: up to 5 items from one image.
+ * Returns [] if Vision unavailable or fails.
+ */
+export async function analyzeItemsFromImageUrl(imageUrl: string): Promise<VisionResult[]> {
+  try {
+    const system = buildSystemPromptMulti();
+    const out = await callOpenAIJson(system, imageUrl);
+    if (!out) return [];
+
+    const parsed = out.parsed as MultiVisionResponse;
+    const items = Array.isArray(parsed?.items) ? parsed.items.slice(0, 5) : [];
+
+    const results: VisionResult[] = [];
+    for (const it of items) {
+      results.push(finalizeSingle(it, out.raw));
     }
 
-    if (!parsed) return null;
-
-    return finalizeVision(parsed, json);
+    return results;
   } catch (err: any) {
-    console.warn("Vision failed (exception):", err?.message ?? err);
+    console.warn("Vision multi failed:", err?.message ?? err);
+    return [];
+  }
+}
+
+/**
+ * Outfit-slot analysis: top/bottom/shoes/outerwear/accessory/fragrance.
+ * Returns null if Vision unavailable or fails.
+ */
+export async function analyzeOutfitFromImageUrl(imageUrl: string): Promise<{
+  slots: Record<string, VisionResult | null>;
+  confidence: number;
+  raw_notes: string | null;
+  raw: any;
+} | null> {
+  try {
+    const system = buildSystemPromptOutfit();
+    const out = await callOpenAIJson(system, imageUrl);
+    if (!out) return null;
+
+    const parsed = out.parsed as OutfitVisionResponse;
+    const slots = parsed?.slots ?? {};
+
+    const slotKeys = ["top","bottom","shoes","outerwear","accessory","fragrance"] as const;
+
+    const finalized: Record<string, VisionResult | null> = {};
+    for (const k of slotKeys) {
+      const v = (slots as any)?.[k];
+      finalized[k] = v ? finalizeSingle(v, out.raw) : null;
+    }
+
+    const otherRaw = Array.isArray((slots as any)?.other) ? (slots as any).other.slice(0, 5) : [];
+    if (otherRaw.length) {
+      // We keep "other" inside raw only; you can ingest it if you want later.
+    }
+
+    return {
+      slots: finalized,
+      confidence: clamp01(parsed?.confidence, 0.5),
+      raw_notes: safeString(parsed?.raw_notes),
+      raw: { parsed, raw_response: out.raw },
+    };
+  } catch (err: any) {
+    console.warn("Vision outfit failed:", err?.message ?? err);
     return null;
   }
 }

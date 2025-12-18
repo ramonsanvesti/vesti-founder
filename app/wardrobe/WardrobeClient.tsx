@@ -5,6 +5,8 @@ import { useEffect, useMemo, useState } from "react";
 type Garment = {
   id: string;
   user_id: string | null;
+  source_image_id?: string | null;
+  fingerprint?: string | null;
 
   image_url: string | null;
   catalog_name: string | null;
@@ -17,8 +19,13 @@ type Garment = {
   use_case: string | null;
   use_case_tags: string[] | null;
 
+  brand?: string | null;
   color: string | null;
   material: string | null;
+  pattern?: string | null;
+  seasons?: string[] | null;
+  size?: string | null;
+  confidence?: number | null;
 
   metadata?: any;
 
@@ -26,13 +33,7 @@ type Garment = {
   updated_at?: string;
 };
 
-type OutfitSlot =
-  | "top"
-  | "bottom"
-  | "shoes"
-  | "outerwear"
-  | "accessory"
-  | "fragrance";
+type OutfitSlot = "top" | "bottom" | "shoes" | "outerwear" | "accessory" | "fragrance";
 
 type OutfitItem = {
   slot: OutfitSlot;
@@ -43,7 +44,7 @@ type OutfitItem = {
 
 type GenerateOutfitResponse = {
   ok: boolean;
-  outfit: any | null; // could be null if persist failed
+  outfit: any | null;
   items: OutfitItem[];
   reasoning: string;
   next_exclude_ids: string[];
@@ -51,6 +52,38 @@ type GenerateOutfitResponse = {
   error?: string;
   details?: string;
   counts?: any;
+};
+
+type IngestSingleResponse = {
+  ok: boolean;
+  garment?: Garment;
+  error?: string;
+  details?: string;
+};
+
+type IngestBatchResponse = {
+  ok: boolean;
+  inserted: Array<{
+    imageUrl: string;
+    ok: boolean;
+    garment: Garment | null;
+    error: string | null;
+  }>;
+  okCount: number;
+  error?: string;
+  details?: string;
+};
+
+type IngestMultiResponse = {
+  ok: boolean;
+  garments: Garment[];
+  count: number;
+  failures?: any[];
+  fallback?: boolean;
+  error?: string;
+  details?: string;
+  outfit_confidence?: number;
+  outfit_notes?: string;
 };
 
 async function getSupabase() {
@@ -76,9 +109,28 @@ export default function WardrobeClient() {
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Upload by photo
+  // Upload by photo (single)
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
+
+  // Batch upload (up to 5 photos)
+  const [batchFiles, setBatchFiles] = useState<File[]>([]);
+  const [batchUploading, setBatchUploading] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number; ok: number; failed: number }>({
+    done: 0,
+    total: 0,
+    ok: 0,
+    failed: 0,
+  });
+
+  // Multi detection (up to 5 garments from one photo)
+  const [multiFile, setMultiFile] = useState<File | null>(null);
+  const [multiUploading, setMultiUploading] = useState(false);
+
+  // Outfit load mode (slot-based extraction from one photo)
+  const [outfitFile, setOutfitFile] = useState<File | null>(null);
+  const [outfitLoading, setOutfitLoading] = useState(false);
+  const [outfitLoadNotes, setOutfitLoadNotes] = useState<string | null>(null);
 
   // Add by text
   const [textQuery, setTextQuery] = useState("");
@@ -86,15 +138,7 @@ export default function WardrobeClient() {
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
-    | "casual"
-    | "streetwear"
-    | "work"
-    | "athletic"
-    | "formal"
-    | "winter"
-    | "summer"
-    | "travel"
-    | "lounge"
+    "casual" | "streetwear" | "work" | "athletic" | "formal" | "winter" | "summer" | "travel" | "lounge"
   >("streetwear");
 
   const [includeAccessory, setIncludeAccessory] = useState(true);
@@ -154,8 +198,66 @@ export default function WardrobeClient() {
     return counts;
   }, [garments]);
 
+  const groupedWardrobe = useMemo(() => {
+    // Group garments by source_image_id (when present) so items extracted from the same photo stay together.
+    // This makes multi-item and outfit-photo ingestion feel coherent and prevents UI chaos.
+    const map = new Map<string, Garment[]>();
+
+    for (const g of garments) {
+      const key = (g.source_image_id ?? "").trim() || "__ungrouped__";
+      const arr = map.get(key) ?? [];
+      arr.push(g);
+      map.set(key, arr);
+    }
+
+    // Preserve recency: garments are already ordered by created_at desc.
+    // We keep the first-seen group order.
+    const order: string[] = [];
+    for (const g of garments) {
+      const key = (g.source_image_id ?? "").trim() || "__ungrouped__";
+      if (!order.includes(key)) order.push(key);
+    }
+
+    return order.map((key) => ({
+      key,
+      title: key === "__ungrouped__" ? "Ungrouped" : `Source photo: ${key.slice(0, 8)}…`,
+      items: map.get(key) ?? [],
+    }));
+  }, [garments]);
+
   // ----------------------------
-  // Upload by photo
+  // Shared: upload file(s) to Supabase Storage bucket "garments" and return public URLs
+  // ----------------------------
+  const uploadOneToStorage = async (fileToUpload: File): Promise<string> => {
+    const supabase = await getSupabase();
+
+    const ext = fileToUpload.name.split(".").pop() || "jpg";
+    const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+    const filePath = fileName;
+
+    const { error: uploadError } = await supabase.storage
+      .from("garments")
+      .upload(filePath, fileToUpload, {
+        cacheControl: "3600",
+        upsert: false,
+      });
+
+    if (uploadError) {
+      throw new Error(`Storage upload failed: ${uploadError.message}`);
+    }
+
+    const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
+    const publicUrl = publicData?.publicUrl;
+
+    if (!publicUrl) {
+      throw new Error("Could not generate public URL.");
+    }
+
+    return publicUrl;
+  };
+
+  // ----------------------------
+  // Upload by photo (single)
   // ----------------------------
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0] ?? null;
@@ -168,38 +270,8 @@ export default function WardrobeClient() {
     try {
       setUploading(true);
 
-      const supabase = await getSupabase();
+      const publicUrl = await uploadOneToStorage(file);
 
-      // 1) Unique file path
-      const ext = file.name.split(".").pop() || "jpg";
-      const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
-      const filePath = fileName;
-
-      // 2) Upload to Storage bucket: garments
-      const { error: uploadError } = await supabase.storage
-        .from("garments")
-        .upload(filePath, file, {
-          cacheControl: "3600",
-          upsert: false,
-        });
-
-      if (uploadError) {
-        console.error("Upload error:", uploadError);
-        alert("Error uploading image to Storage.");
-        return;
-      }
-
-      // 3) Public URL
-      const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
-      const publicUrl = publicData?.publicUrl;
-
-      if (!publicUrl) {
-        console.error("Missing public URL for filePath:", filePath);
-        alert("Could not generate public URL.");
-        return;
-      }
-
-      // 4) Call ingest (photo)
       const res = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -209,32 +281,205 @@ export default function WardrobeClient() {
         }),
       });
 
-      const json = await res.json().catch(() => ({}));
+      const json = (await res.json().catch(() => ({}))) as IngestSingleResponse;
 
-      if (!res.ok || !json?.ok) {
+      if (!res.ok || !json?.ok || !json.garment) {
         console.error("Ingest error:", json);
-        alert(json?.details || "Error creating garment (ingest).");
+        alert(json?.details || json?.error || "Error creating garment (ingest).");
         return;
       }
 
-      const newGarment = json.garment as Garment;
-
-      // 5) Update UI
-      setGarments((prev) => [newGarment, ...prev]);
+      setGarments((prev) => [json.garment as Garment, ...prev]);
       setFile(null);
 
       const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
-    } catch (err) {
+    } catch (err: any) {
       console.error("Unexpected upload error:", err);
-      alert("Unexpected error.");
+      alert(err?.message || "Unexpected error.");
     } finally {
       setUploading(false);
     }
   };
 
   // ----------------------------
-  // Add by text
+  // Batch upload (up to 5 photos)
+  // ----------------------------
+  const handleBatchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []).slice(0, 5);
+    setBatchFiles(files);
+  };
+
+  const handleBatchUpload = async () => {
+    if (!batchFiles.length) return;
+
+    try {
+      setBatchUploading(true);
+      setBatchProgress({ done: 0, total: batchFiles.length, ok: 0, failed: 0 });
+
+      // Upload sequentially (more stable than parallel; fewer intermittent storage issues)
+      const urls: string[] = [];
+      for (let i = 0; i < batchFiles.length; i++) {
+        const u = await uploadOneToStorage(batchFiles[i]);
+        urls.push(u);
+        setBatchProgress((p) => ({ ...p, done: i + 1 }));
+      }
+
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "batch_photo",
+          payload: { imageUrls: urls },
+        }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as IngestBatchResponse;
+
+      if (!res.ok || !json?.ok) {
+        console.error("Batch ingest error:", json);
+        alert(json?.details || json?.error || "Error batch ingest.");
+        return;
+      }
+
+      const inserted = Array.isArray(json.inserted) ? json.inserted : [];
+      const okGarments = inserted.filter((r) => r.ok && r.garment).map((r) => r.garment!) as Garment[];
+
+      setBatchProgress((p) => ({
+        ...p,
+        ok: okGarments.length,
+        failed: Math.max(0, inserted.length - okGarments.length),
+      }));
+
+      if (okGarments.length) {
+        setGarments((prev) => [...okGarments, ...prev]);
+      }
+
+      setBatchFiles([]);
+
+      const input = document.getElementById("batch-input") as HTMLInputElement | null;
+      if (input) input.value = "";
+    } catch (err: any) {
+      console.error("Unexpected batch upload error:", err);
+      alert(err?.message || "Unexpected error.");
+    } finally {
+      setBatchUploading(false);
+      setTimeout(() => {
+        setBatchProgress({ done: 0, total: 0, ok: 0, failed: 0 });
+      }, 1000);
+    }
+  };
+
+  // ----------------------------
+  // Multi-photo detection (up to 5 garments from 1 photo)
+  // ----------------------------
+  const handleMultiChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0] ?? null;
+    setMultiFile(selected);
+  };
+
+  const handleMultiUpload = async () => {
+    if (!multiFile) return;
+
+    try {
+      setMultiUploading(true);
+
+      const publicUrl = await uploadOneToStorage(multiFile);
+
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "multi_photo",
+          payload: { imageUrl: publicUrl },
+        }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as IngestMultiResponse;
+
+      if (!res.ok || !json?.ok) {
+        console.error("Multi ingest error:", json);
+        alert(json?.details || json?.error || "Error ingesting multi photo.");
+        return;
+      }
+
+      const newGarments = Array.isArray(json.garments) ? json.garments : [];
+      if (newGarments.length) {
+        setGarments((prev) => [...newGarments, ...prev]);
+      }
+
+      setMultiFile(null);
+
+      const input = document.getElementById("multi-input") as HTMLInputElement | null;
+      if (input) input.value = "";
+    } catch (err: any) {
+      console.error("Unexpected multi upload error:", err);
+      alert(err?.message || "Unexpected error.");
+    } finally {
+      setMultiUploading(false);
+    }
+  };
+
+  // ----------------------------
+  // Outfit load mode (slot-based extraction)
+  // ----------------------------
+  const handleOutfitChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0] ?? null;
+    setOutfitFile(selected);
+  };
+
+  const handleOutfitLoad = async () => {
+    if (!outfitFile) return;
+
+    try {
+      setOutfitLoading(true);
+      setOutfitLoadNotes(null);
+
+      const publicUrl = await uploadOneToStorage(outfitFile);
+
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "outfit_photo",
+          payload: { imageUrl: publicUrl },
+        }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as IngestMultiResponse;
+
+      if (!res.ok || !json?.ok) {
+        console.error("Outfit photo ingest error:", json);
+        alert(json?.details || json?.error || "Error loading outfit photo.");
+        return;
+      }
+
+      const newGarments = Array.isArray(json.garments) ? json.garments : [];
+      if (newGarments.length) {
+        setGarments((prev) => [...newGarments, ...prev]);
+      }
+
+      const notesParts: string[] = [];
+      if (typeof json.outfit_confidence === "number") notesParts.push(`Outfit confidence: ${json.outfit_confidence.toFixed(2)}`);
+      if (json.outfit_notes) notesParts.push(json.outfit_notes);
+      if (Array.isArray(json.failures) && json.failures.length) notesParts.push(`Failures: ${json.failures.length}`);
+
+      setOutfitLoadNotes(notesParts.length ? notesParts.join(" · ") : `Loaded ${newGarments.length} item(s) from outfit photo.`);
+
+      setOutfitFile(null);
+
+      const input = document.getElementById("outfit-input") as HTMLInputElement | null;
+      if (input) input.value = "";
+    } catch (err: any) {
+      console.error("Unexpected outfit load error:", err);
+      alert(err?.message || "Unexpected error.");
+    } finally {
+      setOutfitLoading(false);
+    }
+  };
+
+  // ----------------------------
+  // Add by text (CSE -> image -> Vision -> insert)
   // ----------------------------
   const handleAddByText = async () => {
     const q = textQuery.trim();
@@ -252,97 +497,86 @@ export default function WardrobeClient() {
         }),
       });
 
-      const json = await res.json().catch(() => ({}));
+      const json = (await res.json().catch(() => ({}))) as IngestSingleResponse;
 
-      if (!res.ok || !json?.ok) {
+      if (!res.ok || !json?.ok || !json.garment) {
         console.error("Text ingest error:", json);
-        alert(json?.details || "Error adding item by text.");
+        alert(json?.details || json?.error || "Error adding item by text.");
         return;
       }
 
-      const newGarment = json.garment as Garment;
-      setGarments((prev) => [newGarment, ...prev]);
+      setGarments((prev) => [json.garment as Garment, ...prev]);
       setTextQuery("");
-    } catch (e) {
+    } catch (e: any) {
       console.error("Unexpected add-by-text error:", e);
-      alert("Unexpected error.");
+      alert(e?.message || "Unexpected error.");
     } finally {
       setAddingText(false);
     }
   };
 
- // ----------------------------
-// Outfit generation
-// ----------------------------
-const resetOutfitUI = () => {
-  setOutfitError(null);
-  setOutfitWarnings([]);
-  setOutfitReasoning("");
-  setOutfitItems([]);
-};
+  // ----------------------------
+  // Outfit generation
+  // ----------------------------
+  const resetOutfitUI = () => {
+    setOutfitError(null);
+    setOutfitWarnings([]);
+    setOutfitReasoning("");
+    setOutfitItems([]);
+  };
 
-const generateOutfit = async (opts?: { regenerate?: boolean }) => {
-  try {
-    setGenerating(true);
-    resetOutfitUI();
+  const generateOutfit = async (opts?: { regenerate?: boolean }) => {
+    try {
+      setGenerating(true);
+      resetOutfitUI();
 
-    const res = await fetch("/api/outfits/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        use_case: useCase,
-        include_accessory: includeAccessory,
-        include_fragrance: includeFragrance,
-        seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
-        exclude_ids: opts?.regenerate ? excludeIds : [],
-      }),
-    });
+      const res = await fetch("/api/outfits/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          use_case: useCase,
+          include_accessory: includeAccessory,
+          include_fragrance: includeFragrance,
+          seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
+          exclude_ids: opts?.regenerate ? excludeIds : [],
+        }),
+      });
 
-    const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
+      const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
 
-    if (!res.ok || !json || json.ok !== true) {
-      const msg =
-        json?.details ||
-        json?.error ||
-        "Could not generate outfit.";
-      setOutfitError(msg);
-      console.error("Generate outfit error:", json);
-      return;
+      if (!res.ok || !json?.ok) {
+        const msg = json?.details || json?.error || "Could not generate outfit.";
+        setOutfitError(msg);
+        console.error("Generate outfit error:", json);
+        return;
+      }
+
+      const items = Array.isArray(json.items) ? json.items : [];
+      if (items.length === 0) {
+        setOutfitError("No items returned.");
+        console.error("Generate outfit returned no items:", json);
+        return;
+      }
+
+      // Outfit can be null; do NOT assume outfit.user_id exists.
+      setOutfitItems(items);
+      setOutfitReasoning(json.reasoning || "");
+      setOutfitWarnings(Array.isArray(json.warnings) ? json.warnings : []);
+
+      const newSeedId = json.outfit?.id ?? null;
+      if (newSeedId) setSeedOutfitId(newSeedId);
+
+      const nextExclude = Array.isArray(json.next_exclude_ids) ? json.next_exclude_ids : [];
+      setExcludeIds(nextExclude);
+    } catch (e: any) {
+      console.error("Generate/save outfit error:", e);
+      setOutfitError(e?.message || "Unexpected error.");
+    } finally {
+      setGenerating(false);
     }
+  };
 
-    // Defensive: items must exist and be array
-    const items: OutfitItem[] = Array.isArray(json.items) ? json.items : [];
-
-    if (items.length === 0) {
-      setOutfitError("No items returned. Add more garments first.");
-      console.error("Empty outfit result:", json);
-      return;
-    }
-
-    setOutfitItems(items);
-    setOutfitReasoning(typeof json.reasoning === "string" ? json.reasoning : "");
-    setOutfitWarnings(Array.isArray(json.warnings) ? json.warnings : []);
-
-    // Outfit can be null if persistence failed — that's OK
-    if (json.outfit && typeof json.outfit.id === "string") {
-      setSeedOutfitId(json.outfit.id);
-    }
-
-    // Auto exclusion for regenerate variations
-    if (Array.isArray(json.next_exclude_ids)) {
-      setExcludeIds(json.next_exclude_ids.filter((x): x is string => typeof x === "string"));
-    } else {
-      setExcludeIds([]);
-    }
-  } catch (err: any) {
-    console.error("Generate/save outfit error:", err);
-    setOutfitError(err?.message || "Unexpected error while generating outfit.");
-  } finally {
-    setGenerating(false);
-  }
-};
-
-const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
+  const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
 
   // ----------------------------
   // Render helpers
@@ -368,14 +602,25 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
     const cat = (g.category ?? "").trim();
     const sub = (g.subcategory ?? "").trim();
 
+    const seasons = Array.isArray(g.seasons) ? g.seasons.filter(Boolean) : [];
+
     const metaLine = [
+      g.brand ? `Brand: ${g.brand}` : null,
       g.color ? `Color: ${g.color}` : null,
       g.material ? `Material: ${g.material}` : null,
+      g.pattern ? `Pattern: ${g.pattern}` : null,
+      g.size ? `Size: ${g.size}` : null,
+      seasons.length ? `Seasons: ${seasons.join(", ")}` : null,
       g.fit ? `Fit: ${g.fit}` : null,
       g.use_case ? `Use: ${g.use_case}` : null,
+      typeof g.confidence === "number" ? `Conf: ${g.confidence.toFixed(2)}` : null,
     ]
       .filter(Boolean)
       .join(" · ");
+
+    const sourceLine = g.source_image_id
+      ? `source: ${String(g.source_image_id).slice(0, 8)}…`
+      : null;
 
     return (
       <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
@@ -407,6 +652,7 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
         )}
 
         {metaLine ? <div className="text-xs text-gray-500">{metaLine}</div> : null}
+        {sourceLine ? <div className="text-[11px] text-gray-600">{sourceLine}</div> : null}
 
         {renderTags(g)}
       </div>
@@ -418,7 +664,7 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
-          Upload by photo or add by text. Then generate a rules-based outfit with reasoning and history.
+          Add items by photo, batch photos, multi-item photo, outfit photo, or by text. Then generate a rules-based outfit with reasoning.
         </p>
 
         <div className="text-xs text-gray-500 pt-2">
@@ -428,9 +674,9 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
 
       {/* Upload by photo */}
       <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Add garment by photo</h2>
+        <h2 className="text-lg font-medium">Add garment by photo (single)</h2>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 flex-wrap">
           <input
             id="file-input"
             type="file"
@@ -453,11 +699,104 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
         </div>
       </section>
 
+      {/* Batch upload */}
+      <section className="border rounded-lg p-4 space-y-3">
+        <h2 className="text-lg font-medium">Batch upload (up to 5 photos)</h2>
+
+        <div className="flex items-center gap-4 flex-wrap">
+          <input
+            id="batch-input"
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={handleBatchChange}
+            className="block text-sm"
+          />
+
+          <button
+            onClick={handleBatchUpload}
+            disabled={!batchFiles.length || batchUploading}
+            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+          >
+            {batchUploading ? "Uploading batch..." : "Upload batch"}
+          </button>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          {batchFiles.length ? `Selected: ${batchFiles.length} file(s)` : "Select up to 5 images."}
+          {batchUploading && batchProgress.total ? (
+            <span className="ml-2">
+              Progress: {batchProgress.done}/{batchProgress.total}
+            </span>
+          ) : null}
+          {!batchUploading && (batchProgress.ok || batchProgress.failed) ? (
+            <span className="ml-2">
+              Done · OK {batchProgress.ok} · Failed {batchProgress.failed}
+            </span>
+          ) : null}
+        </div>
+      </section>
+
+      {/* Multi-item detection */}
+      <section className="border rounded-lg p-4 space-y-3">
+        <h2 className="text-lg font-medium">Add up to 5 garments from one photo (multi-item)</h2>
+
+        <div className="flex items-center gap-4 flex-wrap">
+          <input
+            id="multi-input"
+            type="file"
+            accept="image/*"
+            onChange={handleMultiChange}
+            className="block text-sm"
+          />
+
+          <button
+            onClick={handleMultiUpload}
+            disabled={!multiFile || multiUploading}
+            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+          >
+            {multiUploading ? "Processing..." : "Extract garments"}
+          </button>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          {multiFile ? `Selected: ${multiFile.name}` : "Use a photo that contains multiple items. VESTI will try to extract up to 5 garments."}
+        </div>
+      </section>
+
+      {/* Outfit load mode */}
+      <section className="border rounded-lg p-4 space-y-3">
+        <h2 className="text-lg font-medium">Outfit load mode (slot-based extraction)</h2>
+
+        <div className="flex items-center gap-4 flex-wrap">
+          <input
+            id="outfit-input"
+            type="file"
+            accept="image/*"
+            onChange={handleOutfitChange}
+            className="block text-sm"
+          />
+
+          <button
+            onClick={handleOutfitLoad}
+            disabled={!outfitFile || outfitLoading}
+            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+          >
+            {outfitLoading ? "Loading outfit..." : "Load outfit items"}
+          </button>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          {outfitFile ? `Selected: ${outfitFile.name}` : "Use a full outfit photo (person wearing the outfit). VESTI will try to extract slots (top, bottom, shoes, etc.)."}
+          {outfitLoadNotes ? <div className="pt-1">{outfitLoadNotes}</div> : null}
+        </div>
+      </section>
+
       {/* Add by text */}
       <section className="border rounded-lg p-4 space-y-3">
         <h2 className="text-lg font-medium">Add garment by text</h2>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <input
             value={textQuery}
             onChange={(e) => setTextQuery(e.target.value)}
@@ -538,11 +877,7 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
           </div>
         </div>
 
-        {outfitError ? (
-          <div className="text-sm text-red-400">
-            {outfitError}
-          </div>
-        ) : null}
+        {outfitError ? <div className="text-sm text-red-400">{outfitError}</div> : null}
 
         {outfitWarnings.length ? (
           <div className="text-xs text-yellow-300 space-y-1">
@@ -560,11 +895,7 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
               {outfitItems.map((it) => (
                 <div key={`${it.slot}:${it.garment.id}`}>
                   {renderGarmentCard(it.garment, { badge: it.slot.toUpperCase() })}
-                  {it.reason ? (
-                    <div className="text-xs text-gray-500 pt-2">
-                      {it.reason}
-                    </div>
-                  ) : null}
+                  {it.reason ? <div className="text-xs text-gray-500 pt-2">{it.reason}</div> : null}
                 </div>
               ))}
             </div>
@@ -572,9 +903,7 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
             {outfitReasoning ? (
               <div className="border rounded-lg p-3 bg-white/5">
                 <div className="text-sm font-medium mb-2">Reasoning</div>
-                <pre className="text-xs whitespace-pre-wrap text-gray-200">
-                  {outfitReasoning}
-                </pre>
+                <pre className="text-xs whitespace-pre-wrap text-gray-200">{outfitReasoning}</pre>
               </div>
             ) : null}
           </div>
@@ -599,9 +928,22 @@ const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
         ) : garments.length === 0 ? (
           <p className="text-sm text-gray-500">No garments yet. Add your first one above.</p>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {garments.map((g) => (
-              <div key={g.id}>{renderGarmentCard(g)}</div>
+          <div className="space-y-8">
+            {groupedWardrobe.map((group) => (
+              <div key={group.key} className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-medium">
+                    {group.title}
+                    <span className="ml-2 text-xs text-gray-500">({group.items.length})</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                  {group.items.map((g) => (
+                    <div key={g.id}>{renderGarmentCard(g)}</div>
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
         )}

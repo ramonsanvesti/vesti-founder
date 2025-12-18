@@ -102,6 +102,57 @@ function isHeadwear(g: GarmentRow): boolean {
   );
 }
 
+function looksLikeSlot(g: GarmentRow, slot: OutfitSlot): boolean {
+  const tags = safeTags(g);
+  const uct = safeUseCaseTags(g);
+  const sub = norm(g.subcategory ?? "");
+  const name = norm(displayName(g));
+  const blob = `${name} ${sub} ${tags.join(" ")} ${uct.join(" ")}`;
+
+  // Heuristic slot filters used ONLY when we are forced to fall back to `unknown`.
+  if (slot === "top") {
+    return (
+      blob.includes("tee") ||
+      blob.includes("t shirt") ||
+      blob.includes("t-shirt") ||
+      blob.includes("shirt") ||
+      blob.includes("crewneck") ||
+      blob.includes("sweater") ||
+      blob.includes("hoodie") ||
+      blob.includes("jacket")
+    );
+  }
+
+  if (slot === "bottom") {
+    return (
+      blob.includes("pant") ||
+      blob.includes("pants") ||
+      blob.includes("trouser") ||
+      blob.includes("jean") ||
+      blob.includes("denim") ||
+      blob.includes("jogger") ||
+      blob.includes("short")
+    );
+  }
+
+  if (slot === "shoes") {
+    return (
+      blob.includes("shoe") ||
+      blob.includes("shoes") ||
+      blob.includes("sneaker") ||
+      blob.includes("sneakers") ||
+      blob.includes("trainer") ||
+      blob.includes("boot") ||
+      blob.includes("loafer") ||
+      blob.includes("sandal") ||
+      blob.includes("slide")
+    );
+  }
+
+  // Optional slots: allow anything; scoring handles the rest.
+  return true;
+}
+
 function scoreGarment(g: GarmentRow, targetUseCase: UseCase, slot: OutfitSlot): { score: number; reasonBits: string[] } {
   const reasonBits: string[] = [];
   let score = 0;
@@ -175,10 +226,18 @@ function scoreGarment(g: GarmentRow, targetUseCase: UseCase, slot: OutfitSlot): 
   return { score, reasonBits };
 }
 
-function pickBest(candidates: GarmentRow[], targetUseCase: UseCase, slot: OutfitSlot): PickedItem | null {
+function pickBest(
+  candidates: GarmentRow[],
+  targetUseCase: UseCase,
+  slot: OutfitSlot,
+  excludeIds: Set<string> = new Set()
+): PickedItem | null {
   let best: PickedItem | null = null;
 
   for (const g of candidates) {
+    if (!g?.id) continue;
+    if (excludeIds.has(g.id)) continue;
+
     const { score, reasonBits } = scoreGarment(g, targetUseCase, slot);
     const reason = `${displayName(g)}: ${reasonBits.join(" · ") || "Selected by fallback rules"}`;
 
@@ -323,10 +382,10 @@ export async function POST(req: NextRequest) {
     const by = bucketByCategory(wardrobe);
 
     // Minimum required: top + bottom + shoes
-    // Intelligent fallback: if category buckets are empty but we have unknown, try to reuse unknown.
-    const topsPool = by.tops.length ? by.tops : by.unknown;
-    const bottomsPool = by.bottoms.length ? by.bottoms : by.unknown;
-    const shoesPool = by.shoes.length ? by.shoes : by.unknown;
+    // Intelligent fallback: if a bucket is empty but we have `unknown`, filter unknown with slot heuristics.
+    const topsPool = by.tops.length ? by.tops : by.unknown.filter((g) => looksLikeSlot(g, "top"));
+    const bottomsPool = by.bottoms.length ? by.bottoms : by.unknown.filter((g) => looksLikeSlot(g, "bottom"));
+    const shoesPool = by.shoes.length ? by.shoes : by.unknown.filter((g) => looksLikeSlot(g, "shoes"));
 
     if (!topsPool.length || !bottomsPool.length || !shoesPool.length) {
       const missing = [
@@ -356,9 +415,17 @@ export async function POST(req: NextRequest) {
 
     const picked: PickedItem[] = [];
 
-    const topPick = pickBest(topsPool, targetUseCase, "top");
-    const bottomPick = pickBest(bottomsPool, targetUseCase, "bottom");
-    const shoesPick = pickBest(shoesPool, targetUseCase, "shoes");
+    // Avoid selecting the same garment multiple times when falling back to `unknown`.
+    const pickedIds = new Set<string>();
+
+    const topPick = pickBest(topsPool, targetUseCase, "top", pickedIds);
+    if (topPick) pickedIds.add(topPick.garment.id);
+
+    const bottomPick = pickBest(bottomsPool, targetUseCase, "bottom", pickedIds);
+    if (bottomPick) pickedIds.add(bottomPick.garment.id);
+
+    const shoesPick = pickBest(shoesPool, targetUseCase, "shoes", pickedIds);
+    if (shoesPick) pickedIds.add(shoesPick.garment.id);
 
     if (!topPick || !bottomPick || !shoesPick) {
       return NextResponse.json(
@@ -378,22 +445,31 @@ export async function POST(req: NextRequest) {
 
     if (shouldAddOuterwear && by.outerwear.length > 0) {
       // Avoid picking an outerwear that is basically the same item as the top (rare, but helpful)
-      const outerPick = pickBest(by.outerwear, targetUseCase, "outerwear");
-      if (outerPick) picked.push(outerPick);
+      const outerPick = pickBest(by.outerwear, targetUseCase, "outerwear", pickedIds);
+      if (outerPick) {
+        picked.push(outerPick);
+        pickedIds.add(outerPick.garment.id);
+      }
     }
 
     // Optional accessory: controlled and de-weight headwear so it doesn't show up everywhere
     if (includeAccessory && by.accessories.length > 0) {
       // If winter, allow accessories but do not force headwear
       // Also: only one accessory max in v1
-      const accessoryPick = pickBest(by.accessories, targetUseCase, "accessory");
-      if (accessoryPick && accessoryPick.score >= 0) picked.push(accessoryPick);
+      const accessoryPick = pickBest(by.accessories, targetUseCase, "accessory", pickedIds);
+      if (accessoryPick && accessoryPick.score >= 0) {
+        picked.push(accessoryPick);
+        pickedIds.add(accessoryPick.garment.id);
+      }
     }
 
     // Optional fragrance: only if explicitly enabled
     if (includeFragrance && by.fragrance.length > 0) {
-      const fragPick = pickBest(by.fragrance, targetUseCase, "fragrance");
-      if (fragPick) picked.push(fragPick);
+      const fragPick = pickBest(by.fragrance, targetUseCase, "fragrance", pickedIds);
+      if (fragPick) {
+        picked.push(fragPick);
+        pickedIds.add(fragPick.garment.id);
+      }
     }
 
     // Build coherent, human reasoning
