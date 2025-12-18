@@ -8,7 +8,7 @@ type Garment = {
   source_image_id?: string | null;
   fingerprint?: string | null;
 
-  image_url: string | null;
+  image_url: string | null; // must be WebP from DB
   catalog_name: string | null;
 
   category: string | null;
@@ -33,7 +33,13 @@ type Garment = {
   updated_at?: string;
 };
 
-type OutfitSlot = "top" | "bottom" | "shoes" | "outerwear" | "accessory" | "fragrance";
+type OutfitSlot =
+  | "top"
+  | "bottom"
+  | "shoes"
+  | "outerwear"
+  | "accessory"
+  | "fragrance";
 
 type OutfitItem = {
   slot: OutfitSlot;
@@ -63,13 +69,21 @@ type IngestSingleResponse = {
 
 type IngestBatchResponse = {
   ok: boolean;
+  mode?: string;
+  multi?: boolean;
+  okCount?: number;
   inserted: Array<{
     imageUrl: string;
+    webpUrl?: string;
     ok: boolean;
-    garment: Garment | null;
-    error: string | null;
+    garment?: Garment | null;
+    garments?: Garment[];
+    skipped?: boolean;
+    fallback?: boolean;
+    count?: number;
+    error?: string | null;
+    details?: string;
   }>;
-  okCount: number;
   error?: string;
   details?: string;
 };
@@ -94,7 +108,9 @@ async function getSupabase() {
 
 function httpsify(url?: string | null) {
   if (!url) return null;
-  return url.startsWith("http://") ? url.replace("http://", "https://") : url;
+  const u = String(url).trim();
+  if (!u) return null;
+  return u.startsWith("http://") ? u.replace("http://", "https://") : u;
 }
 
 function displayName(g: Garment) {
@@ -113,17 +129,24 @@ export default function WardrobeClient() {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
-  // Batch upload (up to 5 photos)
+  // Batch upload (up to 25 photos) + optional multi-item detection per photo
   const [batchFiles, setBatchFiles] = useState<File[]>([]);
   const [batchUploading, setBatchUploading] = useState(false);
-  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number; ok: number; failed: number }>({
+  const [batchMulti, setBatchMulti] = useState(false);
+  const [batchMaxItemsPerPhoto, setBatchMaxItemsPerPhoto] = useState(5);
+  const [batchProgress, setBatchProgress] = useState<{
+    done: number;
+    total: number;
+    ok: number;
+    failed: number;
+  }>({
     done: 0,
     total: 0,
     ok: 0,
     failed: 0,
   });
 
-  // Multi detection (up to 5 garments from one photo)
+  // Multi detection (single photo -> up to 5 garments)
   const [multiFile, setMultiFile] = useState<File | null>(null);
   const [multiUploading, setMultiUploading] = useState(false);
 
@@ -138,7 +161,15 @@ export default function WardrobeClient() {
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
-    "casual" | "streetwear" | "work" | "athletic" | "formal" | "winter" | "summer" | "travel" | "lounge"
+    | "casual"
+    | "streetwear"
+    | "work"
+    | "athletic"
+    | "formal"
+    | "winter"
+    | "summer"
+    | "travel"
+    | "lounge"
   >("streetwear");
 
   const [includeAccessory, setIncludeAccessory] = useState(true);
@@ -184,7 +215,15 @@ export default function WardrobeClient() {
   }, []);
 
   const wardrobeCounts = useMemo(() => {
-    const counts = { tops: 0, bottoms: 0, shoes: 0, outerwear: 0, accessories: 0, fragrance: 0, unknown: 0 };
+    const counts = {
+      tops: 0,
+      bottoms: 0,
+      shoes: 0,
+      outerwear: 0,
+      accessories: 0,
+      fragrance: 0,
+      unknown: 0,
+    };
     for (const g of garments) {
       const c = norm(g.category ?? "");
       if (c === "tops") counts.tops++;
@@ -199,8 +238,6 @@ export default function WardrobeClient() {
   }, [garments]);
 
   const groupedWardrobe = useMemo(() => {
-    // Group garments by source_image_id (when present) so items extracted from the same photo stay together.
-    // This makes multi-item and outfit-photo ingestion feel coherent and prevents UI chaos.
     const map = new Map<string, Garment[]>();
 
     for (const g of garments) {
@@ -210,8 +247,6 @@ export default function WardrobeClient() {
       map.set(key, arr);
     }
 
-    // Preserve recency: garments are already ordered by created_at desc.
-    // We keep the first-seen group order.
     const order: string[] = [];
     for (const g of garments) {
       const key = (g.source_image_id ?? "").trim() || "__ungrouped__";
@@ -303,10 +338,10 @@ export default function WardrobeClient() {
   };
 
   // ----------------------------
-  // Batch upload (up to 5 photos)
+  // Batch upload (up to 25 photos) -> mode:"batch" + multi:true/false
   // ----------------------------
   const handleBatchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []).slice(0, 5);
+    const files = Array.from(e.target.files || []).slice(0, 25);
     setBatchFiles(files);
   };
 
@@ -317,7 +352,7 @@ export default function WardrobeClient() {
       setBatchUploading(true);
       setBatchProgress({ done: 0, total: batchFiles.length, ok: 0, failed: 0 });
 
-      // Upload sequentially (more stable than parallel; fewer intermittent storage issues)
+      // Upload sequentially for stability
       const urls: string[] = [];
       for (let i = 0; i < batchFiles.length; i++) {
         const u = await uploadOneToStorage(batchFiles[i]);
@@ -329,8 +364,12 @@ export default function WardrobeClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          mode: "batch_photo",
-          payload: { imageUrls: urls },
+          mode: "batch",
+          payload: {
+            imageUrls: urls,
+            multi: batchMulti,
+            maxItemsPerPhoto: Math.min(5, Math.max(1, Number(batchMaxItemsPerPhoto || 5))),
+          },
         }),
       });
 
@@ -343,16 +382,37 @@ export default function WardrobeClient() {
       }
 
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
-      const okGarments = inserted.filter((r) => r.ok && r.garment).map((r) => r.garment!) as Garment[];
 
-      setBatchProgress((p) => ({
-        ...p,
-        ok: okGarments.length,
-        failed: Math.max(0, inserted.length - okGarments.length),
-      }));
+      // Collect garments from either `garment` (single) or `garments` (multi)
+      const allNew: Garment[] = [];
+      let ok = 0;
+      let failed = 0;
 
-      if (okGarments.length) {
-        setGarments((prev) => [...okGarments, ...prev]);
+      for (const r of inserted) {
+        if (!r || !r.ok) {
+          failed++;
+          continue;
+        }
+
+        const gs = Array.isArray(r.garments) ? r.garments.filter(Boolean) : [];
+        if (gs.length) {
+          ok++;
+          allNew.push(...(gs as Garment[]));
+          continue;
+        }
+
+        if (r.garment) {
+          ok++;
+          allNew.push(r.garment as Garment);
+        } else {
+          failed++;
+        }
+      }
+
+      setBatchProgress((p) => ({ ...p, ok, failed }));
+
+      if (allNew.length) {
+        setGarments((prev) => [...allNew, ...prev]);
       }
 
       setBatchFiles([]);
@@ -460,11 +520,17 @@ export default function WardrobeClient() {
       }
 
       const notesParts: string[] = [];
-      if (typeof json.outfit_confidence === "number") notesParts.push(`Outfit confidence: ${json.outfit_confidence.toFixed(2)}`);
+      if (typeof json.outfit_confidence === "number")
+        notesParts.push(`Outfit confidence: ${json.outfit_confidence.toFixed(2)}`);
       if (json.outfit_notes) notesParts.push(json.outfit_notes);
-      if (Array.isArray(json.failures) && json.failures.length) notesParts.push(`Failures: ${json.failures.length}`);
+      if (Array.isArray(json.failures) && json.failures.length)
+        notesParts.push(`Failures: ${json.failures.length}`);
 
-      setOutfitLoadNotes(notesParts.length ? notesParts.join(" · ") : `Loaded ${newGarments.length} item(s) from outfit photo.`);
+      setOutfitLoadNotes(
+        notesParts.length
+          ? notesParts.join(" · ")
+          : `Loaded ${newGarments.length} item(s) from outfit photo.`
+      );
 
       setOutfitFile(null);
 
@@ -558,7 +624,6 @@ export default function WardrobeClient() {
         return;
       }
 
-      // Outfit can be null; do NOT assume outfit.user_id exists.
       setOutfitItems(items);
       setOutfitReasoning(json.reasoning || "");
       setOutfitWarnings(Array.isArray(json.warnings) ? json.warnings : []);
@@ -588,7 +653,10 @@ export default function WardrobeClient() {
     return (
       <div className="flex flex-wrap gap-2 pt-1">
         {tags.slice(0, 16).map((t) => (
-          <span key={t} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
+          <span
+            key={t}
+            className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
+          >
             {t}
           </span>
         ))}
@@ -597,6 +665,7 @@ export default function WardrobeClient() {
   };
 
   const renderGarmentCard = (g: Garment, extra?: { badge?: string }) => {
+    // Always use DB-stored image_url (already WebP). Do NOT depend on original upload URL.
     const src = httpsify(g.image_url);
     const name = displayName(g);
     const cat = (g.category ?? "").trim();
@@ -618,9 +687,7 @@ export default function WardrobeClient() {
       .filter(Boolean)
       .join(" · ");
 
-    const sourceLine = g.source_image_id
-      ? `source: ${String(g.source_image_id).slice(0, 8)}…`
-      : null;
+    const sourceLine = g.source_image_id ? `source: ${String(g.source_image_id).slice(0, 8)}…` : null;
 
     return (
       <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
@@ -701,7 +768,7 @@ export default function WardrobeClient() {
 
       {/* Batch upload */}
       <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Batch upload (up to 5 photos)</h2>
+        <h2 className="text-lg font-medium">Batch upload (up to 25 photos)</h2>
 
         <div className="flex items-center gap-4 flex-wrap">
           <input
@@ -722,8 +789,36 @@ export default function WardrobeClient() {
           </button>
         </div>
 
+        <div className="flex items-center gap-4 flex-wrap">
+          <label className="text-sm flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={batchMulti}
+              onChange={(e) => setBatchMulti(e.target.checked)}
+            />
+            Multi-item per photo (extract up to 5 garments)
+          </label>
+
+          <label className="text-sm flex items-center gap-2">
+            Max items/photo
+            <select
+              value={batchMaxItemsPerPhoto}
+              onChange={(e) => setBatchMaxItemsPerPhoto(Number(e.target.value))}
+              className="border rounded-md px-2 py-2 text-sm bg-transparent"
+              disabled={!batchMulti}
+              title={batchMulti ? "Max garments extracted per photo" : "Enable multi-item to use this"}
+            >
+              <option value={1}>1</option>
+              <option value={2}>2</option>
+              <option value={3}>3</option>
+              <option value={4}>4</option>
+              <option value={5}>5</option>
+            </select>
+          </label>
+        </div>
+
         <div className="text-xs text-gray-500">
-          {batchFiles.length ? `Selected: ${batchFiles.length} file(s)` : "Select up to 5 images."}
+          {batchFiles.length ? `Selected: ${batchFiles.length} file(s)` : "Select up to 25 images."}
           {batchUploading && batchProgress.total ? (
             <span className="ml-2">
               Progress: {batchProgress.done}/{batchProgress.total}
@@ -734,6 +829,10 @@ export default function WardrobeClient() {
               Done · OK {batchProgress.ok} · Failed {batchProgress.failed}
             </span>
           ) : null}
+          <div className="pt-1">
+            Batch calls <code>/api/ingest</code> with{" "}
+            <code>{`{ mode:"batch", payload:{ imageUrls:[...], multi:true/false } }`}</code>.
+          </div>
         </div>
       </section>
 
@@ -760,7 +859,9 @@ export default function WardrobeClient() {
         </div>
 
         <div className="text-xs text-gray-500">
-          {multiFile ? `Selected: ${multiFile.name}` : "Use a photo that contains multiple items. VESTI will try to extract up to 5 garments."}
+          {multiFile
+            ? `Selected: ${multiFile.name}`
+            : "Use a photo that contains multiple items. VESTI will try to extract up to 5 garments."}
         </div>
       </section>
 
@@ -787,7 +888,9 @@ export default function WardrobeClient() {
         </div>
 
         <div className="text-xs text-gray-500">
-          {outfitFile ? `Selected: ${outfitFile.name}` : "Use a full outfit photo (person wearing the outfit). VESTI will try to extract slots (top, bottom, shoes, etc.)."}
+          {outfitFile
+            ? `Selected: ${outfitFile.name}`
+            : "Use a full outfit photo (person wearing the outfit). VESTI will try to extract slots (top, bottom, shoes, etc.)."}
           {outfitLoadNotes ? <div className="pt-1">{outfitLoadNotes}</div> : null}
         </div>
       </section>
@@ -870,7 +973,11 @@ export default function WardrobeClient() {
               onClick={() => generateOutfit({ regenerate: true })}
               disabled={generating || !canRegenerate}
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
-              title={canRegenerate ? "Generate a variation (auto-exclude items from seed outfit)" : "Generate first to enable variations"}
+              title={
+                canRegenerate
+                  ? "Generate a variation (auto-exclude items from seed outfit)"
+                  : "Generate first to enable variations"
+              }
             >
               {generating ? "Working..." : "Regenerate Variation"}
             </button>
