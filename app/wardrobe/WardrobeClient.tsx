@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import ConfirmGarment from "@/app/wardrobe/ConfirmGarment";
 
 type Garment = {
   id: string;
@@ -72,6 +73,12 @@ type IngestBatchResponse = {
   details?: string;
 };
 
+type ConfirmDefaults = {
+  subcategory: string;
+  wear_temperature: "Cold" | "Mild" | "Warm";
+  formality_feel: "Casual" | "Smart Casual" | "Formal";
+};
+
 async function getSupabase() {
   const mod = await import("@/lib/supabaseClientBrowser");
   return mod.getSupabaseBrowserClient();
@@ -90,6 +97,19 @@ function displayName(g: Garment) {
 
 function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+}
+
+function uniqStrings(arr: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of arr) {
+    const t = String(a ?? "").trim();
+    if (!t) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
 }
 
 async function safeFetchJSON(
@@ -146,7 +166,6 @@ function extractGarmentsFromBatch(inserted: any[]): Garment[] {
     return false;
   };
 
-  // Some APIs may return inserted as an object, not an array
   if (!Array.isArray(inserted)) {
     const maybe = (inserted as any)?.inserted ?? (inserted as any)?.results ?? [];
     return extractGarmentsFromBatch(Array.isArray(maybe) ? maybe : []);
@@ -155,13 +174,11 @@ function extractGarmentsFromBatch(inserted: any[]): Garment[] {
   for (const r of inserted || []) {
     if (!r) continue;
 
-    // If the element itself is an array of garments
     if (Array.isArray(r)) {
       pushMany(r);
       continue;
     }
 
-    // Per-photo arrays
     pushMany(r.garments);
     pushMany(r.inserted_garments);
     pushMany(r.data?.garments);
@@ -170,7 +187,6 @@ function extractGarmentsFromBatch(inserted: any[]): Garment[] {
     pushMany(r.data?.items);
     pushMany(r.result?.items);
 
-    // Nested results arrays
     if (Array.isArray(r.results)) {
       for (const rr of r.results) {
         if (!rr) continue;
@@ -180,13 +196,11 @@ function extractGarmentsFromBatch(inserted: any[]): Garment[] {
       }
     }
 
-    // Single garment shapes
     if (pushOne(r.garment)) continue;
     if (pushOne(r.data?.garment)) continue;
     if (pushOne(r.result?.garment)) continue;
   }
 
-  // Dedupe by id
   const seen = new Set<string>();
   const deduped: Garment[] = [];
   for (const g of out) {
@@ -197,6 +211,79 @@ function extractGarmentsFromBatch(inserted: any[]): Garment[] {
   }
 
   return deduped;
+}
+
+function inferWearTemperature(g: Garment): ConfirmDefaults["wear_temperature"] {
+  const tags = Array.isArray(g.tags) ? g.tags.map((t) => norm(String(t))) : [];
+  const sub = norm(g.subcategory ?? "");
+  const cat = norm(g.category ?? "");
+
+  if (
+    tags.includes("winter") ||
+    tags.some((t) => t.includes("season winter")) ||
+    sub.includes("hoodie") ||
+    sub.includes("jacket") ||
+    sub.includes("coat") ||
+    cat === "outerwear"
+  ) {
+    return "Cold";
+  }
+
+  if (
+    sub.includes("short") ||
+    sub.includes("tank") ||
+    sub.includes("tee") ||
+    tags.includes("summer") ||
+    tags.some((t) => t.includes("season summer"))
+  ) {
+    return "Warm";
+  }
+
+  return "Mild";
+}
+
+function inferFormalityFeel(g: Garment): ConfirmDefaults["formality_feel"] {
+  const use = norm(g.use_case ?? "");
+  const tags = Array.isArray(g.tags) ? g.tags.map((t) => norm(String(t))) : [];
+  const sub = norm(g.subcategory ?? "");
+
+  if (use === "formal" || tags.includes("formal") || sub.includes("suit") || sub.includes("dress")) {
+    return "Formal";
+  }
+
+  if (
+    use === "work" ||
+    tags.includes("smart") ||
+    tags.includes("smart casual") ||
+    sub.includes("trouser") ||
+    sub.includes("oxford")
+  ) {
+    return "Smart Casual";
+  }
+
+  return "Casual";
+}
+
+function buildConfirmDefaults(g: Garment): ConfirmDefaults {
+  const existing = g?.metadata?.confirmation ?? null;
+
+  const subcategory = String(g.subcategory ?? existing?.subcategory ?? "").trim() || "unknown";
+
+  const wear_temperature =
+    (existing?.wear_temperature as any) ||
+    inferWearTemperature(g);
+
+  const formality_feel =
+    (existing?.formality_feel as any) ||
+    inferFormalityFeel(g);
+
+  const wt: ConfirmDefaults["wear_temperature"] =
+    wear_temperature === "Cold" || wear_temperature === "Warm" ? wear_temperature : "Mild";
+
+  const ff: ConfirmDefaults["formality_feel"] =
+    formality_feel === "Formal" || formality_feel === "Smart Casual" ? formality_feel : "Casual";
+
+  return { subcategory, wear_temperature: wt, formality_feel: ff };
 }
 
 export default function WardrobeClient() {
@@ -257,6 +344,13 @@ export default function WardrobeClient() {
 
   const [seedOutfitId, setSeedOutfitId] = useState<string | null>(null);
   const [excludeIds, setExcludeIds] = useState<string[]>([]);
+
+  // Confirmation UI
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmSaving, setConfirmSaving] = useState(false);
+  const [confirmGarmentId, setConfirmGarmentId] = useState<string | null>(null);
+  const [confirmQueue, setConfirmQueue] = useState<string[]>([]);
+  const lastQueueSourceRef = useRef<string>("");
 
   const fetchGarments = async () => {
     try {
@@ -333,6 +427,179 @@ export default function WardrobeClient() {
     }));
   }, [garments]);
 
+  const subcategoryOptions = useMemo(() => {
+    const fromWardrobe = garments
+      .map((g) => String(g.subcategory ?? "").trim())
+      .filter(Boolean);
+
+    const base = [
+      "unknown",
+      "t-shirt",
+      "shirt",
+      "long sleeve",
+      "crewneck sweatshirt",
+      "hoodie",
+      "zip hoodie",
+      "jacket",
+      "coat",
+      "trousers",
+      "jeans",
+      "joggers",
+      "shorts",
+      "sneakers",
+      "boots",
+      "loafers",
+      "belt",
+      "cap",
+      "beanie",
+      "bag",
+      "fragrance",
+    ];
+
+    return uniqStrings([...fromWardrobe, ...base]).sort((a, b) => a.localeCompare(b));
+  }, [garments]);
+
+  const confirmGarment = useMemo(() => {
+    if (!confirmGarmentId) return null;
+    return garments.find((g) => g.id === confirmGarmentId) ?? null;
+  }, [confirmGarmentId, garments]);
+
+  const confirmDefaults = useMemo(() => {
+    if (!confirmGarment) return null;
+    return buildConfirmDefaults(confirmGarment);
+  }, [confirmGarment]);
+
+  const openConfirmForGarmentId = (id: string) => {
+    const tid = String(id ?? "").trim();
+    if (!tid) return;
+    setConfirmGarmentId(tid);
+    setConfirmOpen(true);
+  };
+
+  const closeConfirm = () => {
+    setConfirmOpen(false);
+    setConfirmGarmentId(null);
+  };
+
+  const advanceConfirmQueue = () => {
+    setConfirmQueue((q) => {
+      const next = q.slice(1);
+      const nextId = next[0] ?? null;
+      if (nextId) {
+        setConfirmGarmentId(nextId);
+        setConfirmOpen(true);
+      } else {
+        setConfirmOpen(false);
+        setConfirmGarmentId(null);
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!confirmQueue.length) return;
+    if (!confirmOpen) {
+      openConfirmForGarmentId(confirmQueue[0]);
+    }
+  }, [confirmQueue, confirmOpen]);
+
+  const persistConfirmation = async (args: {
+    garmentId: string;
+    subcategory: string;
+    wear_temperature: ConfirmDefaults["wear_temperature"];
+    formality_feel: ConfirmDefaults["formality_feel"];
+  }) => {
+    const { garmentId, subcategory, wear_temperature, formality_feel } = args;
+
+    const supabase = await getSupabase();
+
+    const current = garments.find((g) => g.id === garmentId) ?? null;
+    const existingMeta = (current?.metadata && typeof current.metadata === "object") ? current.metadata : {};
+
+    const nextMeta = {
+      ...existingMeta,
+      confirmation: {
+        subcategory,
+        wear_temperature,
+        formality_feel,
+        confirmed_at: new Date().toISOString(),
+      },
+    };
+
+    const { data, error } = await supabase
+      .from("garments")
+      .update({
+        subcategory,
+        metadata: nextMeta,
+      })
+      .eq("id", garmentId)
+      .select("*")
+      .single();
+
+    if (error) throw new Error(error.message);
+
+    if (data?.id) {
+      setGarments((prev) => prev.map((g) => (g.id === data.id ? (data as Garment) : g)));
+    }
+  };
+
+  const onConfirmSave = async (values: ConfirmDefaults) => {
+    if (!confirmGarmentId) return;
+
+    try {
+      setConfirmSaving(true);
+      await persistConfirmation({
+        garmentId: confirmGarmentId,
+        subcategory: values.subcategory,
+        wear_temperature: values.wear_temperature,
+        formality_feel: values.formality_feel,
+      });
+
+      if (confirmQueue.length) {
+        advanceConfirmQueue();
+      } else {
+        closeConfirm();
+      }
+    } catch (e: any) {
+      console.error("Confirm save failed:", e);
+      alert(e?.message || "Save failed");
+    } finally {
+      setConfirmSaving(false);
+    }
+  };
+
+  const onConfirmSkip = async () => {
+    if (!confirmGarmentId) return;
+
+    try {
+      setConfirmSaving(true);
+
+      const defaults = confirmDefaults ?? {
+        subcategory: "unknown",
+        wear_temperature: "Mild" as const,
+        formality_feel: "Casual" as const,
+      };
+
+      await persistConfirmation({
+        garmentId: confirmGarmentId,
+        subcategory: defaults.subcategory,
+        wear_temperature: defaults.wear_temperature,
+        formality_feel: defaults.formality_feel,
+      });
+
+      if (confirmQueue.length) {
+        advanceConfirmQueue();
+      } else {
+        closeConfirm();
+      }
+    } catch (e: any) {
+      console.error("Confirm skip failed:", e);
+      alert(e?.message || "Save failed");
+    } finally {
+      setConfirmSaving(false);
+    }
+  };
+
   // Storage upload helper
   const uploadOneToStorage = async (fileToUpload: File): Promise<string> => {
     const supabase = await getSupabase();
@@ -382,7 +649,6 @@ export default function WardrobeClient() {
         message: "Uploading to Storage…",
       });
 
-      // Upload sequentially for stability
       const urls: string[] = [];
       for (let i = 0; i < ingestFiles.length; i++) {
         const u = await uploadOneToStorage(ingestFiles[i]);
@@ -424,7 +690,6 @@ export default function WardrobeClient() {
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
       const allNew = extractGarmentsFromBatch(inserted);
 
-      // Prefer server counters when available, otherwise infer
       const ok =
         typeof json.okCount === "number"
           ? json.okCount
@@ -455,8 +720,16 @@ export default function WardrobeClient() {
         });
       }
 
-      // Always refresh from DB to reflect server-side dedupe/fingerprint
       await fetchGarments();
+
+      if (allNew.length) {
+        const queueIds = uniqStrings(allNew.map((g) => g.id));
+        const stamp = queueIds.join(",");
+        if (stamp && stamp !== lastQueueSourceRef.current) {
+          lastQueueSourceRef.current = stamp;
+          setConfirmQueue(queueIds);
+        }
+      }
 
       setIngestFiles([]);
       const input = document.getElementById("ingest-input") as HTMLInputElement | null;
@@ -517,9 +790,12 @@ export default function WardrobeClient() {
         return;
       }
 
-      setGarments((prev) => [json.garment as Garment, ...prev]);
+      const newG = json.garment as Garment;
+      setGarments((prev) => [newG as Garment, ...prev]);
       await fetchGarments();
       setTextQuery("");
+
+      setConfirmQueue([newG.id]);
     } catch (e: any) {
       console.error("Unexpected add-by-text error:", e);
       alert(e?.message || "Unexpected error.");
@@ -630,25 +906,31 @@ export default function WardrobeClient() {
       .filter(Boolean)
       .join(" · ");
 
-    const sourceLine = g.source_image_id
-      ? `source: ${String(g.source_image_id).slice(0, 8)}…`
-      : null;
+    const sourceLine = g.source_image_id ? `source: ${String(g.source_image_id).slice(0, 8)}…` : null;
+    const confirmed = Boolean(g?.metadata?.confirmation?.confirmed_at);
 
     return (
       <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
-        {extra?.badge ? (
-          <div className="text-xs inline-flex self-start px-2 py-1 rounded-full border border-white/10 bg-white/5">
-            {extra.badge}
-          </div>
-        ) : null}
+        <div className="flex items-center justify-between gap-2">
+          {extra?.badge ? (
+            <div className="text-xs inline-flex self-start px-2 py-1 rounded-full border border-white/10 bg-white/5">
+              {extra.badge}
+            </div>
+          ) : (
+            <div />
+          )}
+
+          <button
+            onClick={() => openConfirmForGarmentId(g.id)}
+            className="text-xs px-2 py-1 rounded border border-white/15 bg-white/5"
+            title="Review and save the 3-field confirmation"
+          >
+            {confirmed ? "Review" : "Confirm"}
+          </button>
+        </div>
 
         {src ? (
-          <img
-            src={src}
-            alt={name}
-            className="w-full h-40 object-cover rounded"
-            loading="lazy"
-          />
+          <img src={src} alt={name} className="w-full h-40 object-cover rounded" loading="lazy" />
         ) : (
           <div className="w-full h-40 rounded bg-white/5 border border-white/10 flex items-center justify-center text-xs text-gray-400">
             No image
@@ -657,12 +939,7 @@ export default function WardrobeClient() {
 
         <div className="font-medium">{name}</div>
 
-        {(cat || sub) && (
-          <div className="text-xs text-gray-500">
-            {[cat, sub].filter(Boolean).join(" · ")}
-          </div>
-        )}
-
+        {(cat || sub) && <div className="text-xs text-gray-500">{[cat, sub].filter(Boolean).join(" · ")}</div>}
         {metaLine ? <div className="text-xs text-gray-500">{metaLine}</div> : null}
         {sourceLine ? <div className="text-[11px] text-gray-600">{sourceLine}</div> : null}
 
@@ -673,6 +950,22 @@ export default function WardrobeClient() {
 
   return (
     <main className="p-6 space-y-8">
+      {/* Confirmation Modal */}
+      {confirmOpen && confirmGarment && confirmDefaults ? (
+        <ConfirmGarment
+          open={confirmOpen}
+          garment={confirmGarment}
+          defaults={confirmDefaults}
+          subcategoryOptions={subcategoryOptions}
+          saving={confirmSaving}
+          onClose={() => {
+            closeConfirm();
+          }}
+          onSave={onConfirmSave}
+          onSkip={onConfirmSkip}
+        />
+      ) : null}
+
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
