@@ -381,10 +381,9 @@ async function insertOneGarment(args: {
     formality_feel: null,
   });
 
-  // Convenience: store the final scores in dedicated columns if they exist in the DB.
-  // These are also persisted in metadata.scores for forward compatibility.
-  const comfortScore = scoring?.final?.comfort ?? null;
-  const formalityScore = scoring?.final?.formality ?? null;
+  // Always persist integer scores, defaulting to 3 if not an integer.
+  const comfortScore = Number.isInteger(scoring?.final?.comfort) ? scoring.final.comfort : 3;
+  const formalityScore = Number.isInteger(scoring?.final?.formality) ? scoring.final.formality : 3;
 
   const lock = enforceSlotCategoryLock({
     slotHint: slotHint ?? null,
@@ -456,8 +455,6 @@ async function insertOneGarment(args: {
     seasons: vision?.seasons ?? [],
     size: vision?.size ?? null,
     confidence: typeof vision?.confidence === "number" ? vision.confidence : null,
-    comfort_score: comfortScore,
-    formality_score: formalityScore,
 
     raw_text: vision?.raw_text ?? vision?.raw_notes ?? null,
     quantity: 1,
@@ -466,9 +463,15 @@ async function insertOneGarment(args: {
       scores: {
         engine: "deterministic_v1",
         matched_rule: scoring.matched_rule ?? null,
-        base: scoring.base,
-        final: scoring.final,
-        adjustments_applied: scoring.adjustments_applied,
+        base: {
+          comfort: Number.isInteger(scoring?.base?.comfort) ? scoring.base.comfort : 3,
+          formality: Number.isInteger(scoring?.base?.formality) ? scoring.base.formality : 3,
+        },
+        final: {
+          comfort: Number.isInteger(scoring?.final?.comfort) ? scoring.final.comfort : 3,
+          formality: Number.isInteger(scoring?.final?.formality) ? scoring.final.formality : 3,
+        },
+        adjustments_applied: Boolean(scoring?.adjustments_applied),
         updated_at: new Date().toISOString(),
       },
       tags_source: tagsSource,
@@ -938,6 +941,166 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Invalid mode" }, { status: 400 });
   } catch (err: any) {
     console.error("Error in /api/ingest:", err);
+    return NextResponse.json(
+      { ok: false, error: "Server error", details: err?.message ?? "unknown" },
+      { status: 500 }
+    );
+  }
+}
+
+// EPIC 6.2 — Edit existing garment (re-edit classification later)
+// Reuses the same deterministic scoring engine and persists without duplicating records.
+
+type WearTemperature = "cold" | "mild" | "warm";
+
+// scoring.ts expects the space-form: "smart casual".
+// We accept legacy underscore form from older UI payloads.
+type FormalityFeelNormalized = "casual" | "smart casual" | "formal";
+type FormalityFeelInput = FormalityFeelNormalized | "smart_casual";
+
+function normalizeFormalityFeel(v: any): FormalityFeelNormalized | null {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  if (s === "smart_casual") return "smart casual";
+  if (s === "smart casual") return "smart casual";
+  if (s === "casual") return "casual";
+  if (s === "formal") return "formal";
+  return null;
+}
+
+function normalizeWearTemperature(v: any): WearTemperature | null {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  if (s === "cold" || s === "mild" || s === "warm") return s as WearTemperature;
+  return null;
+}
+
+type PatchBody = {
+  garment_id: string;
+  subcategory: string;
+  wear_temperature?: WearTemperature | null;
+  formality_feel?: FormalityFeelInput | null;
+};
+
+export async function PATCH(req: NextRequest) {
+  try {
+    const body = (await req.json().catch(() => null)) as PatchBody | null;
+
+    if (!body?.garment_id) {
+      return NextResponse.json({ ok: false, error: "Missing garment_id" }, { status: 400 });
+    }
+
+    const desiredSubcategory = String(body.subcategory ?? "").trim();
+    if (!desiredSubcategory) {
+      return NextResponse.json({ ok: false, error: "Missing subcategory" }, { status: 400 });
+    }
+
+    const wear_temperature = normalizeWearTemperature(body.wear_temperature);
+    const formality_feel = normalizeFormalityFeel(body.formality_feel);
+
+    const supabase = getSupabaseServerClient();
+
+    // Founder Edition fake user_id (replace with auth later)
+    const fakeUserId = "00000000-0000-0000-0000-000000000001";
+
+    // Load existing garment
+    const { data: existing, error: readErr } = await supabase
+      .from("garments")
+      .select("*")
+      .eq("id", body.garment_id)
+      .eq("user_id", fakeUserId)
+      .single();
+
+    if (readErr || !existing) {
+      return NextResponse.json(
+        { ok: false, error: "Garment not found", details: readErr?.message ?? null },
+        { status: 404 }
+      );
+    }
+
+    const existingTags: string[] = Array.isArray(existing.tags)
+      ? existing.tags.map((t: any) => normTag(String(t))).filter(Boolean)
+      : [];
+
+    // Normalize category/subcategory from the chosen subcategory.
+    // We keep the existing tags/title so the category resolver has context.
+    const normalized = normalizeCategory({
+      garmentType: null,
+      subcategory: desiredSubcategory,
+      tags: existingTags,
+      title: existing.catalog_name ?? null,
+    });
+
+    // Deterministic scoring with optional user adjustments
+    const scoring = computeDeterministicScores({
+      category: normalized.category,
+      subcategory: normalized.subcategory ?? desiredSubcategory,
+      wear_temperature,
+      formality_feel,
+    });
+
+    const comfortFinal = Number.isInteger(scoring?.final?.comfort) ? scoring.final.comfort : 3;
+    const formalityFinal = Number.isInteger(scoring?.final?.formality) ? scoring.final.formality : 3;
+
+    const nextMeta = {
+      ...(existing.metadata ?? {}),
+      confirmation: {
+        subcategory: normalized.subcategory ?? desiredSubcategory,
+        wear_temperature,
+        formality_feel,
+        updated_at: new Date().toISOString(),
+      },
+      scores: {
+        engine: "deterministic_v1",
+        matched_rule: scoring.matched_rule ?? null,
+        base: {
+          comfort: Number.isInteger(scoring?.base?.comfort) ? scoring.base.comfort : 3,
+          formality: Number.isInteger(scoring?.base?.formality) ? scoring.base.formality : 3,
+        },
+        final: {
+          comfort: comfortFinal,
+          formality: formalityFinal,
+        },
+        adjustments_applied: Boolean(scoring?.adjustments_applied),
+        updated_at: new Date().toISOString(),
+      },
+    };
+
+    const updates: Record<string, any> = {
+      category: normalized.category,
+      subcategory: normalized.subcategory ?? desiredSubcategory,
+      // NOTE: we persist user inputs in metadata.confirmation to avoid schema coupling.
+      metadata: nextMeta,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: updated, error: upErr } = await supabase
+      .from("garments")
+      .update(updates)
+      .eq("id", body.garment_id)
+      .eq("user_id", fakeUserId)
+      .select("*")
+      .single();
+
+    if (upErr) {
+      return NextResponse.json(
+        { ok: false, error: "Failed to update garment", details: upErr.message },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        garment: updated,
+        scores: { comfort: comfortFinal, formality: formalityFinal },
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    console.error("Error in PATCH /api/ingest:", err);
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
       { status: 500 }

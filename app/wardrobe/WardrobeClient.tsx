@@ -278,10 +278,14 @@ function buildConfirmDefaults(g: Garment): ConfirmDefaults {
     inferFormalityFeel(g);
 
   const wt: ConfirmDefaults["wear_temperature"] =
-    wear_temperature === "Cold" || wear_temperature === "Warm" ? wear_temperature : "Mild";
+    wear_temperature === "Cold" || wear_temperature === "Mild" || wear_temperature === "Warm"
+      ? wear_temperature
+      : "Mild";
 
   const ff: ConfirmDefaults["formality_feel"] =
-    formality_feel === "Formal" || formality_feel === "Smart Casual" ? formality_feel : "Casual";
+    formality_feel === "Casual" || formality_feel === "Smart Casual" || formality_feel === "Formal"
+      ? formality_feel
+      : "Casual";
 
   return { subcategory, wear_temperature: wt, formality_feel: ff };
 }
@@ -511,10 +515,45 @@ export default function WardrobeClient() {
   }) => {
     const { garmentId, subcategory, wear_temperature, formality_feel } = args;
 
+    // Prefer server-side persistence so category locking + scoring stay deterministic.
+    // Backend should return `{ ok:true, garment:<row> }`.
+    try {
+      const json = await safeFetchJSON(
+        "/api/ingest",
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            garment_id: garmentId,
+            confirmation: {
+              subcategory,
+              wear_temperature,
+              formality_feel,
+            },
+          }),
+        },
+        120000
+      );
+
+      if (json?.ok && json?.garment?.id) {
+        const updated = json.garment as Garment;
+        setGarments((prev) => prev.map((g) => (g.id === updated.id ? updated : g)));
+        return;
+      }
+
+      if (json && !json?.ok) {
+        throw new Error(json?.details || json?.error || "Confirmation save failed");
+      }
+    } catch (e: any) {
+      // Fallback to client-side update (works for Founder Edition, but won’t recalc scores)
+      console.warn("/api/ingest PATCH failed, falling back to direct Supabase update:", e?.message || e);
+    }
+
     const supabase = await getSupabase();
 
     const current = garments.find((g) => g.id === garmentId) ?? null;
-    const existingMeta = (current?.metadata && typeof current.metadata === "object") ? current.metadata : {};
+    const existingMeta =
+      current?.metadata && typeof current.metadata === "object" ? current.metadata : {};
 
     const nextMeta = {
       ...existingMeta,
@@ -574,11 +613,15 @@ export default function WardrobeClient() {
     try {
       setConfirmSaving(true);
 
-      const defaults = confirmDefaults ?? {
-        subcategory: "unknown",
-        wear_temperature: "Mild" as const,
-        formality_feel: "Casual" as const,
-      };
+      const defaults =
+        confirmDefaults ??
+        (confirmGarment
+          ? buildConfirmDefaults(confirmGarment)
+          : {
+              subcategory: "unknown",
+              wear_temperature: "Mild" as const,
+              formality_feel: "Casual" as const,
+            });
 
       await persistConfirmation({
         garmentId: confirmGarmentId,
