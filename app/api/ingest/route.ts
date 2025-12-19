@@ -21,12 +21,11 @@ import {
   type VisionResult,
 } from "@/lib/vision";
 
-// Modes
-// - photo: 1 photo -> 1 garment
-// - text: query -> CSE image -> 1 garment
-// - batch: up to 25 photos -> 1 garment per photo OR multi-item per photo
-// - multi_photo: 1 photo -> up to 5 garments
-// - outfit_photo: 1 photo -> slot-based extraction -> multiple garments
+/**
+ * Unified ingest model
+ * - UI should always call mode:"batch" even for 1 photo.
+ * - Back-compat: accepts legacy modes "photo" | "multi_photo" | "outfit_photo" and maps them internally.
+ */
 
 type IngestMode = "photo" | "text" | "batch" | "multi_photo" | "outfit_photo";
 
@@ -37,7 +36,8 @@ type IngestRequestBody =
       mode: "batch";
       payload: {
         imageUrls: string[];
-        multi?: boolean; // if true, run multi-item detection per photo
+        multi?: boolean; // up to 5 items per photo
+        outfit?: boolean; // slot-based extraction per photo
         maxItemsPerPhoto?: number; // default 5, max 5
       };
     }
@@ -251,15 +251,14 @@ function extractQueryTags(query: string): string[] {
   return uniq(out).slice(0, 20);
 }
 
-function buildFinalCatalogName(v: VisionResult | null, fallbackText?: string | null) {
-  // Brand + Color + Model
-  const brand = (v?.brand ?? "").trim();
-  const color = (v?.color ?? "").trim();
+function buildFinalCatalogName(v: any, fallbackText?: string | null) {
+  const brand = String(v?.brand ?? "").trim();
+  const color = String(v?.color ?? "").trim();
   const model =
-    (v?.model_name ?? "").trim() ||
-    (v?.subcategory ?? "").trim() ||
-    (v?.garmentType ?? "").trim() ||
-    (fallbackText ?? "").trim() ||
+    String(v?.model_name ?? "").trim() ||
+    String(v?.subcategory ?? "").trim() ||
+    String(v?.garmentType ?? "").trim() ||
+    String(fallbackText ?? "").trim() ||
     "Item";
 
   return titleCase([brand, color, model].filter(Boolean).join(" ").trim() || "Unknown Item");
@@ -296,7 +295,6 @@ function enforceSlotCategoryLock(args: {
   const { slotHint, normalizedCategory } = args;
   if (!slotHint) return { ok: true };
 
-  // Slot -> allowed category
   const want: Record<string, string> = {
     top: "tops",
     bottom: "bottoms",
@@ -322,7 +320,7 @@ async function insertOneGarment(args: {
   source: string;
   imageUrlWebp: string;
   originalImageUrl?: string | null;
-  vision: VisionResult | null;
+  vision: VisionResult | any | null;
   sourceImageId: string;
   textQuery?: string | null;
   cseMeta?: any | null;
@@ -341,12 +339,11 @@ async function insertOneGarment(args: {
     slotHint,
   } = args;
 
-  const confidence = typeof (vision as any)?.confidence === "number" ? (vision as any).confidence : 0;
+  const confidence = typeof vision?.confidence === "number" ? vision.confidence : 0;
 
-  const visionTags = Array.isArray(vision?.tags) ? vision!.tags.map(normTag).filter(Boolean) : [];
+  const visionTags = Array.isArray(vision?.tags) ? vision.tags.map(normTag).filter(Boolean) : [];
   const queryTags = textQuery ? extractQueryTags(textQuery) : [];
 
-  // Confidence gating for stable tags
   let tagsSource: "vision" | "mixed" | "text_fallback" = "vision";
   let combinedTags: string[] = [];
 
@@ -361,7 +358,6 @@ async function insertOneGarment(args: {
     combinedTags = queryTags.length ? [...queryTags, ...visionTags] : visionTags;
   }
 
-  // Slot hint can help stabilization in outfit mode (non-speculative)
   if (slotHint) combinedTags.push(slotHint);
 
   const finalTags = clampTags(combinedTags, 12, 25);
@@ -373,13 +369,12 @@ async function insertOneGarment(args: {
     title: vision?.catalog_name ?? textQuery ?? null,
   });
 
-  // Slot-to-category locking (outfit mode stability)
   const lock = enforceSlotCategoryLock({
     slotHint: slotHint ?? null,
     normalizedCategory: normalized.category,
   });
   if (!lock.ok) {
-    return { ok: false, error: lock.error, garment: null };
+    return { ok: false, error: lock.error, garment: null, skipped: false };
   }
 
   const fit = inferFit({ tags: finalTags, title: vision?.catalog_name ?? textQuery ?? null });
@@ -395,12 +390,11 @@ async function insertOneGarment(args: {
 
   const finalCatalogName = buildFinalCatalogName(vision, textQuery);
 
-  // Dedupe + grouping
   const fingerprint = buildFingerprint({
     category: normalized.category,
     subcategory: normalized.subcategory,
-    color: (vision as any)?.color ?? null,
-    pattern: (vision as any)?.pattern ?? null,
+    color: vision?.color ?? null,
+    pattern: vision?.pattern ?? null,
     tags: finalTags,
   });
 
@@ -416,29 +410,6 @@ async function insertOneGarment(args: {
   if (!existingErr && existing && existing.length > 0) {
     return { ok: true, error: null, garment: existing[0], skipped: true };
   }
-
-  const visionMetadata = vision
-    ? {
-        ok: true,
-        provider: (vision as any).provider ?? "openai",
-        model: (vision as any).model ?? null,
-        confidence: (vision as any).confidence ?? null,
-        garmentType: vision.garmentType ?? null,
-        subcategory: vision.subcategory ?? null,
-        brand: (vision as any).brand ?? null,
-        color: (vision as any).color ?? null,
-        material: (vision as any).material ?? null,
-        pattern: (vision as any).pattern ?? null,
-        seasons: (vision as any).seasons ?? [],
-        size: (vision as any).size ?? null,
-        raw_notes: (vision as any).raw_text ?? (vision as any).raw_notes ?? null,
-        extras: (vision as any).extras ?? null,
-        raw: (vision as any).raw ?? null,
-      }
-    : {
-        ok: false,
-        reason: "Vision unavailable or failed. Inserted with fallback tags.",
-      };
 
   const garmentToInsert: Record<string, any> = {
     user_id: userId,
@@ -461,15 +432,15 @@ async function insertOneGarment(args: {
     use_case: useCase,
     use_case_tags: useCaseTags,
 
-    brand: (vision as any)?.brand ?? null,
-    color: (vision as any)?.color ?? null,
-    material: (vision as any)?.material ?? null,
-    pattern: (vision as any)?.pattern ?? null,
-    seasons: (vision as any)?.seasons ?? [],
-    size: (vision as any)?.size ?? null,
-    confidence: (vision as any)?.confidence ?? null,
+    brand: vision?.brand ?? null,
+    color: vision?.color ?? null,
+    material: vision?.material ?? null,
+    pattern: vision?.pattern ?? null,
+    seasons: vision?.seasons ?? [],
+    size: vision?.size ?? null,
+    confidence: typeof vision?.confidence === "number" ? vision.confidence : null,
 
-    raw_text: (vision as any)?.raw_text ?? null,
+    raw_text: vision?.raw_text ?? vision?.raw_notes ?? null,
     quantity: 1,
 
     metadata: {
@@ -479,17 +450,273 @@ async function insertOneGarment(args: {
       ...(textQuery ? { text_query: textQuery } : {}),
       ...(cseMeta ? { cse: cseMeta } : {}),
       ...(originalImageUrl ? { original_image_url: originalImageUrl } : {}),
-      vision: visionMetadata,
+      vision: vision
+        ? {
+            ok: true,
+            provider: vision?.provider ?? "openai",
+            model: vision?.model ?? null,
+            confidence: typeof vision?.confidence === "number" ? vision.confidence : null,
+            garmentType: vision?.garmentType ?? null,
+            subcategory: vision?.subcategory ?? null,
+            brand: vision?.brand ?? null,
+            color: vision?.color ?? null,
+            material: vision?.material ?? null,
+            pattern: vision?.pattern ?? null,
+            seasons: vision?.seasons ?? [],
+            size: vision?.size ?? null,
+            raw_notes: vision?.raw_text ?? vision?.raw_notes ?? null,
+            extras: vision?.extras ?? null,
+            raw: vision?.raw ?? null,
+          }
+        : { ok: false, reason: "Vision unavailable or failed. Inserted with fallback tags." },
     },
   };
 
   const { data, error } = await supabase.from("garments").insert(garmentToInsert).select("*").single();
 
   if (error) {
-    return { ok: false, error: error.message, garment: null };
+    return { ok: false, error: error.message, garment: null, skipped: false };
   }
 
-  return { ok: true, error: null, garment: data };
+  return { ok: true, error: null, garment: data, skipped: false };
+}
+
+async function handleBatch(args: {
+  supabase: ReturnType<typeof getSupabaseServerClient>;
+  userId: string;
+  imageUrls: string[];
+  multi: boolean;
+  outfit: boolean;
+  maxItemsPerPhoto: number;
+  sourceLabel: string;
+}) {
+  const { supabase, userId, imageUrls, multi, outfit, maxItemsPerPhoto, sourceLabel } = args;
+
+  const results: any[] = [];
+
+  for (const imageUrl of imageUrls) {
+    const sourceImageId = crypto.randomUUID();
+
+    let webp: { webpUrl: string; originalUrl: string; storedPath: string | null };
+    try {
+      webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl, hint: sourceLabel });
+    } catch (e: any) {
+      results.push({
+        ok: false,
+        imageUrl,
+        webpUrl: null,
+        source_image_id: sourceImageId,
+        garments: [],
+        skippedCount: 0,
+        error: `webp_failed:${e?.message ?? "unknown"}`,
+      });
+      continue;
+    }
+
+    // Outfit load mode (slot-based)
+    if (outfit) {
+      let outfitRes: any = null;
+      try {
+        outfitRes = await analyzeOutfitFromImageUrl(webp.webpUrl);
+      } catch {
+        outfitRes = null;
+      }
+
+      const slotHints: Record<string, string> = {
+        top: "top",
+        bottom: "bottom",
+        shoes: "shoes",
+        outerwear: "outerwear",
+        accessory: "accessory",
+        fragrance: "fragrance",
+      };
+
+      const insertedGarments: any[] = [];
+      const failures: any[] = [];
+      let skippedCount = 0;
+
+      const slots = outfitRes?.slots && typeof outfitRes.slots === "object" ? outfitRes.slots : null;
+
+      if (slots) {
+        for (const [slot, v] of Object.entries(slots)) {
+          if (!v) continue;
+
+          const inserted = await insertOneGarment({
+            supabase,
+            userId,
+            source: sourceLabel,
+            imageUrlWebp: webp.webpUrl,
+            originalImageUrl: webp.originalUrl,
+            vision: v,
+            sourceImageId,
+            slotHint: slotHints[slot] ?? null,
+          });
+
+          if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
+          else failures.push({ slot, error: inserted.error });
+
+          if (inserted.skipped) skippedCount++;
+        }
+      }
+
+      // If no slots yielded inserts, fallback to single-garment analysis
+      if (!insertedGarments.length) {
+        let vision: VisionResult | null = null;
+        try {
+          vision = await analyzeGarmentFromImageUrl(webp.webpUrl);
+        } catch {
+          vision = null;
+        }
+
+        const inserted = await insertOneGarment({
+          supabase,
+          userId,
+          source: sourceLabel,
+          imageUrlWebp: webp.webpUrl,
+          originalImageUrl: webp.originalUrl,
+          vision,
+          sourceImageId,
+        });
+
+        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
+        else failures.push({ slot: "fallback", error: inserted.error });
+
+        if (inserted.skipped) skippedCount++;
+      }
+
+      results.push({
+        ok: insertedGarments.length > 0,
+        imageUrl,
+        webpUrl: webp.webpUrl,
+        source_image_id: sourceImageId,
+        garments: insertedGarments,
+        skippedCount,
+        failures,
+        mode: "outfit",
+        outfit_confidence: outfitRes?.confidence ?? null,
+        outfit_notes: outfitRes?.raw_notes ?? null,
+      });
+
+      continue;
+    }
+
+    // Multi-item mode (up to 5 garments per photo)
+    if (multi) {
+      let items: any[] = [];
+      try {
+        const vItems = await analyzeItemsFromImageUrl(webp.webpUrl);
+        items = Array.isArray(vItems) ? vItems.slice(0, maxItemsPerPhoto) : [];
+      } catch {
+        items = [];
+      }
+
+      const insertedGarments: any[] = [];
+      const failures: any[] = [];
+      let skippedCount = 0;
+
+      if (!items.length) {
+        // fallback to single-garment analysis
+        let vision: VisionResult | null = null;
+        try {
+          vision = await analyzeGarmentFromImageUrl(webp.webpUrl);
+        } catch {
+          vision = null;
+        }
+
+        const inserted = await insertOneGarment({
+          supabase,
+          userId,
+          source: sourceLabel,
+          imageUrlWebp: webp.webpUrl,
+          originalImageUrl: webp.originalUrl,
+          vision,
+          sourceImageId,
+        });
+
+        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
+        else failures.push({ error: inserted.error });
+
+        if (inserted.skipped) skippedCount++;
+
+        results.push({
+          ok: insertedGarments.length > 0,
+          imageUrl,
+          webpUrl: webp.webpUrl,
+          source_image_id: sourceImageId,
+          garments: insertedGarments,
+          skippedCount,
+          failures,
+          mode: "multi",
+          fallback: true,
+        });
+
+        continue;
+      }
+
+      for (const vision of items) {
+        const inserted = await insertOneGarment({
+          supabase,
+          userId,
+          source: sourceLabel,
+          imageUrlWebp: webp.webpUrl,
+          originalImageUrl: webp.originalUrl,
+          vision,
+          sourceImageId,
+        });
+
+        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
+        else failures.push({ error: inserted.error });
+
+        if (inserted.skipped) skippedCount++;
+      }
+
+      results.push({
+        ok: insertedGarments.length > 0,
+        imageUrl,
+        webpUrl: webp.webpUrl,
+        source_image_id: sourceImageId,
+        garments: insertedGarments,
+        skippedCount,
+        failures,
+        mode: "multi",
+      });
+
+      continue;
+    }
+
+    // Single-garment mode
+    let vision: VisionResult | null = null;
+    try {
+      vision = await analyzeGarmentFromImageUrl(webp.webpUrl);
+    } catch {
+      vision = null;
+    }
+
+    const inserted = await insertOneGarment({
+      supabase,
+      userId,
+      source: sourceLabel,
+      imageUrlWebp: webp.webpUrl,
+      originalImageUrl: webp.originalUrl,
+      vision,
+      sourceImageId,
+    });
+
+    results.push({
+      ok: inserted.ok,
+      imageUrl,
+      webpUrl: webp.webpUrl,
+      source_image_id: sourceImageId,
+      garments: inserted.ok && inserted.garment ? [inserted.garment] : [],
+      skippedCount: inserted.skipped ? 1 : 0,
+      failures: inserted.ok ? [] : [{ error: inserted.error }],
+      mode: "single",
+    });
+  }
+
+  const okCount = results.filter((r) => r.ok).length;
+
+  return { results, okCount };
 }
 
 export async function POST(req: NextRequest) {
@@ -505,45 +732,83 @@ export async function POST(req: NextRequest) {
     // Founder Edition fake user_id (replace with auth later)
     const fakeUserId = "00000000-0000-0000-0000-000000000001";
 
-    // PHOTO (single)
-    if (body.mode === "photo") {
+    // Back-compat mapping
+    if (body.mode === "multi_photo") {
       const imageUrl = String(body.payload.imageUrl ?? "").trim();
-      if (!imageUrl) return NextResponse.json({ ok: false, error: "payload.imageUrl is empty" }, { status: 400 });
+      const maxItems = Math.min(5, Math.max(1, Number(body.payload.maxItems ?? 5)));
 
-      const sourceImageId = crypto.randomUUID();
-
-      const webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl, hint: "photo" });
-
-      let vision: VisionResult | null = null;
-      try {
-        vision = await analyzeGarmentFromImageUrl(webp.webpUrl);
-      } catch {
-        vision = null;
-      }
-
-      const inserted = await insertOneGarment({
+      const { results, okCount } = await handleBatch({
         supabase,
         userId: fakeUserId,
-        source: "photo",
-        imageUrlWebp: webp.webpUrl,
-        originalImageUrl: webp.originalUrl,
-        vision,
-        sourceImageId,
+        imageUrls: imageUrl ? [imageUrl] : [],
+        multi: true,
+        outfit: false,
+        maxItemsPerPhoto: maxItems,
+        sourceLabel: "batch",
       });
 
-      if (!inserted.ok) {
-        return NextResponse.json({ ok: false, error: "Failed to insert garment", details: inserted.error }, { status: 500 });
+      return NextResponse.json(
+        { ok: true, mode: "batch", multi: true, outfit: false, inserted: results, okCount },
+        { status: 200 }
+      );
+    }
+
+    if (body.mode === "outfit_photo") {
+      const imageUrl = String(body.payload.imageUrl ?? "").trim();
+
+      const { results, okCount } = await handleBatch({
+        supabase,
+        userId: fakeUserId,
+        imageUrls: imageUrl ? [imageUrl] : [],
+        multi: false,
+        outfit: true,
+        maxItemsPerPhoto: 5,
+        sourceLabel: "batch",
+      });
+
+      return NextResponse.json(
+        { ok: true, mode: "batch", multi: false, outfit: true, inserted: results, okCount },
+        { status: 200 }
+      );
+    }
+
+    // PHOTO (legacy single)
+    if (body.mode === "photo") {
+      const imageUrl = String(body.payload.imageUrl ?? "").trim();
+      if (!imageUrl) {
+        return NextResponse.json({ ok: false, error: "payload.imageUrl is empty" }, { status: 400 });
       }
 
-      return NextResponse.json({ ok: true, garment: inserted.garment, skipped: inserted.skipped ?? false }, { status: 200 });
+      const { results, okCount } = await handleBatch({
+        supabase,
+        userId: fakeUserId,
+        imageUrls: [imageUrl],
+        multi: false,
+        outfit: false,
+        maxItemsPerPhoto: 5,
+        sourceLabel: "photo",
+      });
+
+      // Return legacy shape for single photo
+      const first = results[0];
+      const garment = first?.garments?.[0] ?? null;
+
+      if (!first?.ok) {
+        return NextResponse.json(
+          { ok: false, error: "Failed to insert garment", details: first?.failures?.[0]?.error ?? first?.error },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({ ok: true, garment, skipped: (first?.skippedCount ?? 0) > 0 }, { status: 200 });
     }
 
     // TEXT (CSE -> image -> Vision)
     if (body.mode === "text") {
       const textQuery = String(body.payload.query ?? "").trim();
-      if (!textQuery) return NextResponse.json({ ok: false, error: "payload.query is empty" }, { status: 400 });
-
-      const sourceImageId = crypto.randomUUID();
+      if (!textQuery) {
+        return NextResponse.json({ ok: false, error: "payload.query is empty" }, { status: 400 });
+      }
 
       let imageUrl: string | null = null;
       let cseMeta: any = null;
@@ -567,6 +832,8 @@ export async function POST(req: NextRequest) {
         };
       }
 
+      // For text mode we still store via insertOneGarment directly so we can pass textQuery + cseMeta
+      const sourceImageId = crypto.randomUUID();
       const webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl: imageUrl!, hint: "text" });
 
       let vision: VisionResult | null = null;
@@ -589,13 +856,16 @@ export async function POST(req: NextRequest) {
       });
 
       if (!inserted.ok) {
-        return NextResponse.json({ ok: false, error: "Failed to insert garment", details: inserted.error }, { status: 500 });
+        return NextResponse.json(
+          { ok: false, error: "Failed to insert garment", details: inserted.error },
+          { status: 500 }
+        );
       }
 
-      return NextResponse.json({ ok: true, garment: inserted.garment, skipped: inserted.skipped ?? false }, { status: 200 });
+      return NextResponse.json({ ok: true, garment: inserted.garment, skipped: inserted.skipped }, { status: 200 });
     }
 
-    // BATCH (up to 25 images). If `multi=true`, each photo can insert up to 5 garments.
+    // BATCH (the unified endpoint)
     if (body.mode === "batch") {
       const imageUrls = Array.isArray(body.payload.imageUrls) ? body.payload.imageUrls : [];
       const clean = imageUrls.map((u) => String(u || "").trim()).filter(Boolean).slice(0, 25);
@@ -604,262 +874,29 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "payload.imageUrls must contain 1–25 urls" }, { status: 400 });
       }
 
-      const multi = body.payload.multi === true;
+      const outfit = body.payload.outfit === true;
+      const multi = outfit ? true : body.payload.multi === true; // outfit implies multi-ish behavior
       const maxItems = Math.min(5, Math.max(1, Number(body.payload.maxItemsPerPhoto ?? 5)));
 
-      const results: any[] = [];
+      const { results, okCount } = await handleBatch({
+        supabase,
+        userId: fakeUserId,
+        imageUrls: clean,
+        multi,
+        outfit,
+        maxItemsPerPhoto: maxItems,
+        sourceLabel: "batch",
+      });
 
-      for (const imageUrl of clean) {
-        const sourceImageId = crypto.randomUUID();
-
-        let webp: { webpUrl: string; originalUrl: string; storedPath: string | null };
-        try {
-          webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl, hint: "batch" });
-        } catch (e: any) {
-          results.push({ ok: false, imageUrl, error: `webp_failed:${e?.message ?? "unknown"}` });
-          continue;
-        }
-
-        if (!multi) {
-          let vision: VisionResult | null = null;
-          try {
-            vision = await analyzeGarmentFromImageUrl(webp.webpUrl);
-          } catch {
-            vision = null;
-          }
-
-          const inserted = await insertOneGarment({
-            supabase,
-            userId: fakeUserId,
-            source: "batch",
-            imageUrlWebp: webp.webpUrl,
-            originalImageUrl: webp.originalUrl,
-            vision,
-            sourceImageId,
-          });
-
-          const { ok, error, garment, skipped } = inserted as any;
-          results.push({
-            imageUrl,
-            webpUrl: webp.webpUrl,
-            source_image_id: sourceImageId,
-            ok,
-            garment: garment ?? null,
-            skipped: skipped ?? false,
-            error: error ?? null,
-          });
-          continue;
-        }
-
-        // Multi-item per photo
-        let items: VisionResult[] = [];
-        try {
-          const vItems = await analyzeItemsFromImageUrl(webp.webpUrl);
-          items = Array.isArray(vItems) ? vItems.slice(0, maxItems) : [];
-        } catch {
-          items = [];
-        }
-
-        if (!items.length) {
-          // fallback
-          const inserted = await insertOneGarment({
-            supabase,
-            userId: fakeUserId,
-            source: "batch",
-            imageUrlWebp: webp.webpUrl,
-            originalImageUrl: webp.originalUrl,
-            vision: null,
-            sourceImageId,
-          });
-
-          results.push({
-            ok: inserted.ok,
-            imageUrl,
-            webpUrl: webp.webpUrl,
-            source_image_id: sourceImageId,
-            garments: inserted.ok && inserted.garment ? [inserted.garment] : [],
-            fallback: true,
-            error: inserted.ok ? null : inserted.error,
-          });
-          continue;
-        }
-
-        const insertedGarments: any[] = [];
-        const failures: any[] = [];
-
-        for (const vision of items) {
-          const inserted = await insertOneGarment({
-            supabase,
-            userId: fakeUserId,
-            source: "batch",
-            imageUrlWebp: webp.webpUrl,
-            originalImageUrl: webp.originalUrl,
-            vision,
-            sourceImageId,
-          });
-
-          if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
-          else failures.push({ error: inserted.error });
-        }
-
-        results.push({
-          ok: true,
-          imageUrl,
-          webpUrl: webp.webpUrl,
-          source_image_id: sourceImageId,
-          garments: insertedGarments,
-          count: insertedGarments.length,
-          failures,
-        });
-      }
-
-      const okCount = results.filter((r) => r.ok).length;
-      return NextResponse.json({ ok: true, mode: "batch", multi, inserted: results, okCount }, { status: 200 });
-    }
-
-    // MULTI PHOTO (1 image => up to 5 garments)
-    if (body.mode === "multi_photo") {
-      const imageUrl = String(body.payload.imageUrl ?? "").trim();
-      if (!imageUrl) return NextResponse.json({ ok: false, error: "payload.imageUrl is empty" }, { status: 400 });
-
-      const maxItems = Math.min(5, Math.max(1, Number(body.payload.maxItems ?? 5)));
-
-      const sourceImageId = crypto.randomUUID();
-
-      const webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl, hint: "multi" });
-
-      const items = await analyzeItemsFromImageUrl(webp.webpUrl);
-
-      if (!items.length) {
-        const inserted = await insertOneGarment({
-          supabase,
-          userId: fakeUserId,
-          source: "multi_photo",
-          imageUrlWebp: webp.webpUrl,
-          originalImageUrl: webp.originalUrl,
-          vision: null,
-          sourceImageId,
-        });
-
-        if (!inserted.ok) {
-          return NextResponse.json({ ok: false, error: "Failed to insert garment", details: inserted.error }, { status: 500 });
-        }
-
-        return NextResponse.json({ ok: true, garments: [inserted.garment], count: 1, fallback: true }, { status: 200 });
-      }
-
-      const insertedGarments: any[] = [];
-      const failures: any[] = [];
-
-      for (const vision of items.slice(0, maxItems)) {
-        const inserted = await insertOneGarment({
-          supabase,
-          userId: fakeUserId,
-          source: "multi_photo",
-          imageUrlWebp: webp.webpUrl,
-          originalImageUrl: webp.originalUrl,
-          vision,
-          sourceImageId,
-        });
-
-        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
-        else failures.push({ error: inserted.error });
-      }
-
-      return NextResponse.json({ ok: true, garments: insertedGarments, count: insertedGarments.length, failures }, { status: 200 });
-    }
-
-    // OUTFIT PHOTO (slot-based extraction => multiple garments)
-    if (body.mode === "outfit_photo") {
-      const imageUrl = String(body.payload.imageUrl ?? "").trim();
-      if (!imageUrl) return NextResponse.json({ ok: false, error: "payload.imageUrl is empty" }, { status: 400 });
-
-      const sourceImageId = crypto.randomUUID();
-
-      const webp = await ensureWebPImage({ supabase, sourceImageId, imageUrl, hint: "outfit" });
-
-      const outfit = await analyzeOutfitFromImageUrl(webp.webpUrl);
-
-      if (!outfit) {
-        const inserted = await insertOneGarment({
-          supabase,
-          userId: fakeUserId,
-          source: "outfit_photo",
-          imageUrlWebp: webp.webpUrl,
-          originalImageUrl: webp.originalUrl,
-          vision: null,
-          sourceImageId,
-        });
-
-        if (!inserted.ok) {
-          return NextResponse.json({ ok: false, error: "Failed to insert garment", details: inserted.error }, { status: 500 });
-        }
-
-        return NextResponse.json({ ok: true, garments: [inserted.garment], count: 1, fallback: true }, { status: 200 });
-      }
-
-      const slotHints: Record<string, string> = {
-        top: "top",
-        bottom: "bottom",
-        shoes: "shoes",
-        outerwear: "outerwear",
-        accessory: "accessory",
-        fragrance: "fragrance",
-      };
-
-      const insertedGarments: any[] = [];
-      const failures: any[] = [];
-
-      for (const [slot, v] of Object.entries((outfit as any).slots ?? {})) {
-        if (!v) continue;
-
-        const inserted = await insertOneGarment({
-          supabase,
-          userId: fakeUserId,
-          source: "outfit_photo",
-          imageUrlWebp: webp.webpUrl,
-          originalImageUrl: webp.originalUrl,
-          vision: v as VisionResult,
-          sourceImageId,
-          slotHint: slotHints[slot] ?? null,
-        });
-
-        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
-        else failures.push({ slot, error: inserted.error });
-      }
-
-      if (!insertedGarments.length) {
-        const inserted = await insertOneGarment({
-          supabase,
-          userId: fakeUserId,
-          source: "outfit_photo",
-          imageUrlWebp: webp.webpUrl,
-          originalImageUrl: webp.originalUrl,
-          vision: null,
-          sourceImageId,
-        });
-
-        if (inserted.ok && inserted.garment) insertedGarments.push(inserted.garment);
-        else failures.push({ slot: "fallback", error: inserted.error });
-      }
-
-      return NextResponse.json(
-        {
-          ok: true,
-          garments: insertedGarments,
-          count: insertedGarments.length,
-          failures,
-          outfit_confidence: (outfit as any).confidence ?? null,
-          outfit_notes: (outfit as any).raw_notes ?? null,
-          source_image_id: sourceImageId,
-        },
-        { status: 200 }
-      );
+      return NextResponse.json({ ok: true, mode: "batch", multi, outfit, inserted: results, okCount }, { status: 200 });
     }
 
     return NextResponse.json({ ok: false, error: "Invalid mode" }, { status: 400 });
   } catch (err: any) {
     console.error("Error in /api/ingest:", err);
-    return NextResponse.json({ ok: false, error: "Server error", details: err?.message ?? "unknown" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "Server error", details: err?.message ?? "unknown" },
+      { status: 500 }
+    );
   }
 }

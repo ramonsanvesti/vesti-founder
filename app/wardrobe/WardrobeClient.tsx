@@ -92,7 +92,11 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
-async function safeFetchJSON(url: string, init: RequestInit, timeoutMs = 180000): Promise<any> {
+async function safeFetchJSON(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 180000
+): Promise<any> {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -118,39 +122,81 @@ async function safeFetchJSON(url: string, init: RequestInit, timeoutMs = 180000)
   }
 }
 
+/**
+ * Robust extraction for batch responses.
+ * Supports many shapes and dedupes by garment id.
+ */
 function extractGarmentsFromBatch(inserted: any[]): Garment[] {
   const out: Garment[] = [];
+
+  const pushMany = (arr: any) => {
+    if (!Array.isArray(arr)) return;
+    for (const g of arr) {
+      if (g && typeof g === "object" && typeof g.id === "string") {
+        out.push(g as Garment);
+      }
+    }
+  };
+
+  const pushOne = (g: any) => {
+    if (g && typeof g === "object" && typeof g.id === "string") {
+      out.push(g as Garment);
+      return true;
+    }
+    return false;
+  };
+
+  // Some APIs may return inserted as an object, not an array
+  if (!Array.isArray(inserted)) {
+    const maybe = (inserted as any)?.inserted ?? (inserted as any)?.results ?? [];
+    return extractGarmentsFromBatch(Array.isArray(maybe) ? maybe : []);
+  }
 
   for (const r of inserted || []) {
     if (!r) continue;
 
-    const maybeArrays = [
-      r.garments,
-      r.inserted_garments,
-      r.data?.garments,
-      r.result?.garments,
-    ];
+    // If the element itself is an array of garments
+    if (Array.isArray(r)) {
+      pushMany(r);
+      continue;
+    }
 
-    let added = false;
-    for (const arr of maybeArrays) {
-      if (Array.isArray(arr) && arr.length) {
-        out.push(...(arr.filter(Boolean) as Garment[]));
-        added = true;
+    // Per-photo arrays
+    pushMany(r.garments);
+    pushMany(r.inserted_garments);
+    pushMany(r.data?.garments);
+    pushMany(r.result?.garments);
+    pushMany(r.items);
+    pushMany(r.data?.items);
+    pushMany(r.result?.items);
+
+    // Nested results arrays
+    if (Array.isArray(r.results)) {
+      for (const rr of r.results) {
+        if (!rr) continue;
+        pushMany(rr.garments);
+        pushMany(rr.inserted_garments);
+        pushOne(rr.garment);
       }
     }
 
-    if (added) continue;
-
-    const maybeSingles = [r.garment, r.data?.garment, r.result?.garment];
-    for (const g of maybeSingles) {
-      if (g && typeof g === "object" && typeof g.id === "string") {
-        out.push(g as Garment);
-        break;
-      }
-    }
+    // Single garment shapes
+    if (pushOne(r.garment)) continue;
+    if (pushOne(r.data?.garment)) continue;
+    if (pushOne(r.result?.garment)) continue;
   }
 
-  return out;
+  // Dedupe by id
+  const seen = new Set<string>();
+  const deduped: Garment[] = [];
+  for (const g of out) {
+    if (!g?.id) continue;
+    if (seen.has(g.id)) continue;
+    seen.add(g.id);
+    deduped.push(g);
+  }
+
+  return deduped;
 }
 
 export default function WardrobeClient() {
@@ -378,24 +424,38 @@ export default function WardrobeClient() {
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
       const allNew = extractGarmentsFromBatch(inserted);
 
-      let ok = 0;
-      let failed = 0;
-      for (const r of inserted) {
-        if (r?.ok) ok++;
-        else failed++;
-      }
+      // Prefer server counters when available, otherwise infer
+      const ok =
+        typeof json.okCount === "number"
+          ? json.okCount
+          : inserted.reduce((acc, r) => (r?.ok ? acc + 1 : acc), 0);
+
+      const failed = inserted.length
+        ? inserted.reduce((acc, r) => (!r?.ok ? acc + 1 : acc), 0)
+        : 0;
 
       setProgress((p) => ({
         ...p,
         ok,
         failed,
-        message: `Done. OK ${ok}. Failed ${failed}. Refreshing…`,
+        message: `Done. OK ${ok}. Failed ${failed}. Added ${allNew.length} item(s). Refreshing…`,
       }));
 
       if (allNew.length) {
-        setGarments((prev) => [...allNew, ...prev]);
+        setGarments((prev) => {
+          const seen = new Set<string>();
+          const merged = [...allNew, ...prev].filter((g) => {
+            const id = (g?.id ?? "").trim();
+            if (!id) return false;
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return true;
+          });
+          return merged;
+        });
       }
 
+      // Always refresh from DB to reflect server-side dedupe/fingerprint
       await fetchGarments();
 
       setIngestFiles([]);
@@ -538,7 +598,10 @@ export default function WardrobeClient() {
     return (
       <div className="flex flex-wrap gap-2 pt-1">
         {tags.slice(0, 16).map((t) => (
-          <span key={t} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
+          <span
+            key={t}
+            className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
+          >
             {t}
           </span>
         ))}
@@ -567,7 +630,9 @@ export default function WardrobeClient() {
       .filter(Boolean)
       .join(" · ");
 
-    const sourceLine = g.source_image_id ? `source: ${String(g.source_image_id).slice(0, 8)}…` : null;
+    const sourceLine = g.source_image_id
+      ? `source: ${String(g.source_image_id).slice(0, 8)}…`
+      : null;
 
     return (
       <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
@@ -578,7 +643,12 @@ export default function WardrobeClient() {
         ) : null}
 
         {src ? (
-          <img src={src} alt={name} className="w-full h-40 object-cover rounded" loading="lazy" />
+          <img
+            src={src}
+            alt={name}
+            className="w-full h-40 object-cover rounded"
+            loading="lazy"
+          />
         ) : (
           <div className="w-full h-40 rounded bg-white/5 border border-white/10 flex items-center justify-center text-xs text-gray-400">
             No image
@@ -689,9 +759,7 @@ export default function WardrobeClient() {
         </div>
 
         <div className="text-xs text-gray-500 space-y-1">
-          <div>
-            {ingestFiles.length ? `Selected: ${ingestFiles.length} file(s)` : "Select 1 to 25 images."}
-          </div>
+          <div>{ingestFiles.length ? `Selected: ${ingestFiles.length} file(s)` : "Select 1 to 25 images."}</div>
 
           {progress.total ? (
             <div>
