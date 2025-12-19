@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 type Garment = {
   id: string;
   user_id: string | null;
+
   source_image_id?: string | null;
   fingerprint?: string | null;
 
@@ -60,43 +61,23 @@ type GenerateOutfitResponse = {
   counts?: any;
 };
 
-type IngestSingleResponse = {
-  ok: boolean;
-  garment?: Garment;
-  error?: string;
-  details?: string;
-};
-
 type IngestBatchResponse = {
   ok: boolean;
   mode?: string;
   multi?: boolean;
+  outfit?: boolean;
   okCount?: number;
   inserted?: Array<any>;
   error?: string;
   details?: string;
 };
 
-type IngestMultiResponse = {
-  ok: boolean;
-  garments: Garment[];
-  count: number;
-  failures?: any[];
-  fallback?: boolean;
-  error?: string;
-  details?: string;
-  outfit_confidence?: number;
-  outfit_notes?: string;
-};
-
 async function getSupabase() {
-  // Dynamic import avoids evaluating env at build/SSR time
   const mod = await import("@/lib/supabaseClientBrowser");
   return mod.getSupabaseBrowserClient();
 }
 
 function httpsify(url?: string | null) {
-  // Ensure we never render http:// assets (mixed content)
   if (!url) return null;
   const u = String(url).trim();
   if (!u) return null;
@@ -111,17 +92,7 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
-/**
- * Fetch JSON safely:
- * - surfaces non-OK server errors with useful message
- * - prevents silent "failed to fetch" ambiguity
- * - supports abort timeout
- */
-async function safeFetchJSON(
-  url: string,
-  init: RequestInit,
-  timeoutMs = 180000
-): Promise<any> {
+async function safeFetchJSON(url: string, init: RequestInit, timeoutMs = 180000): Promise<any> {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -147,20 +118,12 @@ async function safeFetchJSON(
   }
 }
 
-/**
- * Normalize batch response rows into a flat array of garments.
- * This is intentionally tolerant because the server payload may evolve.
- */
 function extractGarmentsFromBatch(inserted: any[]): Garment[] {
   const out: Garment[] = [];
 
   for (const r of inserted || []) {
     if (!r) continue;
 
-    // Common patterns:
-    // r.garments (multi)
-    // r.garment  (single)
-    // r.data / r.result / r.inserted_garments (future)
     const maybeArrays = [
       r.garments,
       r.inserted_garments,
@@ -194,35 +157,31 @@ export default function WardrobeClient() {
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Upload by photo (single)
-  const [file, setFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
+  // Unified ingest UI
+  const [ingestFiles, setIngestFiles] = useState<File[]>([]);
+  const [ingesting, setIngesting] = useState(false);
 
-  // Batch upload (up to 25 photos) + optional multi-item detection per photo
-  const [batchFiles, setBatchFiles] = useState<File[]>([]);
-  const [batchUploading, setBatchUploading] = useState(false);
-  const [batchMulti, setBatchMulti] = useState(false);
-  const [batchMaxItemsPerPhoto, setBatchMaxItemsPerPhoto] = useState(5);
-  const [batchProgress, setBatchProgress] = useState<{
+  // Unified options
+  const [optMultiItem, setOptMultiItem] = useState(false);
+  const [optOutfitMode, setOptOutfitMode] = useState(false);
+  const [optMaxItemsPerPhoto, setOptMaxItemsPerPhoto] = useState(5);
+
+  // Progress
+  const [progress, setProgress] = useState<{
+    stage: "idle" | "uploading" | "ingesting";
     done: number;
     total: number;
     ok: number;
     failed: number;
+    message?: string | null;
   }>({
+    stage: "idle",
     done: 0,
     total: 0,
     ok: 0,
     failed: 0,
+    message: null,
   });
-
-  // Multi detection (single photo -> up to 5 garments)
-  const [multiFile, setMultiFile] = useState<File | null>(null);
-  const [multiUploading, setMultiUploading] = useState(false);
-
-  // Outfit load mode (slot-based extraction from one photo)
-  const [outfitFile, setOutfitFile] = useState<File | null>(null);
-  const [outfitLoading, setOutfitLoading] = useState(false);
-  const [outfitLoadNotes, setOutfitLoadNotes] = useState<string | null>(null);
 
   // Add by text
   const [textQuery, setTextQuery] = useState("");
@@ -250,7 +209,6 @@ export default function WardrobeClient() {
   const [outfitWarnings, setOutfitWarnings] = useState<string[]>([]);
   const [outfitError, setOutfitError] = useState<string | null>(null);
 
-  // Regenerate controls
   const [seedOutfitId, setSeedOutfitId] = useState<string | null>(null);
   const [excludeIds, setExcludeIds] = useState<string[]>([]);
 
@@ -329,9 +287,7 @@ export default function WardrobeClient() {
     }));
   }, [garments]);
 
-  // ----------------------------
-  // Shared: upload file(s) to Supabase Storage bucket "garments" and return public URLs
-  // ----------------------------
+  // Storage upload helper
   const uploadOneToStorage = async (fileToUpload: File): Promise<string> => {
     const supabase = await getSupabase();
 
@@ -360,78 +316,40 @@ export default function WardrobeClient() {
     return publicUrl;
   };
 
-  // ----------------------------
-  // Upload by photo (single)
-  // ----------------------------
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
-    setFile(selected);
-  };
-
-  const handleUpload = async () => {
-    if (!file) return;
-
-    try {
-      setUploading(true);
-
-      const publicUrl = await uploadOneToStorage(file);
-
-      const json = (await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "photo",
-            payload: { imageUrl: publicUrl },
-          }),
-        },
-        180000
-      )) as IngestSingleResponse;
-
-      if (!json?.ok || !json.garment) {
-        console.error("Ingest error:", json);
-        alert(json?.details || json?.error || "Error creating garment (ingest).");
-        return;
-      }
-
-      // Add optimistically + refresh for truth
-      setGarments((prev) => [json.garment as Garment, ...prev]);
-      await fetchGarments();
-
-      setFile(null);
-      const input = document.getElementById("file-input") as HTMLInputElement | null;
-      if (input) input.value = "";
-    } catch (err: any) {
-      console.error("Unexpected upload error:", err);
-      alert(err?.message || "Unexpected error.");
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  // ----------------------------
-  // Batch upload (up to 25 photos) -> mode:"batch" + multi:true/false
-  // ----------------------------
-  const handleBatchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Unified ingest handlers
+  const handleIngestChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []).slice(0, 25);
-    setBatchFiles(files);
+    setIngestFiles(files);
   };
 
-  const handleBatchUpload = async () => {
-    if (!batchFiles.length) return;
+  const runUnifiedIngest = async () => {
+    if (!ingestFiles.length) return;
 
     try {
-      setBatchUploading(true);
-      setBatchProgress({ done: 0, total: batchFiles.length, ok: 0, failed: 0 });
+      setIngesting(true);
+      setProgress({
+        stage: "uploading",
+        done: 0,
+        total: ingestFiles.length,
+        ok: 0,
+        failed: 0,
+        message: "Uploading to Storage…",
+      });
 
       // Upload sequentially for stability
       const urls: string[] = [];
-      for (let i = 0; i < batchFiles.length; i++) {
-        const u = await uploadOneToStorage(batchFiles[i]);
+      for (let i = 0; i < ingestFiles.length; i++) {
+        const u = await uploadOneToStorage(ingestFiles[i]);
         urls.push(u);
-        setBatchProgress((p) => ({ ...p, done: i + 1 }));
+        setProgress((p) => ({ ...p, done: i + 1 }));
       }
+
+      setProgress((p) => ({
+        ...p,
+        stage: "ingesting",
+        done: 0,
+        message: "Ingesting…",
+      }));
 
       const json = (await safeFetchJSON(
         "/api/ingest",
@@ -442,8 +360,9 @@ export default function WardrobeClient() {
             mode: "batch",
             payload: {
               imageUrls: urls,
-              multi: batchMulti,
-              maxItemsPerPhoto: Math.min(5, Math.max(1, Number(batchMaxItemsPerPhoto || 5))),
+              multi: Boolean(optMultiItem),
+              outfit: Boolean(optOutfitMode),
+              maxItemsPerPhoto: Math.min(5, Math.max(1, Number(optMaxItemsPerPhoto || 5))),
             },
           }),
         },
@@ -451,169 +370,67 @@ export default function WardrobeClient() {
       )) as IngestBatchResponse;
 
       if (!json?.ok) {
-        console.error("Batch ingest error:", json);
-        alert(json?.details || json?.error || "Error batch ingest.");
+        console.error("Unified batch ingest error:", json);
+        alert(json?.details || json?.error || "Error ingest.");
         return;
       }
 
       const inserted = Array.isArray(json.inserted) ? json.inserted : [];
       const allNew = extractGarmentsFromBatch(inserted);
 
-      // Update counters (best-effort)
       let ok = 0;
       let failed = 0;
       for (const r of inserted) {
         if (r?.ok) ok++;
         else failed++;
       }
-      setBatchProgress((p) => ({ ...p, ok, failed }));
 
-      // Optimistic add if we have them
+      setProgress((p) => ({
+        ...p,
+        ok,
+        failed,
+        message: `Done. OK ${ok}. Failed ${failed}. Refreshing…`,
+      }));
+
       if (allNew.length) {
         setGarments((prev) => [...allNew, ...prev]);
       }
 
-      // IMPORTANT: Always refresh from DB after batch.
-      // This guarantees the closet shows what was actually inserted (dedupe, grouping, etc.)
       await fetchGarments();
 
-      setBatchFiles([]);
-      const input = document.getElementById("batch-input") as HTMLInputElement | null;
+      setIngestFiles([]);
+      const input = document.getElementById("ingest-input") as HTMLInputElement | null;
       if (input) input.value = "";
+
+      setProgress((p) => ({
+        ...p,
+        stage: "idle",
+        message: `Ingest complete. OK ${ok}. Failed ${failed}.`,
+      }));
     } catch (err: any) {
-      console.error("Unexpected batch upload error:", err);
+      console.error("Unexpected unified ingest error:", err);
       alert(err?.message || "Unexpected error.");
+      setProgress((p) => ({
+        ...p,
+        stage: "idle",
+        message: err?.message || "Unexpected error.",
+      }));
     } finally {
-      setBatchUploading(false);
+      setIngesting(false);
       setTimeout(() => {
-        setBatchProgress({ done: 0, total: 0, ok: 0, failed: 0 });
-      }, 1000);
+        setProgress({
+          stage: "idle",
+          done: 0,
+          total: 0,
+          ok: 0,
+          failed: 0,
+          message: null,
+        });
+      }, 1500);
     }
   };
 
-  // ----------------------------
-  // Multi-photo detection (up to 5 garments from 1 photo)
-  // ----------------------------
-  const handleMultiChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
-    setMultiFile(selected);
-  };
-
-  const handleMultiUpload = async () => {
-    if (!multiFile) return;
-
-    try {
-      setMultiUploading(true);
-
-      const publicUrl = await uploadOneToStorage(multiFile);
-
-      const json = (await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "multi_photo",
-            payload: { imageUrl: publicUrl },
-          }),
-        },
-        240000
-      )) as IngestMultiResponse;
-
-      if (!json?.ok) {
-        console.error("Multi ingest error:", json);
-        alert(json?.details || json?.error || "Error ingesting multi photo.");
-        return;
-      }
-
-      const newGarments = Array.isArray(json.garments) ? json.garments : [];
-      if (newGarments.length) {
-        setGarments((prev) => [...newGarments, ...prev]);
-      }
-
-      await fetchGarments();
-
-      setMultiFile(null);
-      const input = document.getElementById("multi-input") as HTMLInputElement | null;
-      if (input) input.value = "";
-    } catch (err: any) {
-      console.error("Unexpected multi upload error:", err);
-      alert(err?.message || "Unexpected error.");
-    } finally {
-      setMultiUploading(false);
-    }
-  };
-
-  // ----------------------------
-  // Outfit load mode (slot-based extraction)
-  // ----------------------------
-  const handleOutfitChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
-    setOutfitFile(selected);
-  };
-
-  const handleOutfitLoad = async () => {
-    if (!outfitFile) return;
-
-    try {
-      setOutfitLoading(true);
-      setOutfitLoadNotes(null);
-
-      const publicUrl = await uploadOneToStorage(outfitFile);
-
-      const json = (await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "outfit_photo",
-            payload: { imageUrl: publicUrl },
-          }),
-        },
-        240000
-      )) as IngestMultiResponse;
-
-      if (!json?.ok) {
-        console.error("Outfit photo ingest error:", json);
-        alert(json?.details || json?.error || "Error loading outfit photo.");
-        return;
-      }
-
-      const newGarments = Array.isArray(json.garments) ? json.garments : [];
-      if (newGarments.length) {
-        setGarments((prev) => [...newGarments, ...prev]);
-      }
-
-      const notesParts: string[] = [];
-      if (typeof json.outfit_confidence === "number")
-        notesParts.push(`Outfit confidence: ${json.outfit_confidence.toFixed(2)}`);
-      if (json.outfit_notes) notesParts.push(json.outfit_notes);
-      if (Array.isArray(json.failures) && json.failures.length)
-        notesParts.push(`Failures: ${json.failures.length}`);
-
-      setOutfitLoadNotes(
-        notesParts.length
-          ? notesParts.join(" · ")
-          : `Loaded ${newGarments.length} item(s) from outfit photo.`
-      );
-
-      await fetchGarments();
-
-      setOutfitFile(null);
-      const input = document.getElementById("outfit-input") as HTMLInputElement | null;
-      if (input) input.value = "";
-    } catch (err: any) {
-      console.error("Unexpected outfit load error:", err);
-      alert(err?.message || "Unexpected error.");
-    } finally {
-      setOutfitLoading(false);
-    }
-  };
-
-  // ----------------------------
-  // Add by text (CSE -> image -> Vision -> insert)
-  // ----------------------------
+  // Add by text
   const handleAddByText = async () => {
     const q = textQuery.trim();
     if (!q) return;
@@ -621,7 +438,7 @@ export default function WardrobeClient() {
     try {
       setAddingText(true);
 
-      const json = (await safeFetchJSON(
+      const json = await safeFetchJSON(
         "/api/ingest",
         {
           method: "POST",
@@ -632,7 +449,7 @@ export default function WardrobeClient() {
           }),
         },
         180000
-      )) as IngestSingleResponse;
+      );
 
       if (!json?.ok || !json.garment) {
         console.error("Text ingest error:", json);
@@ -642,7 +459,6 @@ export default function WardrobeClient() {
 
       setGarments((prev) => [json.garment as Garment, ...prev]);
       await fetchGarments();
-
       setTextQuery("");
     } catch (e: any) {
       console.error("Unexpected add-by-text error:", e);
@@ -652,9 +468,7 @@ export default function WardrobeClient() {
     }
   };
 
-  // ----------------------------
   // Outfit generation
-  // ----------------------------
   const resetOutfitUI = () => {
     setOutfitError(null);
     setOutfitWarnings([]);
@@ -716,9 +530,7 @@ export default function WardrobeClient() {
 
   const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
 
-  // ----------------------------
   // Render helpers
-  // ----------------------------
   const renderTags = (g: Garment) => {
     const tags = Array.isArray(g.tags) ? g.tags.filter(Boolean) : [];
     if (!tags.length) return null;
@@ -726,10 +538,7 @@ export default function WardrobeClient() {
     return (
       <div className="flex flex-wrap gap-2 pt-1">
         {tags.slice(0, 16).map((t) => (
-          <span
-            key={t}
-            className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
-          >
+          <span key={t} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
             {t}
           </span>
         ))}
@@ -738,12 +547,10 @@ export default function WardrobeClient() {
   };
 
   const renderGarmentCard = (g: Garment, extra?: { badge?: string }) => {
-    // Always use DB-stored image_url (already WebP). Do NOT depend on original upload URL.
     const src = httpsify(g.image_url);
     const name = displayName(g);
     const cat = (g.category ?? "").trim();
     const sub = (g.subcategory ?? "").trim();
-
     const seasons = Array.isArray(g.seasons) ? g.seasons.filter(Boolean) : [];
 
     const metaLine = [
@@ -771,12 +578,7 @@ export default function WardrobeClient() {
         ) : null}
 
         {src ? (
-          <img
-            src={src}
-            alt={name}
-            className="w-full h-40 object-cover rounded"
-            loading="lazy"
-          />
+          <img src={src} alt={name} className="w-full h-40 object-cover rounded" loading="lazy" />
         ) : (
           <div className="w-full h-40 rounded bg-white/5 border border-white/10 flex items-center justify-center text-xs text-gray-400">
             No image
@@ -804,7 +606,7 @@ export default function WardrobeClient() {
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
-          Add items by photo, batch photos, multi-item photo, outfit photo, or by text. Then generate a rules-based outfit with reasoning.
+          One ingest flow. Upload 1 to 25 photos. Optional multi item extraction. Optional outfit load mode. Always WebP from DB.
         </p>
 
         <div className="text-xs text-gray-500 pt-2">
@@ -812,53 +614,32 @@ export default function WardrobeClient() {
         </div>
       </header>
 
-      {/* Upload by photo */}
+      {/* Unified Ingest */}
       <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Add garment by photo (single)</h2>
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <h2 className="text-lg font-medium">Ingest photos (1 to 25)</h2>
 
-        <div className="flex items-center gap-4 flex-wrap">
-          <input
-            id="file-input"
-            type="file"
-            accept="image/*"
-            onChange={handleFileChange}
-            className="block text-sm"
-          />
-
-          <button
-            onClick={handleUpload}
-            disabled={!file || uploading}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
-          >
-            {uploading ? "Uploading..." : "Upload"}
+          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
+            Refresh closet
           </button>
         </div>
 
-        <div className="text-xs text-gray-500">
-          {file ? `Selected: ${file.name}` : "Select an image to begin."}
-        </div>
-      </section>
-
-      {/* Batch upload */}
-      <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Batch upload (up to 25 photos)</h2>
-
         <div className="flex items-center gap-4 flex-wrap">
           <input
-            id="batch-input"
+            id="ingest-input"
             type="file"
             accept="image/*"
             multiple
-            onChange={handleBatchChange}
+            onChange={handleIngestChange}
             className="block text-sm"
           />
 
           <button
-            onClick={handleBatchUpload}
-            disabled={!batchFiles.length || batchUploading}
+            onClick={runUnifiedIngest}
+            disabled={!ingestFiles.length || ingesting}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
           >
-            {batchUploading ? "Uploading batch..." : "Upload batch"}
+            {ingesting ? "Working…" : "Ingest"}
           </button>
         </div>
 
@@ -866,20 +647,37 @@ export default function WardrobeClient() {
           <label className="text-sm flex items-center gap-2">
             <input
               type="checkbox"
-              checked={batchMulti}
-              onChange={(e) => setBatchMulti(e.target.checked)}
+              checked={optMultiItem}
+              onChange={(e) => {
+                const v = e.target.checked;
+                setOptMultiItem(v);
+                if (!v) setOptOutfitMode(false);
+              }}
             />
-            Multi-item per photo (extract up to 5 garments)
+            Multi item per photo (up to 5 garments)
+          </label>
+
+          <label className="text-sm flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={optOutfitMode}
+              onChange={(e) => {
+                const v = e.target.checked;
+                setOptOutfitMode(v);
+                if (v) setOptMultiItem(true);
+              }}
+            />
+            Outfit load mode (slot based extraction)
           </label>
 
           <label className="text-sm flex items-center gap-2">
             Max items/photo
             <select
-              value={batchMaxItemsPerPhoto}
-              onChange={(e) => setBatchMaxItemsPerPhoto(Number(e.target.value))}
+              value={optMaxItemsPerPhoto}
+              onChange={(e) => setOptMaxItemsPerPhoto(Number(e.target.value))}
               className="border rounded-md px-2 py-2 text-sm bg-transparent"
-              disabled={!batchMulti}
-              title={batchMulti ? "Max garments extracted per photo" : "Enable multi-item to use this"}
+              disabled={!optMultiItem}
+              title={optMultiItem ? "Max garments extracted per photo" : "Enable multi item to use this"}
             >
               <option value={1}>1</option>
               <option value={2}>2</option>
@@ -890,81 +688,22 @@ export default function WardrobeClient() {
           </label>
         </div>
 
-        <div className="text-xs text-gray-500">
-          {batchFiles.length ? `Selected: ${batchFiles.length} file(s)` : "Select up to 25 images."}
-          {batchUploading && batchProgress.total ? (
-            <span className="ml-2">
-              Progress: {batchProgress.done}/{batchProgress.total}
-            </span>
-          ) : null}
-          {!batchUploading && (batchProgress.ok || batchProgress.failed) ? (
-            <span className="ml-2">
-              Done · OK {batchProgress.ok} · Failed {batchProgress.failed}
-            </span>
-          ) : null}
-          <div className="pt-1">
-            Batch calls <code>/api/ingest</code> with{" "}
-            <code>{`{ mode:"batch", payload:{ imageUrls:[...], multi:true/false } }`}</code>.
+        <div className="text-xs text-gray-500 space-y-1">
+          <div>
+            {ingestFiles.length ? `Selected: ${ingestFiles.length} file(s)` : "Select 1 to 25 images."}
           </div>
-        </div>
-      </section>
 
-      {/* Multi-item detection */}
-      <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Add up to 5 garments from one photo (multi-item)</h2>
+          {progress.total ? (
+            <div>
+              Stage: {progress.stage} · {progress.done}/{progress.total} · OK {progress.ok} · Failed {progress.failed}
+              {progress.message ? <span className="ml-2">{progress.message}</span> : null}
+            </div>
+          ) : null}
 
-        <div className="flex items-center gap-4 flex-wrap">
-          <input
-            id="multi-input"
-            type="file"
-            accept="image/*"
-            onChange={handleMultiChange}
-            className="block text-sm"
-          />
-
-          <button
-            onClick={handleMultiUpload}
-            disabled={!multiFile || multiUploading}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
-          >
-            {multiUploading ? "Processing..." : "Extract garments"}
-          </button>
-        </div>
-
-        <div className="text-xs text-gray-500">
-          {multiFile
-            ? `Selected: ${multiFile.name}`
-            : "Use a photo that contains multiple items. VESTI will try to extract up to 5 garments."}
-        </div>
-      </section>
-
-      {/* Outfit load mode */}
-      <section className="border rounded-lg p-4 space-y-3">
-        <h2 className="text-lg font-medium">Outfit load mode (slot-based extraction)</h2>
-
-        <div className="flex items-center gap-4 flex-wrap">
-          <input
-            id="outfit-input"
-            type="file"
-            accept="image/*"
-            onChange={handleOutfitChange}
-            className="block text-sm"
-          />
-
-          <button
-            onClick={handleOutfitLoad}
-            disabled={!outfitFile || outfitLoading}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
-          >
-            {outfitLoading ? "Loading outfit..." : "Load outfit items"}
-          </button>
-        </div>
-
-        <div className="text-xs text-gray-500">
-          {outfitFile
-            ? `Selected: ${outfitFile.name}`
-            : "Use a full outfit photo (person wearing the outfit). VESTI will try to extract slots (top, bottom, shoes, etc.)."}
-          {outfitLoadNotes ? <div className="pt-1">{outfitLoadNotes}</div> : null}
+          <div>
+            Calls <code>/api/ingest</code> with{" "}
+            <code>{`{ mode:"batch", payload:{ imageUrls:[...], multi:${optMultiItem}, outfit:${optOutfitMode}, maxItemsPerPhoto:${optMaxItemsPerPhoto} } }`}</code>
+          </div>
         </div>
       </section>
 
@@ -985,7 +724,7 @@ export default function WardrobeClient() {
             disabled={!textQuery.trim() || addingText}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
           >
-            {addingText ? "Adding..." : "Add"}
+            {addingText ? "Adding…" : "Add"}
           </button>
         </div>
 
@@ -1039,7 +778,7 @@ export default function WardrobeClient() {
               disabled={generating}
               className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
             >
-              {generating ? "Generating..." : "Generate Outfit"}
+              {generating ? "Generating…" : "Generate Outfit"}
             </button>
 
             <button
@@ -1048,11 +787,11 @@ export default function WardrobeClient() {
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
               title={
                 canRegenerate
-                  ? "Generate a variation (auto-exclude items from seed outfit)"
+                  ? "Generate a variation (auto exclude items from seed outfit)"
                   : "Generate first to enable variations"
               }
             >
-              {generating ? "Working..." : "Regenerate Variation"}
+              {generating ? "Working…" : "Regenerate Variation"}
             </button>
           </div>
         </div>
@@ -1098,9 +837,6 @@ export default function WardrobeClient() {
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-medium">Your wardrobe</h2>
-          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
-            Refresh
-          </button>
         </div>
 
         {loading ? (
