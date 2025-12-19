@@ -20,6 +20,7 @@ import {
   analyzeOutfitFromImageUrl,
   type VisionResult,
 } from "@/lib/vision";
+import { computeDeterministicScores } from "@/lib/scoring";
 
 /**
  * Unified ingest model
@@ -369,6 +370,22 @@ async function insertOneGarment(args: {
     title: vision?.catalog_name ?? textQuery ?? null,
   });
 
+  // Deterministic scoring (base + final). At ingest time there is no user confirmation,
+  // so base === final and adjustments_applied === false.
+  const scoring: ReturnType<typeof computeDeterministicScores> = computeDeterministicScores({
+    category: normalized.category,
+    // scoring.ts expects a non-null subcategory string.
+    // If normalization cannot determine it, fall back to "unknown".
+    subcategory: normalized.subcategory ?? "unknown",
+    wear_temperature: null,
+    formality_feel: null,
+  });
+
+  // Convenience: store the final scores in dedicated columns if they exist in the DB.
+  // These are also persisted in metadata.scores for forward compatibility.
+  const comfortScore = scoring?.final?.comfort ?? null;
+  const formalityScore = scoring?.final?.formality ?? null;
+
   const lock = enforceSlotCategoryLock({
     slotHint: slotHint ?? null,
     normalizedCategory: normalized.category,
@@ -439,11 +456,21 @@ async function insertOneGarment(args: {
     seasons: vision?.seasons ?? [],
     size: vision?.size ?? null,
     confidence: typeof vision?.confidence === "number" ? vision.confidence : null,
+    comfort_score: comfortScore,
+    formality_score: formalityScore,
 
     raw_text: vision?.raw_text ?? vision?.raw_notes ?? null,
     quantity: 1,
 
     metadata: {
+      scores: {
+        engine: "deterministic_v1",
+        matched_rule: scoring.matched_rule ?? null,
+        base: scoring.base,
+        final: scoring.final,
+        adjustments_applied: scoring.adjustments_applied,
+        updated_at: new Date().toISOString(),
+      },
       tags_source: tagsSource,
       query_tags: queryTags,
       ...(slotHint ? { slot_hint: slotHint } : {}),
@@ -590,6 +617,7 @@ async function handleBatch(args: {
         webpUrl: webp.webpUrl,
         source_image_id: sourceImageId,
         garments: insertedGarments,
+        garmentsCount: insertedGarments.length,
         skippedCount,
         failures,
         mode: "outfit",
@@ -644,6 +672,7 @@ async function handleBatch(args: {
           webpUrl: webp.webpUrl,
           source_image_id: sourceImageId,
           garments: insertedGarments,
+          garmentsCount: insertedGarments.length,
           skippedCount,
           failures,
           mode: "multi",
@@ -676,6 +705,7 @@ async function handleBatch(args: {
         webpUrl: webp.webpUrl,
         source_image_id: sourceImageId,
         garments: insertedGarments,
+        garmentsCount: insertedGarments.length,
         skippedCount,
         failures,
         mode: "multi",
@@ -708,6 +738,7 @@ async function handleBatch(args: {
       webpUrl: webp.webpUrl,
       source_image_id: sourceImageId,
       garments: inserted.ok && inserted.garment ? [inserted.garment] : [],
+      garmentsCount: inserted.ok && inserted.garment ? 1 : 0,
       skippedCount: inserted.skipped ? 1 : 0,
       failures: inserted.ok ? [] : [{ error: inserted.error }],
       mode: "single",
@@ -888,7 +919,20 @@ export async function POST(req: NextRequest) {
         sourceLabel: "batch",
       });
 
-      return NextResponse.json({ ok: true, mode: "batch", multi, outfit, inserted: results, okCount }, { status: 200 });
+      const garmentsInsertedCount = results.reduce((acc, r) => acc + (Number(r?.garmentsCount ?? 0) || 0), 0);
+
+      return NextResponse.json(
+        {
+          ok: true,
+          mode: "batch",
+          multi,
+          outfit,
+          inserted: results,
+          okCount,
+          garmentsInsertedCount,
+        },
+        { status: 200 }
+      );
     }
 
     return NextResponse.json({ ok: false, error: "Invalid mode" }, { status: 400 });
