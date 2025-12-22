@@ -1,16 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import ConfirmGarment from "@/app/wardrobe/ConfirmGarment";
+import { useEffect, useMemo, useState } from "react";
 
 type Garment = {
   id: string;
   user_id: string | null;
 
-  source_image_id?: string | null;
-  fingerprint?: string | null;
-
-  image_url: string | null; // must be WebP from DB
+  image_url: string | null;
   catalog_name: string | null;
 
   category: string | null;
@@ -21,13 +17,8 @@ type Garment = {
   use_case: string | null;
   use_case_tags: string[] | null;
 
-  brand?: string | null;
   color: string | null;
   material: string | null;
-  pattern?: string | null;
-  seasons?: string[] | null;
-  size?: string | null;
-  confidence?: number | null;
 
   metadata?: any;
 
@@ -62,21 +53,13 @@ type GenerateOutfitResponse = {
   counts?: any;
 };
 
-type IngestBatchResponse = {
+type UploadVideoResponse = {
   ok: boolean;
-  mode?: string;
-  multi?: boolean;
-  outfit?: boolean;
-  okCount?: number;
-  inserted?: Array<any>;
+  video?: any;
+  signed_url?: string | null;
+  warnings?: string[];
   error?: string;
   details?: string;
-};
-
-type ConfirmDefaults = {
-  subcategory: string;
-  wear_temperature: "Cold" | "Mild" | "Warm";
-  formality_feel: "Casual" | "Smart Casual" | "Formal";
 };
 
 async function getSupabase() {
@@ -86,9 +69,7 @@ async function getSupabase() {
 
 function httpsify(url?: string | null) {
   if (!url) return null;
-  const u = String(url).trim();
-  if (!u) return null;
-  return u.startsWith("http://") ? u.replace("http://", "https://") : u;
+  return url.startsWith("http://") ? url.replace("http://", "https://") : url;
 }
 
 function displayName(g: Garment) {
@@ -99,230 +80,44 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
-function uniqStrings(arr: string[]) {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const a of arr) {
-    const t = String(a ?? "").trim();
-    if (!t) continue;
-    if (seen.has(t)) continue;
-    seen.add(t);
-    out.push(t);
-  }
-  return out;
-}
-
-async function safeFetchJSON(
-  url: string,
-  init: RequestInit,
-  timeoutMs = 180000
-): Promise<any> {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
+async function getVideoDurationSeconds(file: File): Promise<number | null> {
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.src = url;
 
-    const text = await res.text().catch(() => "");
-    let json: any = {};
-    try {
-      json = text ? JSON.parse(text) : {};
-    } catch {
-      json = { raw: text };
-    }
+    const duration = await new Promise<number>((resolve, reject) => {
+      v.onloadedmetadata = () => resolve(v.duration);
+      v.onerror = () => reject(new Error("Failed to read video metadata"));
+    });
 
-    if (!res.ok) {
-      const msg = json?.details || json?.error || `HTTP ${res.status}`;
-      throw new Error(msg);
-    }
-
-    return json;
-  } finally {
-    clearTimeout(t);
+    URL.revokeObjectURL(url);
+    if (!Number.isFinite(duration)) return null;
+    return duration;
+  } catch {
+    return null;
   }
-}
-
-/**
- * Robust extraction for batch responses.
- * Supports many shapes and dedupes by garment id.
- */
-function extractGarmentsFromBatch(inserted: any[]): Garment[] {
-  const out: Garment[] = [];
-
-  const pushMany = (arr: any) => {
-    if (!Array.isArray(arr)) return;
-    for (const g of arr) {
-      if (g && typeof g === "object" && typeof g.id === "string") {
-        out.push(g as Garment);
-      }
-    }
-  };
-
-  const pushOne = (g: any) => {
-    if (g && typeof g === "object" && typeof g.id === "string") {
-      out.push(g as Garment);
-      return true;
-    }
-    return false;
-  };
-
-  if (!Array.isArray(inserted)) {
-    const maybe = (inserted as any)?.inserted ?? (inserted as any)?.results ?? [];
-    return extractGarmentsFromBatch(Array.isArray(maybe) ? maybe : []);
-  }
-
-  for (const r of inserted || []) {
-    if (!r) continue;
-
-    if (Array.isArray(r)) {
-      pushMany(r);
-      continue;
-    }
-
-    pushMany(r.garments);
-    pushMany(r.inserted_garments);
-    pushMany(r.data?.garments);
-    pushMany(r.result?.garments);
-    pushMany(r.items);
-    pushMany(r.data?.items);
-    pushMany(r.result?.items);
-
-    if (Array.isArray(r.results)) {
-      for (const rr of r.results) {
-        if (!rr) continue;
-        pushMany(rr.garments);
-        pushMany(rr.inserted_garments);
-        pushOne(rr.garment);
-      }
-    }
-
-    if (pushOne(r.garment)) continue;
-    if (pushOne(r.data?.garment)) continue;
-    if (pushOne(r.result?.garment)) continue;
-  }
-
-  const seen = new Set<string>();
-  const deduped: Garment[] = [];
-  for (const g of out) {
-    if (!g?.id) continue;
-    if (seen.has(g.id)) continue;
-    seen.add(g.id);
-    deduped.push(g);
-  }
-
-  return deduped;
-}
-
-function inferWearTemperature(g: Garment): ConfirmDefaults["wear_temperature"] {
-  const tags = Array.isArray(g.tags) ? g.tags.map((t) => norm(String(t))) : [];
-  const sub = norm(g.subcategory ?? "");
-  const cat = norm(g.category ?? "");
-
-  if (
-    tags.includes("winter") ||
-    tags.some((t) => t.includes("season winter")) ||
-    sub.includes("hoodie") ||
-    sub.includes("jacket") ||
-    sub.includes("coat") ||
-    cat === "outerwear"
-  ) {
-    return "Cold";
-  }
-
-  if (
-    sub.includes("short") ||
-    sub.includes("tank") ||
-    sub.includes("tee") ||
-    tags.includes("summer") ||
-    tags.some((t) => t.includes("season summer"))
-  ) {
-    return "Warm";
-  }
-
-  return "Mild";
-}
-
-function inferFormalityFeel(g: Garment): ConfirmDefaults["formality_feel"] {
-  const use = norm(g.use_case ?? "");
-  const tags = Array.isArray(g.tags) ? g.tags.map((t) => norm(String(t))) : [];
-  const sub = norm(g.subcategory ?? "");
-
-  if (use === "formal" || tags.includes("formal") || sub.includes("suit") || sub.includes("dress")) {
-    return "Formal";
-  }
-
-  if (
-    use === "work" ||
-    tags.includes("smart") ||
-    tags.includes("smart casual") ||
-    sub.includes("trouser") ||
-    sub.includes("oxford")
-  ) {
-    return "Smart Casual";
-  }
-
-  return "Casual";
-}
-
-function buildConfirmDefaults(g: Garment): ConfirmDefaults {
-  const existing = g?.metadata?.confirmation ?? null;
-
-  const subcategory = String(g.subcategory ?? existing?.subcategory ?? "").trim() || "unknown";
-
-  const wear_temperature =
-    (existing?.wear_temperature as any) ||
-    inferWearTemperature(g);
-
-  const formality_feel =
-    (existing?.formality_feel as any) ||
-    inferFormalityFeel(g);
-
-  const wt: ConfirmDefaults["wear_temperature"] =
-    wear_temperature === "Cold" || wear_temperature === "Mild" || wear_temperature === "Warm"
-      ? wear_temperature
-      : "Mild";
-
-  const ff: ConfirmDefaults["formality_feel"] =
-    formality_feel === "Casual" || formality_feel === "Smart Casual" || formality_feel === "Formal"
-      ? formality_feel
-      : "Casual";
-
-  return { subcategory, wear_temperature: wt, formality_feel: ff };
 }
 
 export default function WardrobeClient() {
   const [garments, setGarments] = useState<Garment[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Unified ingest UI
-  const [ingestFiles, setIngestFiles] = useState<File[]>([]);
-  const [ingesting, setIngesting] = useState(false);
-
-  // Unified options
-  const [optMultiItem, setOptMultiItem] = useState(false);
-  const [optOutfitMode, setOptOutfitMode] = useState(false);
-  const [optMaxItemsPerPhoto, setOptMaxItemsPerPhoto] = useState(5);
-
-  // Progress
-  const [progress, setProgress] = useState<{
-    stage: "idle" | "uploading" | "ingesting";
-    done: number;
-    total: number;
-    ok: number;
-    failed: number;
-    message?: string | null;
-  }>({
-    stage: "idle",
-    done: 0,
-    total: 0,
-    ok: 0,
-    failed: 0,
-    message: null,
-  });
+  // Upload by photo
+  const [file, setFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
 
   // Add by text
   const [textQuery, setTextQuery] = useState("");
   const [addingText, setAddingText] = useState(false);
+
+  // Video upload (VESTI-5.1)
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number | null>(null);
+  const [videoUploading, setVideoUploading] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [lastVideo, setLastVideo] = useState<{ signedUrl: string | null; row: any | null } | null>(null);
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -346,15 +141,9 @@ export default function WardrobeClient() {
   const [outfitWarnings, setOutfitWarnings] = useState<string[]>([]);
   const [outfitError, setOutfitError] = useState<string | null>(null);
 
+  // Regenerate controls
   const [seedOutfitId, setSeedOutfitId] = useState<string | null>(null);
   const [excludeIds, setExcludeIds] = useState<string[]>([]);
-
-  // Confirmation UI
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmSaving, setConfirmSaving] = useState(false);
-  const [confirmGarmentId, setConfirmGarmentId] = useState<string | null>(null);
-  const [confirmQueue, setConfirmQueue] = useState<string[]>([]);
-  const lastQueueSourceRef = useRef<string>("");
 
   const fetchGarments = async () => {
     try {
@@ -408,405 +197,82 @@ export default function WardrobeClient() {
     return counts;
   }, [garments]);
 
-  const groupedWardrobe = useMemo(() => {
-    const map = new Map<string, Garment[]>();
-
-    for (const g of garments) {
-      const key = (g.source_image_id ?? "").trim() || "__ungrouped__";
-      const arr = map.get(key) ?? [];
-      arr.push(g);
-      map.set(key, arr);
-    }
-
-    const order: string[] = [];
-    for (const g of garments) {
-      const key = (g.source_image_id ?? "").trim() || "__ungrouped__";
-      if (!order.includes(key)) order.push(key);
-    }
-
-    return order.map((key) => ({
-      key,
-      title: key === "__ungrouped__" ? "Ungrouped" : `Source photo: ${key.slice(0, 8)}…`,
-      items: map.get(key) ?? [],
-    }));
-  }, [garments]);
-
-  const subcategoryOptions = useMemo(() => {
-    const fromWardrobe = garments
-      .map((g) => String(g.subcategory ?? "").trim())
-      .filter(Boolean);
-
-    const base = [
-      "unknown",
-      "t-shirt",
-      "shirt",
-      "long sleeve",
-      "crewneck sweatshirt",
-      "hoodie",
-      "zip hoodie",
-      "jacket",
-      "coat",
-      "trousers",
-      "jeans",
-      "joggers",
-      "shorts",
-      "sneakers",
-      "boots",
-      "loafers",
-      "belt",
-      "cap",
-      "beanie",
-      "bag",
-      "fragrance",
-    ];
-
-    return uniqStrings([...fromWardrobe, ...base]).sort((a, b) => a.localeCompare(b));
-  }, [garments]);
-
-  const confirmGarment = useMemo(() => {
-    if (!confirmGarmentId) return null;
-    return garments.find((g) => g.id === confirmGarmentId) ?? null;
-  }, [confirmGarmentId, garments]);
-
-  const confirmDefaults = useMemo(() => {
-    if (!confirmGarment) return null;
-    return buildConfirmDefaults(confirmGarment);
-  }, [confirmGarment]);
-
-  const openConfirmForGarmentId = (id: string) => {
-    const tid = String(id ?? "").trim();
-    if (!tid) return;
-    setConfirmGarmentId(tid);
-    setConfirmOpen(true);
+  // ----------------------------
+  // Upload by photo
+  // ----------------------------
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0] ?? null;
+    setFile(selected);
   };
 
-  const closeConfirm = () => {
-    setConfirmOpen(false);
-    setConfirmGarmentId(null);
-  };
-
-  const advanceConfirmQueue = () => {
-    setConfirmQueue((q) => {
-      const next = q.slice(1);
-      const nextId = next[0] ?? null;
-      if (nextId) {
-        setConfirmGarmentId(nextId);
-        setConfirmOpen(true);
-      } else {
-        setConfirmOpen(false);
-        setConfirmGarmentId(null);
-      }
-      return next;
-    });
-  };
-
-  useEffect(() => {
-    if (!confirmQueue.length) return;
-    if (!confirmOpen) {
-      openConfirmForGarmentId(confirmQueue[0]);
-    }
-  }, [confirmQueue, confirmOpen]);
-
-  const persistConfirmation = async (args: {
-    garmentId: string;
-    subcategory: string;
-    wear_temperature: ConfirmDefaults["wear_temperature"];
-    formality_feel: ConfirmDefaults["formality_feel"];
-  }) => {
-    const { garmentId, subcategory, wear_temperature, formality_feel } = args;
-
-    // Prefer server-side persistence so category locking + scoring stay deterministic.
-    // Backend should return `{ ok:true, garment:<row> }`.
-    try {
-      const json = await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            garment_id: garmentId,
-            confirmation: {
-              subcategory,
-              wear_temperature,
-              formality_feel,
-            },
-          }),
-        },
-        120000
-      );
-
-      if (json?.ok && json?.garment?.id) {
-        const updated = json.garment as Garment;
-        setGarments((prev) => prev.map((g) => (g.id === updated.id ? updated : g)));
-        return;
-      }
-
-      if (json && !json?.ok) {
-        throw new Error(json?.details || json?.error || "Confirmation save failed");
-      }
-    } catch (e: any) {
-      // Fallback to client-side update (works for Founder Edition, but won’t recalc scores)
-      console.warn("/api/ingest PATCH failed, falling back to direct Supabase update:", e?.message || e);
-    }
-
-    const supabase = await getSupabase();
-
-    const current = garments.find((g) => g.id === garmentId) ?? null;
-    const existingMeta =
-      current?.metadata && typeof current.metadata === "object" ? current.metadata : {};
-
-    const nextMeta = {
-      ...existingMeta,
-      confirmation: {
-        subcategory,
-        wear_temperature,
-        formality_feel,
-        confirmed_at: new Date().toISOString(),
-      },
-    };
-
-    const { data, error } = await supabase
-      .from("garments")
-      .update({
-        subcategory,
-        metadata: nextMeta,
-      })
-      .eq("id", garmentId)
-      .select("*")
-      .single();
-
-    if (error) throw new Error(error.message);
-
-    if (data?.id) {
-      setGarments((prev) => prev.map((g) => (g.id === data.id ? (data as Garment) : g)));
-    }
-  };
-
-  const onConfirmSave = async (values: ConfirmDefaults) => {
-    if (!confirmGarmentId) return;
+  const handleUpload = async () => {
+    if (!file) return;
 
     try {
-      setConfirmSaving(true);
-      await persistConfirmation({
-        garmentId: confirmGarmentId,
-        subcategory: values.subcategory,
-        wear_temperature: values.wear_temperature,
-        formality_feel: values.formality_feel,
-      });
+      setUploading(true);
 
-      if (confirmQueue.length) {
-        advanceConfirmQueue();
-      } else {
-        closeConfirm();
-      }
-    } catch (e: any) {
-      console.error("Confirm save failed:", e);
-      alert(e?.message || "Save failed");
-    } finally {
-      setConfirmSaving(false);
-    }
-  };
+      const supabase = await getSupabase();
 
-  const onConfirmSkip = async () => {
-    if (!confirmGarmentId) return;
+      const ext = file.name.split(".").pop() || "jpg";
+      const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+      const filePath = fileName;
 
-    try {
-      setConfirmSaving(true);
-
-      const defaults =
-        confirmDefaults ??
-        (confirmGarment
-          ? buildConfirmDefaults(confirmGarment)
-          : {
-              subcategory: "unknown",
-              wear_temperature: "Mild" as const,
-              formality_feel: "Casual" as const,
-            });
-
-      await persistConfirmation({
-        garmentId: confirmGarmentId,
-        subcategory: defaults.subcategory,
-        wear_temperature: defaults.wear_temperature,
-        formality_feel: defaults.formality_feel,
-      });
-
-      if (confirmQueue.length) {
-        advanceConfirmQueue();
-      } else {
-        closeConfirm();
-      }
-    } catch (e: any) {
-      console.error("Confirm skip failed:", e);
-      alert(e?.message || "Save failed");
-    } finally {
-      setConfirmSaving(false);
-    }
-  };
-
-  // Storage upload helper
-  const uploadOneToStorage = async (fileToUpload: File): Promise<string> => {
-    const supabase = await getSupabase();
-
-    const ext = fileToUpload.name.split(".").pop() || "jpg";
-    const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
-    const filePath = fileName;
-
-    const { error: uploadError } = await supabase.storage
-      .from("garments")
-      .upload(filePath, fileToUpload, {
-        cacheControl: "3600",
-        upsert: false,
-      });
-
-    if (uploadError) {
-      throw new Error(`Storage upload failed: ${uploadError.message}`);
-    }
-
-    const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
-    const publicUrl = publicData?.publicUrl;
-
-    if (!publicUrl) {
-      throw new Error("Could not generate public URL.");
-    }
-
-    return publicUrl;
-  };
-
-  // Unified ingest handlers
-  const handleIngestChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []).slice(0, 25);
-    setIngestFiles(files);
-  };
-
-  const runUnifiedIngest = async () => {
-    if (!ingestFiles.length) return;
-
-    try {
-      setIngesting(true);
-      setProgress({
-        stage: "uploading",
-        done: 0,
-        total: ingestFiles.length,
-        ok: 0,
-        failed: 0,
-        message: "Uploading to Storage…",
-      });
-
-      const urls: string[] = [];
-      for (let i = 0; i < ingestFiles.length; i++) {
-        const u = await uploadOneToStorage(ingestFiles[i]);
-        urls.push(u);
-        setProgress((p) => ({ ...p, done: i + 1 }));
-      }
-
-      setProgress((p) => ({
-        ...p,
-        stage: "ingesting",
-        done: 0,
-        message: "Ingesting…",
-      }));
-
-      const json = (await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "batch",
-            payload: {
-              imageUrls: urls,
-              multi: Boolean(optMultiItem),
-              outfit: Boolean(optOutfitMode),
-              maxItemsPerPhoto: Math.min(5, Math.max(1, Number(optMaxItemsPerPhoto || 5))),
-            },
-          }),
-        },
-        240000
-      )) as IngestBatchResponse;
-
-      if (!json?.ok) {
-        console.error("Unified batch ingest error:", json);
-        alert(json?.details || json?.error || "Error ingest.");
-        return;
-      }
-
-      const inserted = Array.isArray(json.inserted) ? json.inserted : [];
-      const allNew = extractGarmentsFromBatch(inserted);
-
-      const ok =
-        typeof json.okCount === "number"
-          ? json.okCount
-          : inserted.reduce((acc, r) => (r?.ok ? acc + 1 : acc), 0);
-
-      const failed = inserted.length
-        ? inserted.reduce((acc, r) => (!r?.ok ? acc + 1 : acc), 0)
-        : 0;
-
-      setProgress((p) => ({
-        ...p,
-        ok,
-        failed,
-        message: `Done. OK ${ok}. Failed ${failed}. Added ${allNew.length} item(s). Refreshing…`,
-      }));
-
-      if (allNew.length) {
-        setGarments((prev) => {
-          const seen = new Set<string>();
-          const merged = [...allNew, ...prev].filter((g) => {
-            const id = (g?.id ?? "").trim();
-            if (!id) return false;
-            if (seen.has(id)) return false;
-            seen.add(id);
-            return true;
-          });
-          return merged;
+      const { error: uploadError } = await supabase.storage
+        .from("garments")
+        .upload(filePath, file, {
+          cacheControl: "3600",
+          upsert: false,
         });
+
+      if (uploadError) {
+        console.error("Upload error:", uploadError);
+        alert("Error uploading image to Storage.");
+        return;
       }
 
-      await fetchGarments();
+      const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
+      const publicUrl = publicData?.publicUrl;
 
-      if (allNew.length) {
-        const queueIds = uniqStrings(allNew.map((g) => g.id));
-        const stamp = queueIds.join(",");
-        if (stamp && stamp !== lastQueueSourceRef.current) {
-          lastQueueSourceRef.current = stamp;
-          setConfirmQueue(queueIds);
-        }
+      if (!publicUrl) {
+        console.error("Missing public URL for filePath:", filePath);
+        alert("Could not generate public URL.");
+        return;
       }
 
-      setIngestFiles([]);
-      const input = document.getElementById("ingest-input") as HTMLInputElement | null;
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "photo",
+          payload: { imageUrl: publicUrl },
+        }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+
+      if (!res.ok || !json?.ok) {
+        console.error("Ingest error:", json);
+        alert(json?.details || "Error creating garment (ingest).");
+        return;
+      }
+
+      const newGarment = json.garment as Garment;
+      setGarments((prev) => [newGarment, ...prev]);
+      setFile(null);
+
+      const input = document.getElementById("file-input") as HTMLInputElement | null;
       if (input) input.value = "";
-
-      setProgress((p) => ({
-        ...p,
-        stage: "idle",
-        message: `Ingest complete. OK ${ok}. Failed ${failed}.`,
-      }));
-    } catch (err: any) {
-      console.error("Unexpected unified ingest error:", err);
-      alert(err?.message || "Unexpected error.");
-      setProgress((p) => ({
-        ...p,
-        stage: "idle",
-        message: err?.message || "Unexpected error.",
-      }));
+    } catch (err) {
+      console.error("Unexpected upload error:", err);
+      alert("Unexpected error.");
     } finally {
-      setIngesting(false);
-      setTimeout(() => {
-        setProgress({
-          stage: "idle",
-          done: 0,
-          total: 0,
-          ok: 0,
-          failed: 0,
-          message: null,
-        });
-      }, 1500);
+      setUploading(false);
     }
   };
 
+  // ----------------------------
   // Add by text
+  // ----------------------------
   const handleAddByText = async () => {
     const q = textQuery.trim();
     if (!q) return;
@@ -814,40 +280,101 @@ export default function WardrobeClient() {
     try {
       setAddingText(true);
 
-      const json = await safeFetchJSON(
-        "/api/ingest",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            mode: "text",
-            payload: { query: q },
-          }),
-        },
-        180000
-      );
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "text",
+          payload: { query: q },
+        }),
+      });
 
-      if (!json?.ok || !json.garment) {
+      const json = await res.json().catch(() => ({}));
+
+      if (!res.ok || !json?.ok) {
         console.error("Text ingest error:", json);
-        alert(json?.details || json?.error || "Error adding item by text.");
+        alert(json?.details || "Error adding item by text.");
         return;
       }
 
-      const newG = json.garment as Garment;
-      setGarments((prev) => [newG as Garment, ...prev]);
-      await fetchGarments();
+      const newGarment = json.garment as Garment;
+      setGarments((prev) => [newGarment, ...prev]);
       setTextQuery("");
-
-      setConfirmQueue([newG.id]);
-    } catch (e: any) {
+    } catch (e) {
       console.error("Unexpected add-by-text error:", e);
-      alert(e?.message || "Unexpected error.");
+      alert("Unexpected error.");
     } finally {
       setAddingText(false);
     }
   };
 
+  // ----------------------------
+  // Video upload (VESTI-5.1)
+  // ----------------------------
+  const handleVideoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setVideoError(null);
+    setLastVideo(null);
+
+    const selected = e.target.files?.[0] ?? null;
+    setVideoFile(selected);
+    setVideoDuration(null);
+
+    if (!selected) return;
+
+    // Validate duration <= 60s (mobile-first)
+    const d = await getVideoDurationSeconds(selected);
+    setVideoDuration(d);
+
+    if (d != null && d > 60) {
+      setVideoError(`Video is ${Math.ceil(d)}s. Max is 60s.`);
+      setVideoFile(null);
+      const input = document.getElementById("video-input") as HTMLInputElement | null;
+      if (input) input.value = "";
+    }
+  };
+
+  const uploadWardrobeVideo = async () => {
+    if (!videoFile) return;
+
+    try {
+      setVideoUploading(true);
+      setVideoError(null);
+      setLastVideo(null);
+
+      const form = new FormData();
+      form.append("video", videoFile);
+
+      const res = await fetch("/api/wardrobe-videos/upload", {
+        method: "POST",
+        body: form,
+      });
+
+      const json = (await res.json().catch(() => ({}))) as UploadVideoResponse;
+
+      if (!res.ok || !json?.ok) {
+        const msg = json?.details || json?.error || "Video upload failed.";
+        setVideoError(msg);
+        console.error("Video upload error:", json);
+        return;
+      }
+
+      setLastVideo({ signedUrl: json.signed_url ?? null, row: json.video ?? null });
+      setVideoFile(null);
+      setVideoDuration(null);
+
+      const input = document.getElementById("video-input") as HTMLInputElement | null;
+      if (input) input.value = "";
+    } catch (e: any) {
+      console.error("Unexpected video upload error:", e);
+      setVideoError(e?.message || "Unexpected error.");
+    } finally {
+      setVideoUploading(false);
+    }
+  };
+
+  // ----------------------------
   // Outfit generation
+  // ----------------------------
   const resetOutfitUI = () => {
     setOutfitError(null);
     setOutfitWarnings([]);
@@ -860,23 +387,21 @@ export default function WardrobeClient() {
       setGenerating(true);
       resetOutfitUI();
 
-      const json = (await safeFetchJSON(
-        "/api/outfits/generate",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            use_case: useCase,
-            include_accessory: includeAccessory,
-            include_fragrance: includeFragrance,
-            seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
-            exclude_ids: opts?.regenerate ? excludeIds : [],
-          }),
-        },
-        180000
-      )) as GenerateOutfitResponse;
+      const res = await fetch("/api/outfits/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          use_case: useCase,
+          include_accessory: includeAccessory,
+          include_fragrance: includeFragrance,
+          seed_outfit_id: opts?.regenerate ? seedOutfitId : null,
+          exclude_ids: opts?.regenerate ? excludeIds : [],
+        }),
+      });
 
-      if (!json?.ok) {
+      const json = (await res.json().catch(() => ({}))) as GenerateOutfitResponse;
+
+      if (!res.ok || !json?.ok) {
         const msg = json?.details || json?.error || "Could not generate outfit.";
         setOutfitError(msg);
         console.error("Generate outfit error:", json);
@@ -909,7 +434,9 @@ export default function WardrobeClient() {
 
   const canRegenerate = Boolean(seedOutfitId) && excludeIds.length > 0;
 
+  // ----------------------------
   // Render helpers
+  // ----------------------------
   const renderTags = (g: Garment) => {
     const tags = Array.isArray(g.tags) ? g.tags.filter(Boolean) : [];
     if (!tags.length) return null;
@@ -917,10 +444,7 @@ export default function WardrobeClient() {
     return (
       <div className="flex flex-wrap gap-2 pt-1">
         {tags.slice(0, 16).map((t) => (
-          <span
-            key={t}
-            className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
-          >
+          <span key={t} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
             {t}
           </span>
         ))}
@@ -933,44 +457,23 @@ export default function WardrobeClient() {
     const name = displayName(g);
     const cat = (g.category ?? "").trim();
     const sub = (g.subcategory ?? "").trim();
-    const seasons = Array.isArray(g.seasons) ? g.seasons.filter(Boolean) : [];
 
     const metaLine = [
-      g.brand ? `Brand: ${g.brand}` : null,
       g.color ? `Color: ${g.color}` : null,
       g.material ? `Material: ${g.material}` : null,
-      g.pattern ? `Pattern: ${g.pattern}` : null,
-      g.size ? `Size: ${g.size}` : null,
-      seasons.length ? `Seasons: ${seasons.join(", ")}` : null,
       g.fit ? `Fit: ${g.fit}` : null,
       g.use_case ? `Use: ${g.use_case}` : null,
-      typeof g.confidence === "number" ? `Conf: ${g.confidence.toFixed(2)}` : null,
     ]
       .filter(Boolean)
       .join(" · ");
 
-    const sourceLine = g.source_image_id ? `source: ${String(g.source_image_id).slice(0, 8)}…` : null;
-    const confirmed = Boolean(g?.metadata?.confirmation?.confirmed_at);
-
     return (
       <div className="border rounded-lg p-3 text-sm flex flex-col gap-2">
-        <div className="flex items-center justify-between gap-2">
-          {extra?.badge ? (
-            <div className="text-xs inline-flex self-start px-2 py-1 rounded-full border border-white/10 bg-white/5">
-              {extra.badge}
-            </div>
-          ) : (
-            <div />
-          )}
-
-          <button
-            onClick={() => openConfirmForGarmentId(g.id)}
-            className="text-xs px-2 py-1 rounded border border-white/15 bg-white/5"
-            title="Review and save the 3-field confirmation"
-          >
-            {confirmed ? "Review" : "Confirm"}
-          </button>
-        </div>
+        {extra?.badge ? (
+          <div className="text-xs inline-flex self-start px-2 py-1 rounded-full border border-white/10 bg-white/5">
+            {extra.badge}
+          </div>
+        ) : null}
 
         {src ? (
           <img src={src} alt={name} className="w-full h-40 object-cover rounded" loading="lazy" />
@@ -982,10 +485,13 @@ export default function WardrobeClient() {
 
         <div className="font-medium">{name}</div>
 
-        {(cat || sub) && <div className="text-xs text-gray-500">{[cat, sub].filter(Boolean).join(" · ")}</div>}
-        {metaLine ? <div className="text-xs text-gray-500">{metaLine}</div> : null}
-        {sourceLine ? <div className="text-[11px] text-gray-600">{sourceLine}</div> : null}
+        {(cat || sub) && (
+          <div className="text-xs text-gray-500">
+            {[cat, sub].filter(Boolean).join(" · ")}
+          </div>
+        )}
 
+        {metaLine ? <div className="text-xs text-gray-500">{metaLine}</div> : null}
         {renderTags(g)}
       </div>
     );
@@ -993,26 +499,10 @@ export default function WardrobeClient() {
 
   return (
     <main className="p-6 space-y-8">
-      {/* Confirmation Modal */}
-      {confirmOpen && confirmGarment && confirmDefaults ? (
-        <ConfirmGarment
-          open={confirmOpen}
-          garment={confirmGarment}
-          defaults={confirmDefaults}
-          subcategoryOptions={subcategoryOptions}
-          saving={confirmSaving}
-          onClose={() => {
-            closeConfirm();
-          }}
-          onSave={onConfirmSave}
-          onSkip={onConfirmSkip}
-        />
-      ) : null}
-
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
         <p className="text-sm text-gray-500">
-          One ingest flow. Upload 1 to 25 photos. Optional multi item extraction. Optional outfit load mode. Always WebP from DB.
+          Upload by photo or add by text. Generate rules-based outfits. Upload a wardrobe video (≤60s) as a single ingestion unit.
         </p>
 
         <div className="text-xs text-gray-500 pt-2">
@@ -1020,94 +510,75 @@ export default function WardrobeClient() {
         </div>
       </header>
 
-      {/* Unified Ingest */}
+      {/* Upload wardrobe video */}
       <section className="border rounded-lg p-4 space-y-3">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <h2 className="text-lg font-medium">Ingest photos (1 to 25)</h2>
-
-          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
-            Refresh closet
-          </button>
-        </div>
+        <h2 className="text-lg font-medium">Upload wardrobe video (max 60s)</h2>
 
         <div className="flex items-center gap-4 flex-wrap">
           <input
-            id="ingest-input"
+            id="video-input"
             type="file"
-            accept="image/*"
-            multiple
-            onChange={handleIngestChange}
+            accept="video/*"
+            onChange={handleVideoChange}
             className="block text-sm"
           />
 
           <button
-            onClick={runUnifiedIngest}
-            disabled={!ingestFiles.length || ingesting}
+            onClick={uploadWardrobeVideo}
+            disabled={!videoFile || videoUploading}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
           >
-            {ingesting ? "Working…" : "Ingest"}
+            {videoUploading ? "Uploading..." : "Upload video"}
           </button>
         </div>
 
-        <div className="flex items-center gap-4 flex-wrap">
-          <label className="text-sm flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={optMultiItem}
-              onChange={(e) => {
-                const v = e.target.checked;
-                setOptMultiItem(v);
-                if (!v) setOptOutfitMode(false);
-              }}
-            />
-            Multi item per photo (up to 5 garments)
-          </label>
-
-          <label className="text-sm flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={optOutfitMode}
-              onChange={(e) => {
-                const v = e.target.checked;
-                setOptOutfitMode(v);
-                if (v) setOptMultiItem(true);
-              }}
-            />
-            Outfit load mode (slot based extraction)
-          </label>
-
-          <label className="text-sm flex items-center gap-2">
-            Max items/photo
-            <select
-              value={optMaxItemsPerPhoto}
-              onChange={(e) => setOptMaxItemsPerPhoto(Number(e.target.value))}
-              className="border rounded-md px-2 py-2 text-sm bg-transparent"
-              disabled={!optMultiItem}
-              title={optMultiItem ? "Max garments extracted per photo" : "Enable multi item to use this"}
-            >
-              <option value={1}>1</option>
-              <option value={2}>2</option>
-              <option value={3}>3</option>
-              <option value={4}>4</option>
-              <option value={5}>5</option>
-            </select>
-          </label>
+        <div className="text-xs text-gray-500">
+          {videoFile ? `Selected: ${videoFile.name}` : "Select a short video to begin."}
+          {videoDuration != null ? ` · Duration: ${Math.ceil(videoDuration)}s` : ""}
         </div>
 
-        <div className="text-xs text-gray-500 space-y-1">
-          <div>{ingestFiles.length ? `Selected: ${ingestFiles.length} file(s)` : "Select 1 to 25 images."}</div>
+        {videoError ? <div className="text-sm text-red-400">{videoError}</div> : null}
 
-          {progress.total ? (
-            <div>
-              Stage: {progress.stage} · {progress.done}/{progress.total} · OK {progress.ok} · Failed {progress.failed}
-              {progress.message ? <span className="ml-2">{progress.message}</span> : null}
-            </div>
-          ) : null}
-
-          <div>
-            Calls <code>/api/ingest</code> with{" "}
-            <code>{`{ mode:"batch", payload:{ imageUrls:[...], multi:${optMultiItem}, outfit:${optOutfitMode}, maxItemsPerPhoto:${optMaxItemsPerPhoto} } }`}</code>
+        {lastVideo?.row ? (
+          <div className="text-xs text-gray-500 space-y-2">
+            <div>Saved: status = {String(lastVideo.row.status)} · id = {String(lastVideo.row.id)}</div>
+            {lastVideo.signedUrl ? (
+              <video
+                controls
+                className="w-full max-w-xl rounded border border-white/10"
+                src={lastVideo.signedUrl}
+              />
+            ) : (
+              <div>Signed URL unavailable (check warnings in console).</div>
+            )}
           </div>
+        ) : null}
+      </section>
+
+      {/* Upload by photo */}
+      <section className="border rounded-lg p-4 space-y-3">
+        <h2 className="text-lg font-medium">Add garment by photo</h2>
+
+        <div className="flex items-center gap-4">
+          <input
+            id="file-input"
+            type="file"
+            accept="image/*"
+            onChange={handleFileChange}
+            className="block text-sm"
+          />
+
+          <button
+            onClick={handleUpload}
+            disabled={!file || uploading}
+            className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
+          >
+            {uploading ? "Uploading..." : "Upload"}
+          </button>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          {file ? `Selected: ${file.name}` : "Select an image to begin."}
         </div>
       </section>
 
@@ -1115,7 +586,7 @@ export default function WardrobeClient() {
       <section className="border rounded-lg p-4 space-y-3">
         <h2 className="text-lg font-medium">Add garment by text</h2>
 
-        <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-3">
           <input
             value={textQuery}
             onChange={(e) => setTextQuery(e.target.value)}
@@ -1128,7 +599,7 @@ export default function WardrobeClient() {
             disabled={!textQuery.trim() || addingText}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
           >
-            {addingText ? "Adding…" : "Add"}
+            {addingText ? "Adding..." : "Add"}
           </button>
         </div>
 
@@ -1182,7 +653,7 @@ export default function WardrobeClient() {
               disabled={generating}
               className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
             >
-              {generating ? "Generating…" : "Generate Outfit"}
+              {generating ? "Generating..." : "Generate Outfit"}
             </button>
 
             <button
@@ -1191,11 +662,11 @@ export default function WardrobeClient() {
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
               title={
                 canRegenerate
-                  ? "Generate a variation (auto exclude items from seed outfit)"
+                  ? "Generate a variation (auto-exclude items from seed outfit)"
                   : "Generate first to enable variations"
               }
             >
-              {generating ? "Working…" : "Regenerate Variation"}
+              {generating ? "Working..." : "Regenerate Variation"}
             </button>
           </div>
         </div>
@@ -1241,6 +712,9 @@ export default function WardrobeClient() {
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-medium">Your wardrobe</h2>
+          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
+            Refresh
+          </button>
         </div>
 
         {loading ? (
@@ -1248,22 +722,9 @@ export default function WardrobeClient() {
         ) : garments.length === 0 ? (
           <p className="text-sm text-gray-500">No garments yet. Add your first one above.</p>
         ) : (
-          <div className="space-y-8">
-            {groupedWardrobe.map((group) => (
-              <div key={group.key} className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm font-medium">
-                    {group.title}
-                    <span className="ml-2 text-xs text-gray-500">({group.items.length})</span>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                  {group.items.map((g) => (
-                    <div key={g.id}>{renderGarmentCard(g)}</div>
-                  ))}
-                </div>
-              </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            {garments.map((g) => (
+              <div key={g.id}>{renderGarmentCard(g)}</div>
             ))}
           </div>
         )}
