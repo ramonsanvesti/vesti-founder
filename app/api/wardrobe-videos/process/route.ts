@@ -25,6 +25,13 @@ type CandidateRow = {
   source_frame_index?: number;
 };
 
+type CandidatePreview = {
+  fingerprint: string;
+  image_url: string;
+  score?: number | null;
+  source_frame_index?: number | null;
+};
+
 type CandidateFromDetector = {
   fingerprint?: string;
   hash?: string;
@@ -227,12 +234,16 @@ export async function POST(req: NextRequest) {
           status: "processed",
           frames: 0,
           candidates: 0,
+          candidates_preview: [] as CandidatePreview[],
           message: "No frames extracted",
           started_at: startedAt,
         },
         { status: 200 }
       );
     }
+
+    // Prepare candidatesPreview before persisting candidates
+    let candidatesPreview: CandidatePreview[] = [];
 
     // 3b) Detect candidates (dedupe handled later here)
     const detected = await detectGarmentCandidates({
@@ -287,6 +298,13 @@ export async function POST(req: NextRequest) {
 
     const candidates = uniqByFingerprint(normalizedCandidates).slice(0, maxCandidates);
 
+    candidatesPreview = candidates.map((c) => ({
+      fingerprint: c.fingerprint,
+      image_url: c.image_url,
+      score: c.score ?? null,
+      source_frame_index: c.source_frame_index ?? null,
+    }));
+
     // Retry-safe: clear previous candidates for this video
     await supabase
       .from("wardrobe_video_candidates")
@@ -310,6 +328,23 @@ export async function POST(req: NextRequest) {
         .from("wardrobe_video_candidates")
         .insert(rows);
 
+      // Refresh from DB for UI (and to confirm persistence)
+      const { data: candRows } = await supabase
+        .from("wardrobe_video_candidates")
+        .select("fingerprint,image_url,score,source_frame_index")
+        .eq("wardrobe_video_id", video.id)
+        .eq("user_id", FOUNDER_USER_ID)
+        .order("created_at", { ascending: true });
+
+      if (Array.isArray(candRows) && candRows.length) {
+        candidatesPreview = candRows.map((r: any) => ({
+          fingerprint: asString(r.fingerprint),
+          image_url: asString(r.image_url),
+          score: typeof r.score === "number" ? r.score : null,
+          source_frame_index: typeof r.source_frame_index === "number" ? r.source_frame_index : null,
+        })).filter((r) => r.fingerprint && r.image_url);
+      }
+
       if (candErr) {
         // Do not fail the whole pipeline; mark processed but include warning.
         await supabase
@@ -325,6 +360,7 @@ export async function POST(req: NextRequest) {
             status: "processed",
             frames: frames.length,
             candidates: candidates.length,
+            candidates_preview: candidatesPreview,
             warning: `Candidates detected but failed to persist: ${candErr.message}`,
             started_at: startedAt,
           },
@@ -347,6 +383,7 @@ export async function POST(req: NextRequest) {
         status: "processed",
         frames: frames.length,
         candidates: candidates.length,
+        candidates_preview: candidatesPreview,
         started_at: startedAt,
       },
       { status: 200 }
