@@ -5,12 +5,12 @@ import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Founder Edition: replace with real auth later
 const FAKE_USER_ID = "00000000-0000-0000-0000-000000000001";
 const BUCKET = "wardrobe_videos";
 
-// Server-side hard limits (optional but recommended)
+// Server-side hard limits (size/type). Duration (<=60s) is validated client-side in Founder Edition.
 const MAX_BYTES = 50 * 1024 * 1024; // 50MB safeguard (tune later)
-// Note: 60s duration validation is done client-side (no ffprobe in MVP).
 
 function safeExtFromMime(mime: string) {
   const m = (mime || "").toLowerCase();
@@ -22,6 +22,143 @@ function safeExtFromMime(mime: string) {
 
 function randId() {
   return Math.random().toString(16).slice(2);
+}
+
+function toInt(v: string | null, fallback: number) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.floor(n));
+}
+
+async function signOne(
+  supabase: ReturnType<typeof getSupabaseServerClient>,
+  storagePath: string,
+  seconds: number
+) {
+  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(storagePath, seconds);
+  if (error) return { signedUrl: null as string | null, error: error.message };
+  return { signedUrl: data?.signedUrl ?? null, error: null as string | null };
+}
+
+/**
+ * GET /api/wardrobe-videos/upload
+ * Returns user's upload history + signed URLs.
+ * Query params:
+ *  - limit: number (default 25)
+ *  - signed_ttl: seconds (default 3600)
+ */
+export async function GET(req: NextRequest) {
+  try {
+    const url = new URL(req.url);
+    const limit = Math.min(toInt(url.searchParams.get("limit"), 25), 100);
+    const signedTtl = Math.min(toInt(url.searchParams.get("signed_ttl"), 3600), 24 * 3600);
+
+    const supabase = getSupabaseServerClient();
+
+    const { data: rows, error } = await supabase
+      .from("wardrobe_videos")
+      .select("*")
+      .eq("user_id", FAKE_USER_ID)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      return NextResponse.json(
+        { ok: false, error: "Failed to load wardrobe videos", details: error.message },
+        { status: 500 }
+      );
+    }
+
+    const videos = Array.isArray(rows) ? rows : [];
+
+    // Attach signed URLs (secure) for preview/download
+    const signedMap: Record<string, string | null> = {};
+    const signWarnings: string[] = [];
+
+    const videosWithSignedUrl = [] as any[];
+
+    for (const v of videos) {
+      const storagePath = typeof (v as any)?.video_url === "string" ? (v as any).video_url : "";
+      const id = String((v as any)?.id ?? "");
+
+      if (!storagePath || !id) {
+        signedMap[id] = null;
+        videosWithSignedUrl.push({ ...(v as any), signed_url: null });
+        continue;
+      }
+
+      const { signedUrl, error: signErr } = await signOne(supabase, storagePath, signedTtl);
+      signedMap[id] = signedUrl;
+      videosWithSignedUrl.push({ ...(v as any), signed_url: signedUrl });
+
+      if (signErr) signWarnings.push(`Signed URL failed for ${id}: ${signErr}`);
+    }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        videos: videosWithSignedUrl,
+        signed_urls: signedMap,
+        warnings: signWarnings,
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    console.error("Error in GET /api/wardrobe-videos/upload:", err);
+    return NextResponse.json(
+      { ok: false, error: "Server error", details: err?.message ?? "unknown" },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * PATCH /api/wardrobe-videos/upload
+ * Body: { id: string, status?: "uploaded"|"processing"|"processed"|"failed" }
+ * Updates status (user-scoped). Defaults to "processing".
+ */
+export async function PATCH(req: NextRequest) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as { id?: string; status?: string };
+    const id = typeof body?.id === "string" ? body.id.trim() : "";
+    const requestedStatus = typeof body?.status === "string" ? body.status.trim() : "processing";
+    const allowed = new Set(["uploaded", "processing", "processed", "failed"]);
+    const status = allowed.has(requestedStatus) ? requestedStatus : "processing";
+
+    if (!id) {
+      return NextResponse.json({ ok: false, error: "Missing video id" }, { status: 400 });
+    }
+
+    const supabase = getSupabaseServerClient();
+
+    // Update status user-scoped
+    const { data: updated, error } = await supabase
+      .from("wardrobe_videos")
+      .update({ status })
+      .eq("id", id)
+      .eq("user_id", FAKE_USER_ID)
+      .select("*")
+      .single();
+
+    if (error || !updated) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Failed to update status",
+          details: error?.message ?? "Not found or not allowed",
+        },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, video: updated }, { status: 200 });
+  } catch (err: any) {
+    console.error("Error in PATCH /api/wardrobe-videos/upload:", err);
+    return NextResponse.json(
+      { ok: false, error: "Server error", details: err?.message ?? "unknown" },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -45,7 +182,10 @@ export async function POST(req: NextRequest) {
 
     if (file.size > MAX_BYTES) {
       return NextResponse.json(
-        { ok: false, error: `Video too large. Max ${Math.floor(MAX_BYTES / (1024 * 1024))}MB.` },
+        {
+          ok: false,
+          error: `Video too large. Max ${Math.floor(MAX_BYTES / (1024 * 1024))}MB.`,
+        },
         { status: 413 }
       );
     }
@@ -58,15 +198,13 @@ export async function POST(req: NextRequest) {
 
     // Upload to Storage (bucket should be PRIVATE)
     const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const bytes = new Uint8Array(arrayBuffer);
 
-    const { error: uploadErr } = await supabase.storage
-      .from(BUCKET)
-      .upload(storagePath, buffer, {
-        contentType: file.type,
-        cacheControl: "3600",
-        upsert: false,
-      });
+    const { error: uploadErr } = await supabase.storage.from(BUCKET).upload(storagePath, bytes, {
+      contentType: file.type,
+      cacheControl: "3600",
+      upsert: false,
+    });
 
     if (uploadErr) {
       return NextResponse.json(

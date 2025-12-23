@@ -53,11 +53,34 @@ type GenerateOutfitResponse = {
   counts?: any;
 };
 
+type WardrobeVideoRow = {
+  id: string;
+  user_id: string | null;
+  video_url: string;
+  status: "uploaded" | "processing" | "processed" | "failed" | string;
+  created_at?: string;
+  signed_url?: string | null;
+};
+
 type UploadVideoResponse = {
   ok: boolean;
-  video?: any;
+  video?: WardrobeVideoRow | null;
   signed_url?: string | null;
   warnings?: string[];
+  error?: string;
+  details?: string;
+};
+
+type ListVideosResponse = {
+  ok: boolean;
+  videos?: WardrobeVideoRow[];
+  error?: string;
+  details?: string;
+};
+
+type ProcessVideoResponse = {
+  ok: boolean;
+  video?: WardrobeVideoRow | null;
   error?: string;
   details?: string;
 };
@@ -117,7 +140,13 @@ export default function WardrobeClient() {
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoUploading, setVideoUploading] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
-  const [lastVideo, setLastVideo] = useState<{ signedUrl: string | null; row: any | null } | null>(null);
+  const [lastVideo, setLastVideo] = useState<{ signedUrl: string | null; row: WardrobeVideoRow | null } | null>(null);
+
+  // Video history (VESTI-5.2)
+  const [videos, setVideos] = useState<WardrobeVideoRow[]>([]);
+  const [videosLoading, setVideosLoading] = useState(false);
+  const [videosError, setVideosError] = useState<string | null>(null);
+  const [processingVideoId, setProcessingVideoId] = useState<string | null>(null);
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -170,8 +199,66 @@ export default function WardrobeClient() {
     }
   };
 
+  const fetchVideos = async () => {
+    try {
+      setVideosLoading(true);
+      setVideosError(null);
+
+      const res = await fetch("/api/wardrobe-videos/upload", { method: "GET" });
+      const json = (await res.json().catch(() => ({}))) as ListVideosResponse;
+
+      if (!res.ok || !json?.ok) {
+        const msg = json?.details || json?.error || "Failed to load video history.";
+        setVideosError(msg);
+        setVideos([]);
+        return;
+      }
+
+      const rows = Array.isArray(json.videos) ? json.videos : [];
+      setVideos(rows);
+    } catch (e: any) {
+      console.error("Unexpected error loading video history:", e);
+      setVideosError(e?.message || "Unexpected error.");
+      setVideos([]);
+    } finally {
+      setVideosLoading(false);
+    }
+  };
+
+  const processVideo = async (id: string) => {
+    if (!id) return;
+
+    try {
+      setProcessingVideoId(id);
+      setVideosError(null);
+
+      const res = await fetch("/api/wardrobe-videos/upload", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, status: "processing" }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as ProcessVideoResponse;
+
+      if (!res.ok || !json?.ok) {
+        const msg = json?.details || json?.error || "Failed to update video status.";
+        setVideosError(msg);
+        console.error("Process video error:", json);
+        return;
+      }
+
+      await fetchVideos();
+    } catch (e: any) {
+      console.error("Unexpected process video error:", e);
+      setVideosError(e?.message || "Unexpected error.");
+    } finally {
+      setProcessingVideoId(null);
+    }
+  };
+
   useEffect(() => {
     fetchGarments();
+    fetchVideos();
   }, []);
 
   const wardrobeCounts = useMemo(() => {
@@ -313,6 +400,7 @@ export default function WardrobeClient() {
   // ----------------------------
   const handleVideoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     setVideoError(null);
+    setVideosError(null);
     setLastVideo(null);
 
     const selected = e.target.files?.[0] ?? null;
@@ -321,7 +409,6 @@ export default function WardrobeClient() {
 
     if (!selected) return;
 
-    // Validate duration <= 60s (mobile-first)
     const d = await getVideoDurationSeconds(selected);
     setVideoDuration(d);
 
@@ -358,7 +445,11 @@ export default function WardrobeClient() {
         return;
       }
 
-      setLastVideo({ signedUrl: json.signed_url ?? null, row: json.video ?? null });
+      const uploadedRow = (json.video ?? null) as WardrobeVideoRow | null;
+      setLastVideo({ signedUrl: json.signed_url ?? null, row: uploadedRow });
+
+      await fetchVideos();
+
       setVideoFile(null);
       setVideoDuration(null);
 
@@ -506,7 +597,9 @@ export default function WardrobeClient() {
         </p>
 
         <div className="text-xs text-gray-500 pt-2">
-          Wardrobe counts: tops {wardrobeCounts.tops} · bottoms {wardrobeCounts.bottoms} · shoes {wardrobeCounts.shoes} · outerwear {wardrobeCounts.outerwear} · accessories {wardrobeCounts.accessories} · fragrance {wardrobeCounts.fragrance} · unknown {wardrobeCounts.unknown}
+          Wardrobe counts: tops {wardrobeCounts.tops} · bottoms {wardrobeCounts.bottoms} · shoes {wardrobeCounts.shoes} · outerwear{" "}
+          {wardrobeCounts.outerwear} · accessories {wardrobeCounts.accessories} · fragrance {wardrobeCounts.fragrance} · unknown{" "}
+          {wardrobeCounts.unknown}
         </div>
       </header>
 
@@ -515,13 +608,7 @@ export default function WardrobeClient() {
         <h2 className="text-lg font-medium">Upload wardrobe video (max 60s)</h2>
 
         <div className="flex items-center gap-4 flex-wrap">
-          <input
-            id="video-input"
-            type="file"
-            accept="video/*"
-            onChange={handleVideoChange}
-            className="block text-sm"
-          />
+          <input id="video-input" type="file" accept="video/*" onChange={handleVideoChange} className="block text-sm" />
 
           <button
             onClick={uploadWardrobeVideo}
@@ -541,18 +628,73 @@ export default function WardrobeClient() {
 
         {lastVideo?.row ? (
           <div className="text-xs text-gray-500 space-y-2">
-            <div>Saved: status = {String(lastVideo.row.status)} · id = {String(lastVideo.row.id)}</div>
+            <div>
+              Saved: status = {String(lastVideo.row.status)} · id = {String(lastVideo.row.id)}
+            </div>
             {lastVideo.signedUrl ? (
-              <video
-                controls
-                className="w-full max-w-xl rounded border border-white/10"
-                src={lastVideo.signedUrl}
-              />
+              <video controls className="w-full max-w-xl rounded border border-white/10" src={lastVideo.signedUrl} />
             ) : (
               <div>Signed URL unavailable (check warnings in console).</div>
             )}
           </div>
         ) : null}
+
+        <div className="pt-2 border-t border-white/10" />
+
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-sm font-medium">Your video history</div>
+          <button onClick={fetchVideos} className="text-sm underline text-gray-600" disabled={videosLoading}>
+            {videosLoading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+
+        {videosError ? <div className="text-sm text-red-400">{videosError}</div> : null}
+
+        {videosLoading ? (
+          <div className="text-xs text-gray-500">Loading videos…</div>
+        ) : videos.length === 0 ? (
+          <div className="text-xs text-gray-500">No videos yet.</div>
+        ) : (
+          <div className="space-y-3">
+            {videos.map((v) => {
+              const canProcess = v.status === "uploaded" || v.status === "failed";
+              const isProcessing = processingVideoId === v.id;
+
+              return (
+                <div key={v.id} className="border border-white/10 rounded-lg p-3 bg-white/5 space-y-2">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="text-xs text-gray-500">
+                      <div>
+                        <span className="text-gray-300">Status:</span> {String(v.status)}
+                      </div>
+                      <div>
+                        <span className="text-gray-300">Uploaded:</span> {v.created_at ? String(v.created_at) : "n/a"}
+                      </div>
+                      <div className="break-all">
+                        <span className="text-gray-300">ID:</span> {v.id}
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => processVideo(v.id)}
+                      disabled={!canProcess || isProcessing}
+                      className="px-3 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
+                      title={canProcess ? "Set status to processing" : "Only available when status is uploaded/failed"}
+                    >
+                      {isProcessing ? "Processing…" : "Process"}
+                    </button>
+                  </div>
+
+                  {v.signed_url ? (
+                    <video controls className="w-full max-w-xl rounded border border-white/10" src={v.signed_url} />
+                  ) : (
+                    <div className="text-xs text-gray-500">Playback URL not available yet.</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* Upload by photo */}
@@ -560,13 +702,7 @@ export default function WardrobeClient() {
         <h2 className="text-lg font-medium">Add garment by photo</h2>
 
         <div className="flex items-center gap-4">
-          <input
-            id="file-input"
-            type="file"
-            accept="image/*"
-            onChange={handleFileChange}
-            className="block text-sm"
-          />
+          <input id="file-input" type="file" accept="image/*" onChange={handleFileChange} className="block text-sm" />
 
           <button
             onClick={handleUpload}
@@ -577,9 +713,7 @@ export default function WardrobeClient() {
           </button>
         </div>
 
-        <div className="text-xs text-gray-500">
-          {file ? `Selected: ${file.name}` : "Select an image to begin."}
-        </div>
+        <div className="text-xs text-gray-500">{file ? `Selected: ${file.name}` : "Select an image to begin."}</div>
       </section>
 
       {/* Add by text */}
@@ -631,20 +765,12 @@ export default function WardrobeClient() {
             </select>
 
             <label className="text-sm flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={includeAccessory}
-                onChange={(e) => setIncludeAccessory(e.target.checked)}
-              />
+              <input type="checkbox" checked={includeAccessory} onChange={(e) => setIncludeAccessory(e.target.checked)} />
               Include accessory
             </label>
 
             <label className="text-sm flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={includeFragrance}
-                onChange={(e) => setIncludeFragrance(e.target.checked)}
-              />
+              <input type="checkbox" checked={includeFragrance} onChange={(e) => setIncludeFragrance(e.target.checked)} />
               Include fragrance
             </label>
 
@@ -660,11 +786,7 @@ export default function WardrobeClient() {
               onClick={() => generateOutfit({ regenerate: true })}
               disabled={generating || !canRegenerate}
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
-              title={
-                canRegenerate
-                  ? "Generate a variation (auto-exclude items from seed outfit)"
-                  : "Generate first to enable variations"
-              }
+              title={canRegenerate ? "Generate a variation (auto-exclude items from seed outfit)" : "Generate first to enable variations"}
             >
               {generating ? "Working..." : "Regenerate Variation"}
             </button>
