@@ -55,6 +55,13 @@ export type ExtractFramesOptions = {
 export type ExtractFramesResult = {
   frameDir: string;
   framePaths: string[];
+
+  /**
+   * In-memory WebP frames (same order as framePaths).
+   * This stays ephemeral and should NOT be persisted long-term.
+   */
+  frames: Buffer[];
+
   durationSeconds: number | null;
   processedSeconds: number | null;
 };
@@ -156,6 +163,21 @@ async function listWebpFramesSorted(frameDir: string): Promise<string[]> {
   return webps.map((f) => path.join(frameDir, f));
 }
 
+async function readFramesAsBuffers(framePaths: string[]): Promise<Buffer[]> {
+  if (!Array.isArray(framePaths) || framePaths.length === 0) return [];
+  // Read sequentially to reduce peak memory spikes on serverless.
+  const out: Buffer[] = [];
+  for (const p of framePaths) {
+    try {
+      const buf = await fs.readFile(p);
+      out.push(buf);
+    } catch {
+      // Skip unreadable frames
+    }
+  }
+  return out;
+}
+
 async function assertReadableFile(p: string): Promise<void> {
   try {
     const st = await fs.stat(p);
@@ -214,7 +236,10 @@ export async function extractFramesFromVideo(
   const durationSeconds = await getDurationSeconds(videoPath, Math.min(timeoutMs, 10_000)).catch(() => null);
 
   // If the clip is longer than our cap, only process the first N seconds.
-  const processedSeconds = durationSeconds ? Math.min(durationSeconds, maxVideoSeconds) : maxVideoSeconds;
+  // If duration is unknown, we still cap by maxVideoSeconds.
+  const processedSeconds = durationSeconds
+    ? Math.min(durationSeconds, maxVideoSeconds)
+    : maxVideoSeconds;
 
   // Extract frames
   await run(
@@ -230,7 +255,7 @@ export async function extractFramesFromVideo(
 
       // Cap processing window (Founder Edition spec)
       "-t",
-      String(maxVideoSeconds),
+      String(processedSeconds),
 
       "-vf",
       vf,
@@ -250,13 +275,26 @@ export async function extractFramesFromVideo(
   );
 
   const framePaths = await listWebpFramesSorted(frameDir);
+  const frames = await readFramesAsBuffers(framePaths);
 
   return {
     frameDir,
     framePaths,
+    frames,
     durationSeconds,
     processedSeconds,
   };
+}
+
+/**
+ * Back-compat alias used by API routes.
+ * Prefer calling `extractFramesFromVideo` directly.
+ */
+export async function extractFrames(
+  videoPath: string,
+  options: ExtractFramesOptions = {}
+): Promise<ExtractFramesResult> {
+  return extractFramesFromVideo(videoPath, options);
 }
 
 /**
