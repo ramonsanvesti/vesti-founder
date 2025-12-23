@@ -47,53 +47,84 @@ type CandidateRow = {
   source_frame_index?: number;
 };
 
-async function verifyQStashSignature(req: NextRequest) {
-  // Avoid a hard dependency/type-resolution error during local dev if the package isn't installed.
-  // In production, we fail closed if the verifier can't be loaded.
-  try {
-    // NOTE: using eval('import(...)') avoids TS module-resolution errors when the package is not present.
-    const mod = (await (eval(
-      'import("@upstash/qstash/nextjs")'
-    ) as Promise<any>)) as any;
-
-    const fn = mod?.verifySignatureAppRouter;
-    if (typeof fn !== "function") {
-      throw new Error("verifySignatureAppRouter not found in @upstash/qstash/nextjs");
-    }
-
-    await fn(req);
-  } catch (e: any) {
-    const msg = e?.message ?? String(e);
-    throw new Error(
-      `QStash signature verification unavailable. Install and configure QStash: npm i @upstash/qstash. Details: ${msg}`
-    );
-  }
-}
-
 function isLocalOrDev() {
   const env = process.env.NODE_ENV;
   return env !== "production";
 }
 
-async function requireQStashSignature(req: NextRequest) {
-  // In production we require a valid QStash signature.
-  // In local/dev, allow calling the endpoint directly to iterate faster.
-  if (isLocalOrDev()) return;
+function getSiteUrlFromEnv() {
+  // Prefer an explicit site URL.
+  const explicit = (process.env.NEXT_PUBLIC_SITE_URL || process.env.SITE_URL || "").trim();
+  if (explicit) return explicit.replace(/\/$/, "");
 
-  // verifySignatureAppRouter reads QSTASH_CURRENT_SIGNING_KEY / QSTASH_NEXT_SIGNING_KEY from env.
-  // If keys are missing, we fail closed in production.
-  const hasKeys =
-    Boolean(process.env.QSTASH_CURRENT_SIGNING_KEY) ||
-    Boolean(process.env.QSTASH_NEXT_SIGNING_KEY);
+  // Vercel provides VERCEL_URL without protocol.
+  const vercel = (process.env.VERCEL_URL || "").trim();
+  if (vercel) return `https://${vercel.replace(/\/$/, "")}`;
 
-  if (!hasKeys) {
+  return "";
+}
+
+async function verifyQStashSignature(req: NextRequest, rawBody: string) {
+  // We intentionally load Receiver dynamically to avoid TS/module-resolution errors
+  // when the package is not installed locally.
+  const currentSigningKey = (process.env.QSTASH_CURRENT_SIGNING_KEY || "").trim();
+  const nextSigningKey = (process.env.QSTASH_NEXT_SIGNING_KEY || "").trim();
+
+  if (!currentSigningKey && !nextSigningKey) {
     throw new Error(
       "Missing QStash signing keys. Set QSTASH_CURRENT_SIGNING_KEY (and optionally QSTASH_NEXT_SIGNING_KEY)."
     );
   }
 
-  // Throws if invalid
-  await verifyQStashSignature(req);
+  const signature = (req.headers.get("Upstash-Signature") || "").trim();
+  if (!signature) {
+    throw new Error("Missing Upstash-Signature header");
+  }
+
+  const base = getSiteUrlFromEnv();
+  if (!base) {
+    throw new Error(
+      "Missing site URL. Set NEXT_PUBLIC_SITE_URL (preferred) or ensure VERCEL_URL is present."
+    );
+  }
+
+  const url = `${base}${req.nextUrl.pathname}`;
+
+  try {
+    const mod = (await (eval('import("@upstash/qstash")') as Promise<any>)) as any;
+    const Receiver = mod?.Receiver;
+    if (typeof Receiver !== "function") {
+      throw new Error("Receiver not found in @upstash/qstash");
+    }
+
+    const receiver = new Receiver({
+      currentSigningKey: currentSigningKey || undefined,
+      nextSigningKey: nextSigningKey || undefined,
+    });
+
+    const isValid = await receiver.verify({
+      body: rawBody,
+      signature,
+      url,
+    });
+
+    if (!isValid) {
+      throw new Error("Invalid QStash signature");
+    }
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    throw new Error(
+      `QStash signature verification failed. Ensure @upstash/qstash is installed and signing keys are correct. Details: ${msg}`
+    );
+  }
+}
+
+async function requireQStashSignature(req: NextRequest, rawBody: string) {
+  // In production we require a valid QStash signature.
+  // In local/dev, allow calling the endpoint directly to iterate faster.
+  if (isLocalOrDev()) return;
+
+  await verifyQStashSignature(req, rawBody);
 }
 
 function asString(v: unknown): string {
@@ -160,10 +191,11 @@ export async function POST(req: NextRequest) {
   let statusMovedToProcessing = false;
 
   try {
-    // QStash-only in production (WOW: durable queue + retries)
-    await requireQStashSignature(req);
+    // Read raw body once so we can verify QStash signature deterministically
+    const rawBody = await req.text().catch(() => "");
+    await requireQStashSignature(req, rawBody);
 
-    const body = (await req.json().catch(() => ({}))) as ProcessBody;
+    const body = (rawBody ? JSON.parse(rawBody) : {}) as ProcessBody;
     const videoId = asString(body.wardrobe_video_id || body.video_id);
     videoIdForFail = videoId;
 

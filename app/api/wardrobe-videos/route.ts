@@ -8,6 +8,21 @@ const FOUNDER_USER_ID =
 
 type Status = "uploaded" | "processing" | "processed" | "failed";
 
+type CreateBody = {
+  video_url?: string;
+  auto_process?: boolean;
+};
+
+type ProcessActionBody = {
+  action: "process";
+  video_id?: string;
+  wardrobe_video_id?: string;
+  sample_every_seconds?: number;
+  max_frames?: number;
+  max_width?: number;
+  max_candidates?: number;
+};
+
 function asString(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -18,9 +33,25 @@ function clampInt(v: unknown, fallback: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+function getBaseUrl(req: NextRequest) {
+  // Prefer explicit site URL (production), then Vercel URL, then request host
+  const fromEnv =
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+
+  if (fromEnv) return fromEnv;
+  return `${req.nextUrl.protocol}//${req.nextUrl.host}`;
+}
+
 function isConfiguredQStash() {
-  // Either token-based (recommended) or signing keys (verification on process route)
   return Boolean(process.env.QSTASH_TOKEN);
+}
+
+function qstashPublishUrl(targetUrl: string) {
+  // QStash publish endpoint expects the destination URL to be URL-encoded
+  // https://qstash.upstash.io/v2/publish/<encoded-url>
+  const encoded = encodeURIComponent(targetUrl);
+  return `https://qstash.upstash.io/v2/publish/${encoded}`;
 }
 
 async function enqueueProcessJob(args: {
@@ -40,61 +71,66 @@ async function enqueueProcessJob(args: {
     maxCandidates = 12,
   } = args;
 
-  // If QStash isn't configured, do a best-effort direct call (does not block response).
-  if (!isConfiguredQStash()) {
-    void fetch(`${baseUrl}/api/wardrobe-videos/process`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        wardrobe_video_id: wardrobeVideoId,
-        sample_every_seconds: sampleEverySeconds,
-        max_frames: maxFrames,
-        max_width: maxWidth,
-        max_candidates: maxCandidates,
-      }),
-    }).catch(() => {});
-    return { ok: true, enqueued: false, fallback: "direct_fetch" as const };
-  }
+  const payload = {
+    wardrobe_video_id: wardrobeVideoId,
+    sample_every_seconds: sampleEverySeconds,
+    max_frames: maxFrames,
+    max_width: maxWidth,
+    max_candidates: maxCandidates,
+  };
 
-  // Dynamic import to avoid TS/module errors if package isn't installed locally
-  const mod = (await (eval('import("@upstash/qstash")') as Promise<any>)) as any;
-  const Client = mod?.Client;
-
-  if (!Client) {
-    // If package not available, fallback
-    void fetch(`${baseUrl}/api/wardrobe-videos/process`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        wardrobe_video_id: wardrobeVideoId,
-        sample_every_seconds: sampleEverySeconds,
-        max_frames: maxFrames,
-        max_width: maxWidth,
-        max_candidates: maxCandidates,
-      }),
-    }).catch(() => {});
-    return { ok: true, enqueued: false, fallback: "direct_fetch" as const };
-  }
-
-  const client = new Client({ token: process.env.QSTASH_TOKEN });
-
-  // Queue a POST to our processing route (QStash will sign it; process route verifies in prod).
   const targetUrl = `${baseUrl}/api/wardrobe-videos/process`;
 
-  const res = await client.publishJSON({
-    url: targetUrl,
-    body: {
-      wardrobe_video_id: wardrobeVideoId,
-      sample_every_seconds: sampleEverySeconds,
-      max_frames: maxFrames,
-      max_width: maxWidth,
-      max_candidates: maxCandidates,
+  // If QStash isn't configured, do a best-effort direct call (does not block response).
+  if (!isConfiguredQStash()) {
+    void fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+
+    return { ok: true, enqueued: false, fallback: "direct_fetch" as const };
+  }
+
+  // QStash HTTP API (no SDK dependency) — retry-safe + clean dedupe.
+  // Docs: https://upstash.com/docs/qstash
+  const publishUrl = qstashPublishUrl(targetUrl);
+
+  const dedupeId = `wardrobe_video:${wardrobeVideoId}:process`;
+  const retries = 5;
+
+  const r = await fetch(publishUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
+      "Content-Type": "application/json",
+      // These headers control QStash behavior
+      "Upstash-Deduplication-Id": dedupeId,
+      "Upstash-Retries": String(retries),
     },
-    // Retry policy (WOW): you can tune these
-    retries: 3,
+    body: JSON.stringify(payload),
   });
 
-  return { ok: true, enqueued: true, qstash: res };
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    // Fallback to direct call (best effort). Do not throw: enqueue should not break upload/process UX.
+    void fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+
+    return {
+      ok: true,
+      enqueued: false,
+      fallback: "direct_fetch" as const,
+      qstash_error: { status: r.status, body: txt.slice(0, 500) },
+    };
+  }
+
+  const qstashJson = await r.json().catch(() => null);
+
+  return { ok: true, enqueued: true, qstash: qstashJson };
 }
 
 /**
@@ -138,21 +174,6 @@ export async function GET(req: NextRequest) {
   }
 }
 
-type CreateBody = {
-  video_url?: string;
-  auto_process?: boolean;
-};
-
-type ProcessActionBody = {
-  action: "process";
-  video_id?: string;
-  wardrobe_video_id?: string;
-  sample_every_seconds?: number;
-  max_frames?: number;
-  max_width?: number;
-  max_candidates?: number;
-};
-
 /**
  * POST /api/wardrobe-videos
  * Two modes:
@@ -170,10 +191,7 @@ export async function POST(req: NextRequest) {
       const videoId = asString(b.wardrobe_video_id || b.video_id);
 
       if (!videoId) {
-        return NextResponse.json(
-          { ok: false, error: "Missing video_id" },
-          { status: 400 }
-        );
+        return NextResponse.json({ ok: false, error: "Missing video_id" }, { status: 400 });
       }
 
       // Load video record (user-scoped)
@@ -198,7 +216,9 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Retry-safe: move to processing (or keep processing)
+      // Retry-safe status flip:
+      // - If already processing, keep it.
+      // - If failed/uploaded, move to processing.
       if (video.status !== "processing") {
         const { error: stErr } = await supabase
           .from("wardrobe_videos")
@@ -219,9 +239,7 @@ export async function POST(req: NextRequest) {
       const maxWidth = clampInt(b.max_width, 960, 480, 1920);
       const maxCandidates = clampInt(b.max_candidates, 12, 1, 25);
 
-      const baseUrl =
-        process.env.NEXT_PUBLIC_SITE_URL ||
-        `${req.nextUrl.protocol}//${req.nextUrl.host}`;
+      const baseUrl = getBaseUrl(req);
 
       const enqueue = await enqueueProcessJob({
         wardrobeVideoId: video.id,
@@ -237,7 +255,7 @@ export async function POST(req: NextRequest) {
         {
           ok: true,
           wardrobe_video_id: video.id,
-          status: "processing",
+          status: "processing" as const,
           enqueued: enqueue,
         },
         { status: 200 }
@@ -249,10 +267,7 @@ export async function POST(req: NextRequest) {
     const videoUrl = asString(create.video_url);
 
     if (!videoUrl) {
-      return NextResponse.json(
-        { ok: false, error: "Missing video_url" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "Missing video_url" }, { status: 400 });
     }
 
     // Create immediately in DB
@@ -275,30 +290,29 @@ export async function POST(req: NextRequest) {
 
     // Optional: auto-process right after upload record creation
     if (create.auto_process) {
-      const baseUrl =
-        process.env.NEXT_PUBLIC_SITE_URL ||
-        `${req.nextUrl.protocol}//${req.nextUrl.host}`;
+      void (async () => {
+        try {
+          await supabase
+            .from("wardrobe_videos")
+            .update({ status: "processing" })
+            .eq("id", row.id)
+            .eq("user_id", FOUNDER_USER_ID);
+        } catch {
+          // best-effort; do not block response
+        }
 
-      // flip to processing (retry-safe)
-      await supabase
-        .from("wardrobe_videos")
-        .update({ status: "processing" })
-        .eq("id", row.id)
-        .eq("user_id", FOUNDER_USER_ID);
-
-      void enqueueProcessJob({
-        wardrobeVideoId: row.id,
-        baseUrl,
-      }).catch(() => {});
+        try {
+          await enqueueProcessJob({
+            wardrobeVideoId: row.id,
+            baseUrl: getBaseUrl(req),
+          });
+        } catch {
+          // best-effort; do not block response
+        }
+      })();
     }
 
-    return NextResponse.json(
-      {
-        ok: true,
-        wardrobe_video: row,
-      },
-      { status: 200 }
-    );
+    return NextResponse.json({ ok: true, wardrobe_video: row }, { status: 200 });
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
