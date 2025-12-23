@@ -4,11 +4,15 @@ import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 import { extractFramesFromVideo } from "@/lib/video/extractFrames";
 import { detectGarmentCandidates } from "@/lib/video/detectGarmentCandidates";
 
+// Force Node.js runtime (ffmpeg) and prevent caching
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+// Increase timeout headroom for video processing (Vercel will enforce plan limits)
+export const maxDuration = 300;
+
 // Founder Edition: single-user scope
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
-
-type WearTemperature = "cold" | "mild" | "warm";
 
 type ProcessBody = {
   wardrobe_video_id?: string;
@@ -88,7 +92,7 @@ async function verifyQStashSignature(req: NextRequest, rawBody: string) {
     );
   }
 
-  const url = `${base}${req.nextUrl.pathname}`;
+  const url = `${base}${req.nextUrl.pathname}${req.nextUrl.search}`;
 
   try {
     const mod = (await (eval('import("@upstash/qstash")') as Promise<any>)) as any;
@@ -188,7 +192,6 @@ async function uploadWebpToSupabase(opts: {
 export async function POST(req: NextRequest) {
   const startedAt = nowIso();
   let videoIdForFail: string | null = null;
-  let statusMovedToProcessing = false;
 
   try {
     // Read raw body once so we can verify QStash signature deterministically
@@ -267,10 +270,6 @@ export async function POST(req: NextRequest) {
           { status: 500 }
         );
       }
-      statusMovedToProcessing = true;
-    } else {
-      // Still treat as moved so catch() can mark failed if this run crashes.
-      statusMovedToProcessing = true;
     }
 
     // 3) Run processing pipeline
@@ -388,8 +387,7 @@ export async function POST(req: NextRequest) {
     await supabase
       .from("wardrobe_video_candidates")
       .delete()
-      .eq("wardrobe_video_id", video.id)
-      .eq("user_id", FOUNDER_USER_ID);
+      .eq("wardrobe_video_id", video.id);
 
     // 4) Persist candidate rows (temporary table)
     if (candidates.length) {

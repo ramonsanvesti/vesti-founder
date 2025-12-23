@@ -2,6 +2,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
 // Founder Edition: single-user scope
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
@@ -39,17 +43,23 @@ function getBaseUrl(req: NextRequest) {
     process.env.NEXT_PUBLIC_SITE_URL ||
     (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
 
-  if (fromEnv) return fromEnv;
-  return `${req.nextUrl.protocol}//${req.nextUrl.host}`;
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+
+  // req.nextUrl.protocol is usually "https:" on Vercel, but keep it safe.
+  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
+  const host = req.headers.get("x-forwarded-host") || req.nextUrl.host;
+  return `${proto}://${host}`;
 }
 
 function isConfiguredQStash() {
+  // Token is required to publish.
+  // Signing keys are used by the receiving endpoint to verify authenticity.
   return Boolean(process.env.QSTASH_TOKEN);
 }
 
 function qstashPublishUrl(targetUrl: string) {
-  // QStash publish endpoint expects the destination URL to be URL-encoded
-  // https://qstash.upstash.io/v2/publish/<encoded-url>
+  // QStash publish endpoint expects the destination URL as part of the path.
+  // We keep this in one place to avoid scattering string logic.
   const encoded = encodeURIComponent(targetUrl);
   return `https://qstash.upstash.io/v2/publish/${encoded}`;
 }
@@ -65,9 +75,9 @@ async function enqueueProcessJob(args: {
   const {
     wardrobeVideoId,
     baseUrl,
-    sampleEverySeconds = 2,
-    maxFrames = 24,
-    maxWidth = 960,
+    sampleEverySeconds = 3,
+    maxFrames = 20,
+    maxWidth = 900,
     maxCandidates = 12,
   } = args;
 
@@ -96,7 +106,9 @@ async function enqueueProcessJob(args: {
   // Docs: https://upstash.com/docs/qstash
   const publishUrl = qstashPublishUrl(targetUrl);
 
-  const dedupeId = `wardrobe_video:${wardrobeVideoId}:process`;
+  // Dedupe should collapse identical requests (retry-safe) but allow a fresh run
+  // when the caller changes sampling params.
+  const dedupeId = `wardrobe_video:${wardrobeVideoId}:process:${sampleEverySeconds}:${maxFrames}:${maxWidth}:${maxCandidates}`;
   const retries = 5;
 
   const r = await fetch(publishUrl, {
@@ -105,8 +117,12 @@ async function enqueueProcessJob(args: {
       Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
       "Content-Type": "application/json",
       // These headers control QStash behavior
+      "Upstash-Method": "POST",
+      "Upstash-Content-Type": "application/json",
       "Upstash-Deduplication-Id": dedupeId,
       "Upstash-Retries": String(retries),
+      // Keep messages short-lived if they get stuck (seconds)
+      "Upstash-Timeout": "120",
     },
     body: JSON.stringify(payload),
   });
@@ -161,15 +177,15 @@ export async function GET(req: NextRequest) {
     if (error) {
       return NextResponse.json(
         { ok: false, error: "Failed to list videos", details: error.message },
-        { status: 500 }
+        { status: 500, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    return NextResponse.json({ ok: true, videos: data ?? [] }, { status: 200 });
+    return NextResponse.json({ ok: true, videos: data ?? [] }, { status: 200, headers: { "Cache-Control": "no-store" } });
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
@@ -191,7 +207,7 @@ export async function POST(req: NextRequest) {
       const videoId = asString(b.wardrobe_video_id || b.video_id);
 
       if (!videoId) {
-        return NextResponse.json({ ok: false, error: "Missing video_id" }, { status: 400 });
+        return NextResponse.json({ ok: false, error: "Missing video_id" }, { status: 400, headers: { "Cache-Control": "no-store" } });
       }
 
       // Load video record (user-scoped)
@@ -205,14 +221,14 @@ export async function POST(req: NextRequest) {
       if (loadErr || !video) {
         return NextResponse.json(
           { ok: false, error: "Video not found", details: loadErr?.message ?? "missing row" },
-          { status: 404 }
+          { status: 404, headers: { "Cache-Control": "no-store" } }
         );
       }
 
       if (video.status === "processed") {
         return NextResponse.json(
           { ok: true, wardrobe_video: video, message: "Already processed" },
-          { status: 200 }
+          { status: 200, headers: { "Cache-Control": "no-store" } }
         );
       }
 
@@ -220,16 +236,19 @@ export async function POST(req: NextRequest) {
       // - If already processing, keep it.
       // - If failed/uploaded, move to processing.
       if (video.status !== "processing") {
+        // Retry-safe: only advance states that are allowed to move to processing.
+        // Prevent accidental rewinds from processed.
         const { error: stErr } = await supabase
           .from("wardrobe_videos")
           .update({ status: "processing" })
           .eq("id", video.id)
-          .eq("user_id", FOUNDER_USER_ID);
+          .eq("user_id", FOUNDER_USER_ID)
+          .in("status", ["uploaded", "failed"]);
 
         if (stErr) {
           return NextResponse.json(
             { ok: false, error: "Failed to update status", details: stErr.message },
-            { status: 500 }
+            { status: 500, headers: { "Cache-Control": "no-store" } }
           );
         }
       }
@@ -240,6 +259,9 @@ export async function POST(req: NextRequest) {
       const maxCandidates = clampInt(b.max_candidates, 12, 1, 25);
 
       const baseUrl = getBaseUrl(req);
+
+      // Guard: baseUrl must be absolute https URL in prod.
+      // If someone misconfigures env vars, we still try to proceed.
 
       const enqueue = await enqueueProcessJob({
         wardrobeVideoId: video.id,
@@ -258,7 +280,7 @@ export async function POST(req: NextRequest) {
           status: "processing" as const,
           enqueued: enqueue,
         },
-        { status: 200 }
+        { status: 200, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -267,7 +289,7 @@ export async function POST(req: NextRequest) {
     const videoUrl = asString(create.video_url);
 
     if (!videoUrl) {
-      return NextResponse.json({ ok: false, error: "Missing video_url" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Missing video_url" }, { status: 400, headers: { "Cache-Control": "no-store" } });
     }
 
     // Create immediately in DB
@@ -284,7 +306,7 @@ export async function POST(req: NextRequest) {
     if (insertErr || !row) {
       return NextResponse.json(
         { ok: false, error: "Failed to create video row", details: insertErr?.message ?? "unknown" },
-        { status: 500 }
+        { status: 500, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -292,11 +314,27 @@ export async function POST(req: NextRequest) {
     if (create.auto_process) {
       void (async () => {
         try {
+          const { data: latest } = await supabase
+            .from("wardrobe_videos")
+            .select("id,status")
+            .eq("id", row.id)
+            .eq("user_id", FOUNDER_USER_ID)
+            .single();
+
+          if (latest?.status === "processing" || latest?.status === "processed") {
+            return;
+          }
+        } catch {
+          // best-effort; do not block response
+        }
+
+        try {
           await supabase
             .from("wardrobe_videos")
             .update({ status: "processing" })
             .eq("id", row.id)
-            .eq("user_id", FOUNDER_USER_ID);
+            .eq("user_id", FOUNDER_USER_ID)
+            .in("status", ["uploaded", "failed"]);
         } catch {
           // best-effort; do not block response
         }
@@ -312,11 +350,11 @@ export async function POST(req: NextRequest) {
       })();
     }
 
-    return NextResponse.json({ ok: true, wardrobe_video: row }, { status: 200 });
+    return NextResponse.json({ ok: true, wardrobe_video: row }, { status: 200, headers: { "Cache-Control": "no-store" } });
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
