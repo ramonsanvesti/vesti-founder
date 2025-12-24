@@ -57,9 +57,18 @@ type WardrobeVideoRow = {
   id: string;
   user_id: string | null;
   video_url: string;
-  status: "uploaded" | "processing" | "processed" | "failed" | string;
+  status: "uploaded" | "processing" | "processed" | "failed";
   created_at?: string;
   signed_url?: string | null;
+  // debug (from QStash / processing trace)
+  // (support both legacy + new names; API likely returns snake_case from Supabase)
+  last_process_message_id?: string | null;
+  last_process_retried?: string | null;
+  last_processed_at?: string | null;
+
+  // legacy aliases (keep to avoid breaking older responses)
+  last_message_id?: string | null;
+  last_retried?: string | null;
 };
 
 type UploadVideoResponse = {
@@ -81,6 +90,10 @@ type ListVideosResponse = {
 type ProcessVideoResponse = {
   ok: boolean;
   video?: WardrobeVideoRow | null;
+  // QStash debug id (we accept either key)
+  message_id?: string | null;
+  job_id?: string | null;
+  qstash_retried?: string | null;
   error?: string;
   details?: string;
 };
@@ -140,13 +153,18 @@ export default function WardrobeClient() {
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoUploading, setVideoUploading] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
-  const [lastVideo, setLastVideo] = useState<{ signedUrl: string | null; row: WardrobeVideoRow | null } | null>(null);
+  const [lastVideo, setLastVideo] = useState<{
+    signedUrl: string | null;
+    row: WardrobeVideoRow | null;
+  } | null>(null);
 
   // Video history (VESTI-5.2)
   const [videos, setVideos] = useState<WardrobeVideoRow[]>([]);
   const [videosLoading, setVideosLoading] = useState(false);
   const [videosError, setVideosError] = useState<string | null>(null);
-  const [processingVideoId, setProcessingVideoId] = useState<string | null>(null);
+  const [processingVideoId, setProcessingVideoId] = useState<string | null>(
+    null
+  );
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -199,16 +217,18 @@ export default function WardrobeClient() {
     }
   };
 
+  // History endpoint (GET /api/wardrobe-videos)
   const fetchVideos = async () => {
     try {
       setVideosLoading(true);
       setVideosError(null);
 
-      const res = await fetch("/api/wardrobe-videos/upload", { method: "GET" });
+      const res = await fetch("/api/wardrobe-videos", { method: "GET" });
       const json = (await res.json().catch(() => ({}))) as ListVideosResponse;
 
       if (!res.ok || !json?.ok) {
-        const msg = json?.details || json?.error || "Failed to load video history.";
+        const msg =
+          json?.details || json?.error || "Failed to load video history.";
         setVideosError(msg);
         setVideos([]);
         return;
@@ -225,6 +245,7 @@ export default function WardrobeClient() {
     }
   };
 
+  // Trigger processing pipeline (POST /api/wardrobe-videos { action:"process" })
   const processVideo = async (id: string) => {
     if (!id) return;
 
@@ -232,22 +253,80 @@ export default function WardrobeClient() {
       setProcessingVideoId(id);
       setVideosError(null);
 
-      const res = await fetch("/api/wardrobe-videos/upload", {
-        method: "PATCH",
+      const res = await fetch("/api/wardrobe-videos", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, status: "processing" }),
+        body: JSON.stringify({ action: "process", wardrobe_video_id: id }),
       });
 
       const json = (await res.json().catch(() => ({}))) as ProcessVideoResponse;
 
       if (!res.ok || !json?.ok) {
-        const msg = json?.details || json?.error || "Failed to update video status.";
+        const msg =
+          json?.details || json?.error || "Failed to trigger processing.";
         setVideosError(msg);
-        console.error("Process video error:", json);
+        console.error("Process trigger error:", json);
         return;
       }
 
-      await fetchVideos();
+      const messageId = (json?.job_id ?? json?.message_id) ?? null;
+      const retried = json?.qstash_retried ?? null;
+      const updatedRow = (json?.video ?? null) as WardrobeVideoRow | null;
+
+      // Optimistic update: status + debug ids; if API returned the full row, prefer it.
+      setVideos((prev) =>
+        prev.map((v) => {
+          if (v.id !== id) return v;
+          if (updatedRow) {
+            return {
+              ...v,
+              ...updatedRow,
+              // Prefer new fields, fall back to legacy keys, then to the new response values
+              last_process_message_id:
+                updatedRow.last_process_message_id ??
+                updatedRow.last_message_id ??
+                messageId ??
+                v.last_process_message_id ??
+                v.last_message_id ??
+                null,
+              last_process_retried:
+                updatedRow.last_process_retried ??
+                updatedRow.last_retried ??
+                retried ??
+                v.last_process_retried ??
+                v.last_retried ??
+                null,
+              // keep legacy keys populated too (helps older UI code / debugging)
+              last_message_id:
+                updatedRow.last_message_id ??
+                updatedRow.last_process_message_id ??
+                messageId ??
+                v.last_message_id ??
+                null,
+              last_retried:
+                updatedRow.last_retried ??
+                updatedRow.last_process_retried ??
+                retried ??
+                v.last_retried ??
+                null,
+            };
+          }
+          return {
+            ...v,
+            status: "processing",
+            last_process_message_id: messageId,
+            last_process_retried: retried,
+            // also populate legacy keys for safety
+            last_message_id: messageId,
+            last_retried: retried,
+          };
+        })
+      );
+
+      // Quick refresh shortly after queueing
+      setTimeout(() => {
+        fetchVideos();
+      }, 600);
     } catch (e: any) {
       console.error("Unexpected process video error:", e);
       setVideosError(e?.message || "Unexpected error.");
@@ -260,6 +339,21 @@ export default function WardrobeClient() {
     fetchGarments();
     fetchVideos();
   }, []);
+
+  const hasProcessingVideos = useMemo(() => {
+    return videos.some((v) => String(v.status) === "processing");
+  }, [videos]);
+
+  // Poll only while processing
+  useEffect(() => {
+    if (!hasProcessingVideos) return;
+
+    const t = setInterval(() => {
+      fetchVideos();
+    }, 3000);
+
+    return () => clearInterval(t);
+  }, [hasProcessingVideos]);
 
   const wardrobeCounts = useMemo(() => {
     const counts = {
@@ -301,7 +395,9 @@ export default function WardrobeClient() {
       const supabase = await getSupabase();
 
       const ext = file.name.split(".").pop() || "jpg";
-      const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+      const fileName = `${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2)}.${ext}`;
       const filePath = fileName;
 
       const { error: uploadError } = await supabase.storage
@@ -317,7 +413,9 @@ export default function WardrobeClient() {
         return;
       }
 
-      const { data: publicData } = supabase.storage.from("garments").getPublicUrl(filePath);
+      const { data: publicData } = supabase.storage
+        .from("garments")
+        .getPublicUrl(filePath);
       const publicUrl = publicData?.publicUrl;
 
       if (!publicUrl) {
@@ -347,7 +445,9 @@ export default function WardrobeClient() {
       setGarments((prev) => [newGarment, ...prev]);
       setFile(null);
 
-      const input = document.getElementById("file-input") as HTMLInputElement | null;
+      const input = document.getElementById("file-input") as
+        | HTMLInputElement
+        | null;
       if (input) input.value = "";
     } catch (err) {
       console.error("Unexpected upload error:", err);
@@ -415,7 +515,9 @@ export default function WardrobeClient() {
     if (d != null && d > 60) {
       setVideoError(`Video is ${Math.ceil(d)}s. Max is 60s.`);
       setVideoFile(null);
-      const input = document.getElementById("video-input") as HTMLInputElement | null;
+      const input = document.getElementById("video-input") as
+        | HTMLInputElement
+        | null;
       if (input) input.value = "";
     }
   };
@@ -431,7 +533,8 @@ export default function WardrobeClient() {
       const form = new FormData();
       form.append("video", videoFile);
 
-      const res = await fetch("/api/wardrobe-videos/upload", {
+      // Consolidated endpoint (POST /api/wardrobe-videos)
+      const res = await fetch("/api/wardrobe-videos", {
         method: "POST",
         body: form,
       });
@@ -453,7 +556,9 @@ export default function WardrobeClient() {
       setVideoFile(null);
       setVideoDuration(null);
 
-      const input = document.getElementById("video-input") as HTMLInputElement | null;
+      const input = document.getElementById("video-input") as
+        | HTMLInputElement
+        | null;
       if (input) input.value = "";
     } catch (e: any) {
       console.error("Unexpected video upload error:", e);
@@ -513,7 +618,9 @@ export default function WardrobeClient() {
       const newSeedId = json.outfit?.id ?? null;
       if (newSeedId) setSeedOutfitId(newSeedId);
 
-      const nextExclude = Array.isArray(json.next_exclude_ids) ? json.next_exclude_ids : [];
+      const nextExclude = Array.isArray(json.next_exclude_ids)
+        ? json.next_exclude_ids
+        : [];
       setExcludeIds(nextExclude);
     } catch (e: any) {
       console.error("Generate/save outfit error:", e);
@@ -535,7 +642,10 @@ export default function WardrobeClient() {
     return (
       <div className="flex flex-wrap gap-2 pt-1">
         {tags.slice(0, 16).map((t) => (
-          <span key={t} className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5">
+          <span
+            key={t}
+            className="px-2 py-1 rounded-full text-xs border border-white/15 bg-white/5"
+          >
             {t}
           </span>
         ))}
@@ -544,7 +654,8 @@ export default function WardrobeClient() {
   };
 
   const renderGarmentCard = (g: Garment, extra?: { badge?: string }) => {
-    const src = httpsify(g.image_url);
+    // Always use stored image_url (webp), never original
+    const src = httpsify(g.image_url ?? null);
     const name = displayName(g);
     const cat = (g.category ?? "").trim();
     const sub = (g.subcategory ?? "").trim();
@@ -567,7 +678,12 @@ export default function WardrobeClient() {
         ) : null}
 
         {src ? (
-          <img src={src} alt={name} className="w-full h-40 object-cover rounded" loading="lazy" />
+          <img
+            src={src}
+            alt={name}
+            className="w-full h-40 object-cover rounded"
+            loading="lazy"
+          />
         ) : (
           <div className="w-full h-40 rounded bg-white/5 border border-white/10 flex items-center justify-center text-xs text-gray-400">
             No image
@@ -591,15 +707,19 @@ export default function WardrobeClient() {
   return (
     <main className="p-6 space-y-8">
       <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">VESTI · Wardrobe OS (Founder Edition)</h1>
+        <h1 className="text-2xl font-semibold">
+          VESTI · Wardrobe OS (Founder Edition)
+        </h1>
         <p className="text-sm text-gray-500">
-          Upload by photo or add by text. Generate rules-based outfits. Upload a wardrobe video (≤60s) as a single ingestion unit.
+          Upload by photo or add by text. Generate rules-based outfits. Upload a
+          wardrobe video (≤60s) as a single ingestion unit.
         </p>
 
         <div className="text-xs text-gray-500 pt-2">
-          Wardrobe counts: tops {wardrobeCounts.tops} · bottoms {wardrobeCounts.bottoms} · shoes {wardrobeCounts.shoes} · outerwear{" "}
-          {wardrobeCounts.outerwear} · accessories {wardrobeCounts.accessories} · fragrance {wardrobeCounts.fragrance} · unknown{" "}
-          {wardrobeCounts.unknown}
+          Wardrobe counts: tops {wardrobeCounts.tops} · bottoms{" "}
+          {wardrobeCounts.bottoms} · shoes {wardrobeCounts.shoes} · outerwear{" "}
+          {wardrobeCounts.outerwear} · accessories {wardrobeCounts.accessories} ·
+          fragrance {wardrobeCounts.fragrance} · unknown {wardrobeCounts.unknown}
         </div>
       </header>
 
@@ -608,7 +728,13 @@ export default function WardrobeClient() {
         <h2 className="text-lg font-medium">Upload wardrobe video (max 60s)</h2>
 
         <div className="flex items-center gap-4 flex-wrap">
-          <input id="video-input" type="file" accept="video/*" onChange={handleVideoChange} className="block text-sm" />
+          <input
+            id="video-input"
+            type="file"
+            accept="video/*"
+            onChange={handleVideoChange}
+            className="block text-sm"
+          />
 
           <button
             onClick={uploadWardrobeVideo}
@@ -629,10 +755,15 @@ export default function WardrobeClient() {
         {lastVideo?.row ? (
           <div className="text-xs text-gray-500 space-y-2">
             <div>
-              Saved: status = {String(lastVideo.row.status)} · id = {String(lastVideo.row.id)}
+              Saved: status = {String(lastVideo.row.status)} · id ={" "}
+              {String(lastVideo.row.id)}
             </div>
             {lastVideo.signedUrl ? (
-              <video controls className="w-full max-w-xl rounded border border-white/10" src={lastVideo.signedUrl} />
+              <video
+                controls
+                className="w-full max-w-xl rounded border border-white/10"
+                src={lastVideo.signedUrl}
+              />
             ) : (
               <div>Signed URL unavailable (check warnings in console).</div>
             )}
@@ -643,7 +774,11 @@ export default function WardrobeClient() {
 
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="text-sm font-medium">Your video history</div>
-          <button onClick={fetchVideos} className="text-sm underline text-gray-600" disabled={videosLoading}>
+          <button
+            onClick={fetchVideos}
+            className="text-sm underline text-gray-600"
+            disabled={videosLoading}
+          >
             {videosLoading ? "Loading…" : "Refresh"}
           </button>
         </div>
@@ -657,38 +792,81 @@ export default function WardrobeClient() {
         ) : (
           <div className="space-y-3">
             {videos.map((v) => {
-              const canProcess = v.status === "uploaded" || v.status === "failed";
-              const isProcessing = processingVideoId === v.id;
+              const s = String(v.status);
+
+              const jobId =
+                v.last_process_message_id ?? v.last_message_id ?? null;
+              const retried =
+                v.last_process_retried ?? v.last_retried ?? null;
+              const lastProcessedAt = v.last_processed_at ?? null;
+
+              const isProcessing = s === "processing" || processingVideoId === v.id;
+              const canProcess =
+                !isProcessing && (s === "uploaded" || s === "failed" || s === "processed");
 
               return (
-                <div key={v.id} className="border border-white/10 rounded-lg p-3 bg-white/5 space-y-2">
+                <div
+                  key={v.id}
+                  className="border border-white/10 rounded-lg p-3 bg-white/5 space-y-2"
+                >
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div className="text-xs text-gray-500">
                       <div>
-                        <span className="text-gray-300">Status:</span> {String(v.status)}
+                        <span className="text-gray-300">Status:</span> {s}
                       </div>
                       <div>
-                        <span className="text-gray-300">Uploaded:</span> {v.created_at ? String(v.created_at) : "n/a"}
+                        <span className="text-gray-300">Uploaded:</span>{" "}
+                        {v.created_at ? String(v.created_at) : "n/a"}
                       </div>
                       <div className="break-all">
                         <span className="text-gray-300">ID:</span> {v.id}
                       </div>
+                      {jobId ? (
+                        <div className="break-all">
+                          <span className="text-gray-300">Job:</span>{" "}
+                          {String(jobId)}
+                          {retried ? (
+                            <span className="text-gray-500">
+                              {" "}
+                              · retried {String(retried)}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : s === "processing" ? (
+                        <div className="break-all">
+                          <span className="text-gray-300">Job:</span>{" "}
+                          <span className="text-gray-500">queued…</span>
+                        </div>
+                      ) : null}
+
+                      {lastProcessedAt ? (
+                        <div className="break-all">
+                          <span className="text-gray-300">Last processed:</span>{" "}
+                          <span className="text-gray-500">{String(lastProcessedAt)}</span>
+                        </div>
+                      ) : null}
                     </div>
 
                     <button
                       onClick={() => processVideo(v.id)}
                       disabled={!canProcess || isProcessing}
                       className="px-3 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
-                      title={canProcess ? "Set status to processing" : "Only available when status is uploaded/failed"}
+                      title={canProcess ? "Trigger processing pipeline" : "Not available"}
                     >
-                      {isProcessing ? "Processing…" : "Process"}
+                      {isProcessing ? "Processing…" : s === "processed" ? "Reprocess" : "Process"}
                     </button>
                   </div>
 
                   {v.signed_url ? (
-                    <video controls className="w-full max-w-xl rounded border border-white/10" src={v.signed_url} />
+                    <video
+                      controls
+                      className="w-full max-w-xl rounded border border-white/10"
+                      src={httpsify(v.signed_url) ?? undefined}
+                    />
                   ) : (
-                    <div className="text-xs text-gray-500">Playback URL not available yet.</div>
+                    <div className="text-xs text-gray-500">
+                      Playback URL not available yet.
+                    </div>
                   )}
                 </div>
               );
@@ -702,7 +880,13 @@ export default function WardrobeClient() {
         <h2 className="text-lg font-medium">Add garment by photo</h2>
 
         <div className="flex items-center gap-4">
-          <input id="file-input" type="file" accept="image/*" onChange={handleFileChange} className="block text-sm" />
+          <input
+            id="file-input"
+            type="file"
+            accept="image/*"
+            onChange={handleFileChange}
+            className="block text-sm"
+          />
 
           <button
             onClick={handleUpload}
@@ -713,7 +897,9 @@ export default function WardrobeClient() {
           </button>
         </div>
 
-        <div className="text-xs text-gray-500">{file ? `Selected: ${file.name}` : "Select an image to begin."}</div>
+        <div className="text-xs text-gray-500">
+          {file ? `Selected: ${file.name}` : "Select an image to begin."}
+        </div>
       </section>
 
       {/* Add by text */}
@@ -738,7 +924,8 @@ export default function WardrobeClient() {
         </div>
 
         <div className="text-xs text-gray-500">
-          This calls <code>/api/ingest</code> with <code>{`{ mode:"text", payload:{ query:"..." } }`}</code>.
+          This calls <code>/api/ingest</code> with{" "}
+          <code>{`{ mode:"text", payload:{ query:"..." } }`}</code>.
         </div>
       </section>
 
@@ -765,12 +952,20 @@ export default function WardrobeClient() {
             </select>
 
             <label className="text-sm flex items-center gap-2">
-              <input type="checkbox" checked={includeAccessory} onChange={(e) => setIncludeAccessory(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={includeAccessory}
+                onChange={(e) => setIncludeAccessory(e.target.checked)}
+              />
               Include accessory
             </label>
 
             <label className="text-sm flex items-center gap-2">
-              <input type="checkbox" checked={includeFragrance} onChange={(e) => setIncludeFragrance(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={includeFragrance}
+                onChange={(e) => setIncludeFragrance(e.target.checked)}
+              />
               Include fragrance
             </label>
 
@@ -786,7 +981,11 @@ export default function WardrobeClient() {
               onClick={() => generateOutfit({ regenerate: true })}
               disabled={generating || !canRegenerate}
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
-              title={canRegenerate ? "Generate a variation (auto-exclude items from seed outfit)" : "Generate first to enable variations"}
+              title={
+                canRegenerate
+                  ? "Generate a variation (auto-exclude items from seed outfit)"
+                  : "Generate first to enable variations"
+              }
             >
               {generating ? "Working..." : "Regenerate Variation"}
             </button>
@@ -811,7 +1010,9 @@ export default function WardrobeClient() {
               {outfitItems.map((it) => (
                 <div key={`${it.slot}:${it.garment.id}`}>
                   {renderGarmentCard(it.garment, { badge: it.slot.toUpperCase() })}
-                  {it.reason ? <div className="text-xs text-gray-500 pt-2">{it.reason}</div> : null}
+                  {it.reason ? (
+                    <div className="text-xs text-gray-500 pt-2">{it.reason}</div>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -819,13 +1020,16 @@ export default function WardrobeClient() {
             {outfitReasoning ? (
               <div className="border rounded-lg p-3 bg-white/5">
                 <div className="text-sm font-medium mb-2">Reasoning</div>
-                <pre className="text-xs whitespace-pre-wrap text-gray-200">{outfitReasoning}</pre>
+                <pre className="text-xs whitespace-pre-wrap text-gray-200">
+                  {outfitReasoning}
+                </pre>
               </div>
             ) : null}
           </div>
         ) : (
           <div className="text-xs text-gray-500">
-            Requires minimum: 1 top, 1 bottom, 1 shoe. If you’re missing categories, add more items first.
+            Requires minimum: 1 top, 1 bottom, 1 shoe. If you’re missing
+            categories, add more items first.
           </div>
         )}
       </section>
