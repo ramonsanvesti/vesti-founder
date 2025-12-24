@@ -50,6 +50,19 @@ export type ExtractFramesOptions = {
    * Default: 45s.
    */
   timeoutMs?: number;
+
+  /**
+   * If true, read extracted frames into memory and return `frames` buffers.
+   * Default: true.
+   */
+  readIntoMemory?: boolean;
+
+  /**
+   * If true, keep extracted frames on disk (frameDir/framePaths) for debugging.
+   * Default: true.
+   * Note: The caller is still responsible for calling cleanupExtractedFrames.
+   */
+  keepFramesOnDisk?: boolean;
 };
 
 export type ExtractFramesResult = {
@@ -58,7 +71,8 @@ export type ExtractFramesResult = {
 
   /**
    * In-memory WebP frames (same order as framePaths).
-   * This stays ephemeral and should NOT be persisted long-term.
+   * Ephemeral: should NOT be persisted long-term.
+   * May be empty if `readIntoMemory` is false.
    */
   frames: Buffer[];
 
@@ -192,7 +206,7 @@ async function assertReadableFile(p: string): Promise<void> {
  *
  * - Runs ffmpeg (native binary via ffmpeg-static)
  * - Writes frames under /tmp (or OS temp dir)
- * - Returns local paths only (do NOT persist frames long-term)
+ * - Returns local paths + optional in-memory buffers (do NOT persist frames long-term)
  */
 export async function extractFramesFromVideo(
   videoPath: string,
@@ -213,6 +227,9 @@ export async function extractFramesFromVideo(
 
   const maxVideoSeconds = clampInt(options.maxVideoSeconds, 60, 5, 120);
   const timeoutMs = clampInt(options.timeoutMs, 45_000, 5_000, 180_000);
+
+  const readIntoMemory = options.readIntoMemory !== false;
+  const keepFramesOnDisk = options.keepFramesOnDisk !== false;
 
   const tempRoot = options.tempRootDir?.trim() || os.tmpdir();
   const frameDir = path.join(tempRoot, "vesti", "frames", crypto.randomUUID());
@@ -241,49 +258,55 @@ export async function extractFramesFromVideo(
     ? Math.min(durationSeconds, maxVideoSeconds)
     : maxVideoSeconds;
 
-  // Extract frames
-  await run(
-    ffmpeg,
-    [
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-nostdin",
+  try {
+    // Extract frames
+    await run(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
 
-      "-i",
-      videoPath,
+        "-i",
+        videoPath,
 
-      // Cap processing window (Founder Edition spec)
-      "-t",
-      String(processedSeconds),
+        // Cap processing window (Founder Edition spec)
+        "-t",
+        String(processedSeconds),
 
-      "-vf",
-      vf,
+        "-vf",
+        vf,
 
-      "-frames:v",
-      String(maxFrames),
+        "-frames:v",
+        String(maxFrames),
 
-      // WebP encoding
-      "-c:v",
-      "libwebp",
-      "-quality",
-      String(Math.round(webpQuality)),
+        // WebP encoding
+        "-c:v",
+        "libwebp",
+        "-quality",
+        String(Math.round(webpQuality)),
 
-      outPattern,
-    ],
-    { timeoutMs }
-  );
+        outPattern,
+      ],
+      { timeoutMs }
+    );
 
-  const framePaths = await listWebpFramesSorted(frameDir);
-  const frames = await readFramesAsBuffers(framePaths);
+    const framePaths = keepFramesOnDisk ? await listWebpFramesSorted(frameDir) : [];
+    const frames = readIntoMemory && keepFramesOnDisk ? await readFramesAsBuffers(framePaths) : [];
 
-  return {
-    frameDir,
-    framePaths,
-    frames,
-    durationSeconds,
-    processedSeconds,
-  };
+    return {
+      frameDir,
+      framePaths,
+      frames,
+      durationSeconds,
+      processedSeconds,
+    };
+  } catch (e) {
+    // If extraction fails, remove the temp folder so we don't leak /tmp storage.
+    await cleanupExtractedFrames(frameDir);
+    throw e;
+  }
 }
 
 /**

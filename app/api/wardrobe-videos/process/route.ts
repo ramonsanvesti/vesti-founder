@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
 import { Receiver } from "@upstash/qstash";
-import { extractFramesFromVideo } from "@/lib/video/extractFrames";
+import { extractFramesFromVideo, cleanupExtractedFrames } from "@/lib/video/extractFrames";
 import { detectGarmentCandidates } from "@/lib/video/detectGarmentCandidates";
 
 // Force Node.js runtime (ffmpeg) and prevent caching
@@ -223,6 +223,10 @@ async function uploadWebpToSupabase(opts: {
 
 export async function POST(req: NextRequest) {
   const startedAt = nowIso();
+  // Track outputs across try/finally so we can respond after cleanup.
+  let frames: Buffer[] = [];
+  let candidates: CandidateRow[] = [];
+  let candidatesPreview: CandidatePreview[] = [];
   let videoIdForFail: string | null = null;
 
   const qstash = qstashMeta(req);
@@ -408,182 +412,109 @@ export async function POST(req: NextRequest) {
       maxWidth,
     });
 
-    const frames = Array.isArray(extracted?.frames) ? extracted.frames : [];
+    // Best-effort: if extractFrames provides a temp dir, always clean it up.
+    const frameDir = asString((extracted as any)?.frameDir || (extracted as any)?.dir);
 
-    if (!frames.length) {
-      // Nothing extracted; still mark processed (safe fallback)
-      const processedAt = new Date().toISOString();
-      await supabase
-        .from("wardrobe_videos")
-        .update({
-          status: "processed",
-          last_process_retried: didRetry,
-          last_processed_at: processedAt,
-          ...(qstashMessageId ? { last_process_message_id: qstashMessageId } : {}),
-        })
-        .eq("id", video.id)
-        .eq("user_id", FOUNDER_USER_ID);
+    try {
+      frames = Array.isArray(extracted?.frames) ? extracted.frames : [];
 
-      return NextResponse.json(
-        {
-          ok: true,
-          wardrobe_video_id: video.id,
-          status: "processed",
-          frames: 0,
-          candidates: 0,
-          candidates_preview: [] as CandidatePreview[],
-          qstash_message_id: qstashMessageId ?? null,
-          qstash_retried: qstash?.retried ?? null,
-          last_processed_at: processedAt,
-          message: "No frames extracted",
-          started_at: startedAt,
-          qstash,
-          last_process_retried: (video as any).last_process_retried ?? didRetry,
-          reason: reason || null,
-        },
-        { status: 200 }
-      );
-    }
+      if (!frames.length) {
+        // Nothing extracted; still mark processed (safe fallback)
+        const processedAt = new Date().toISOString();
+        await supabase
+          .from("wardrobe_videos")
+          .update({
+            status: "processed",
+            last_process_retried: didRetry,
+            last_processed_at: processedAt,
+            ...(qstashMessageId ? { last_process_message_id: qstashMessageId } : {}),
+          })
+          .eq("id", video.id)
+          .eq("user_id", FOUNDER_USER_ID);
 
-    // Prepare candidatesPreview before persisting candidates
-    let candidatesPreview: CandidatePreview[] = [];
-
-    // 3b) Detect candidates (dedupe handled later here)
-    const detected = await detectGarmentCandidates({
-      frames,
-      maxCandidates,
-    });
-
-    const candidatesRaw: CandidateFromDetector[] = (() => {
-      if (Array.isArray(detected)) return detected as any;
-      const maybe = detected as any;
-      if (Array.isArray(maybe?.candidates)) return maybe.candidates as any;
-      return [];
-    })();
-
-    // Normalize + ensure we always end with a public webp URL.
-    const normalizedCandidates: CandidateRow[] = [];
-
-    for (let i = 0; i < candidatesRaw.length; i++) {
-      const c = candidatesRaw[i];
-      const fp = asString(c?.fingerprint || c?.dhash_hex || c?.hash || c?.phash);
-      if (!fp) continue;
-
-      // If detector already provides a URL, accept it.
-      let url = asString(c?.webpUrl || c?.image_url || c?.imageUrl || c?.url);
-
-      // If detector provides webp bytes, upload to Supabase and use that URL.
-      if (!url && c?.image_webp) {
-        const folder = `video_candidates/${video.id}`;
-        const file = `${Date.now()}-${i}-candidate.webp`;
-        const path = `${folder}/${file}`;
-
-        const publicUrl = await uploadWebpToSupabase({
-          supabase,
-          bucket: "garments",
-          path,
-          bytes: c.image_webp,
-        });
-
-        if (publicUrl) url = publicUrl;
+        return NextResponse.json(
+          {
+            ok: true,
+            wardrobe_video_id: video.id,
+            status: "processed",
+            frames: 0,
+            candidates: 0,
+            candidates_preview: [] as CandidatePreview[],
+            qstash_message_id: qstashMessageId ?? null,
+            qstash_retried: qstash?.retried ?? null,
+            last_processed_at: processedAt,
+            message: "No frames extracted",
+            started_at: startedAt,
+            qstash,
+            last_process_retried: (video as any).last_process_retried ?? didRetry,
+            reason: reason || null,
+          },
+          { status: 200 }
+        );
       }
 
-      if (!url) continue;
 
-      normalizedCandidates.push({
-        fingerprint: fp,
-        image_url: url,
-        score: typeof c?.score === "number" ? c.score : undefined,
-        source_frame_index:
-          typeof c?.source_frame_index === "number" ? c.source_frame_index : undefined,
+      // 3b) Detect candidates
+      const detected = await detectGarmentCandidates({
+        frames,
+        maxCandidates,
       });
-    }
 
-    const candidates = uniqByFingerprint(normalizedCandidates).slice(0, maxCandidates);
+      const candidatesRaw: CandidateFromDetector[] = (() => {
+        if (Array.isArray(detected)) return detected as any;
+        const maybe = detected as any;
+        if (Array.isArray(maybe?.candidates)) return maybe.candidates as any;
+        return [];
+      })();
 
-    candidatesPreview = candidates.map((c) => ({
-      fingerprint: c.fingerprint,
-      image_url: c.image_url,
-      score: c.score ?? null,
-      source_frame_index: c.source_frame_index ?? null,
-    }));
+      // Normalize + ensure we always end with a public webp URL.
+      const normalizedCandidates: CandidateRow[] = [];
 
-    if (!candidates.length) {
-      const processedAt = new Date().toISOString();
-      await supabase
-        .from("wardrobe_videos")
-        .update({
-          status: "processed",
-          last_process_retried: didRetry,
-          last_processed_at: processedAt,
-          ...(qstashMessageId ? { last_process_message_id: qstashMessageId } : {}),
-        })
-        .eq("id", video.id)
-        .eq("user_id", FOUNDER_USER_ID);
+      for (let i = 0; i < candidatesRaw.length; i++) {
+        const c = candidatesRaw[i];
+        const fp = asString(c?.fingerprint || c?.dhash_hex || c?.hash || c?.phash);
+        if (!fp) continue;
 
-      return NextResponse.json(
-        {
-          ok: true,
-          wardrobe_video_id: video.id,
-          status: "processed",
-          frames: frames.length,
-          candidates: 0,
-          candidates_preview: [] as CandidatePreview[],
-          qstash_message_id: qstashMessageId ?? null,
-          qstash_retried: qstash?.retried ?? null,
-          last_processed_at: processedAt,
-          message: "No garment candidates detected",
-          started_at: startedAt,
-          qstash,
-          last_process_retried: (video as any).last_process_retried ?? didRetry,
-          reason: reason || null,
-        },
-        { status: 200 }
-      );
-    }
+        // If detector already provides a URL, accept it.
+        let url = asString(c?.webpUrl || c?.image_url || c?.imageUrl || c?.url);
 
-    // Retry-safe: clear previous candidates for this video, scoped by user
-    await supabase
-      .from("wardrobe_video_candidates")
-      .delete()
-      .eq("wardrobe_video_id", video.id)
-      .eq("user_id", FOUNDER_USER_ID);
+        // If detector provides webp bytes, upload to Supabase and use that URL.
+        if (!url && c?.image_webp) {
+          const folder = `video_candidates/${video.id}`;
+          const file = `${Date.now()}-${i}-candidate.webp`;
+          const path = `${folder}/${file}`;
 
-    // 4) Persist candidate rows (temporary table)
-    if (candidates.length) {
-      const rows = candidates.map((c) => ({
-        user_id: FOUNDER_USER_ID,
-        wardrobe_video_id: video.id,
-        image_url: c.image_url,
+          const publicUrl = await uploadWebpToSupabase({
+            supabase,
+            bucket: "garments",
+            path,
+            bytes: c.image_webp,
+          });
+
+          if (publicUrl) url = publicUrl;
+        }
+
+        if (!url) continue;
+
+        normalizedCandidates.push({
+          fingerprint: fp,
+          image_url: url,
+          score: typeof c?.score === "number" ? c.score : undefined,
+          source_frame_index:
+            typeof c?.source_frame_index === "number" ? c.source_frame_index : undefined,
+        });
+      }
+
+      candidates = uniqByFingerprint(normalizedCandidates).slice(0, maxCandidates);
+
+      candidatesPreview = candidates.map((c) => ({
         fingerprint: c.fingerprint,
-        status: "candidate",
+        image_url: c.image_url,
         score: c.score ?? null,
         source_frame_index: c.source_frame_index ?? null,
       }));
 
-      const { error: candErr } = await supabase
-        .from("wardrobe_video_candidates")
-        .insert(rows);
-
-      // Refresh from DB for UI (and to confirm persistence)
-      const { data: candRows } = await supabase
-        .from("wardrobe_video_candidates")
-        .select("fingerprint,image_url,score,source_frame_index")
-        .eq("wardrobe_video_id", video.id)
-        .eq("user_id", FOUNDER_USER_ID)
-        .order("created_at", { ascending: true });
-
-      if (Array.isArray(candRows) && candRows.length) {
-        candidatesPreview = candRows.map((r: any) => ({
-          fingerprint: asString(r.fingerprint),
-          image_url: asString(r.image_url),
-          score: typeof r.score === "number" ? r.score : null,
-          source_frame_index: typeof r.source_frame_index === "number" ? r.source_frame_index : null,
-        })).filter((r) => r.fingerprint && r.image_url);
-      }
-
-      if (candErr) {
-        // Do not fail the whole pipeline; mark processed but include warning.
+      if (!candidates.length) {
         const processedAt = new Date().toISOString();
         await supabase
           .from("wardrobe_videos")
@@ -602,12 +533,12 @@ export async function POST(req: NextRequest) {
             wardrobe_video_id: video.id,
             status: "processed",
             frames: frames.length,
-            candidates: candidates.length,
-            candidates_preview: candidatesPreview,
+            candidates: 0,
+            candidates_preview: [] as CandidatePreview[],
             qstash_message_id: qstashMessageId ?? null,
             qstash_retried: qstash?.retried ?? null,
             last_processed_at: processedAt,
-            warning: `Candidates detected but failed to persist: ${candErr.message}`,
+            message: "No garment candidates detected",
             started_at: startedAt,
             qstash,
             last_process_retried: (video as any).last_process_retried ?? didRetry,
@@ -616,9 +547,92 @@ export async function POST(req: NextRequest) {
           { status: 200 }
         );
       }
-    }
 
-    // 5) Finalize status
+      // Retry-safe: clear previous candidates for this video, scoped by user
+      await supabase
+        .from("wardrobe_video_candidates")
+        .delete()
+        .eq("wardrobe_video_id", video.id)
+        .eq("user_id", FOUNDER_USER_ID);
+
+      // 4) Persist candidate rows (temporary table)
+      if (candidates.length) {
+        const rows = candidates.map((c) => ({
+          user_id: FOUNDER_USER_ID,
+          wardrobe_video_id: video.id,
+          image_url: c.image_url,
+          fingerprint: c.fingerprint,
+          status: "candidate",
+          score: c.score ?? null,
+          source_frame_index: c.source_frame_index ?? null,
+        }));
+
+        const { error: candErr } = await supabase
+          .from("wardrobe_video_candidates")
+          .insert(rows);
+
+        // Refresh from DB for UI (and to confirm persistence)
+        const { data: candRows } = await supabase
+          .from("wardrobe_video_candidates")
+          .select("fingerprint,image_url,score,source_frame_index")
+          .eq("wardrobe_video_id", video.id)
+          .eq("user_id", FOUNDER_USER_ID)
+          .order("created_at", { ascending: true });
+
+        if (Array.isArray(candRows) && candRows.length) {
+          candidatesPreview = candRows
+            .map((r: any) => ({
+              fingerprint: asString(r.fingerprint),
+              image_url: asString(r.image_url),
+              score: typeof r.score === "number" ? r.score : null,
+              source_frame_index:
+                typeof r.source_frame_index === "number" ? r.source_frame_index : null,
+            }))
+            .filter((r) => r.fingerprint && r.image_url);
+        }
+
+        if (candErr) {
+          // Do not fail the whole pipeline; mark processed but include warning.
+          const processedAt = new Date().toISOString();
+          await supabase
+            .from("wardrobe_videos")
+            .update({
+              status: "processed",
+              last_process_retried: didRetry,
+              last_processed_at: processedAt,
+              ...(qstashMessageId ? { last_process_message_id: qstashMessageId } : {}),
+            })
+            .eq("id", video.id)
+            .eq("user_id", FOUNDER_USER_ID);
+
+          return NextResponse.json(
+            {
+              ok: true,
+              wardrobe_video_id: video.id,
+              status: "processed",
+              frames: frames.length,
+              candidates: candidates.length,
+              candidates_preview: candidatesPreview,
+              qstash_message_id: qstashMessageId ?? null,
+              qstash_retried: qstash?.retried ?? null,
+              last_processed_at: processedAt,
+              warning: `Candidates detected but failed to persist: ${candErr.message}`,
+              started_at: startedAt,
+              qstash,
+              last_process_retried: (video as any).last_process_retried ?? didRetry,
+              reason: reason || null,
+            },
+            { status: 200 }
+          );
+        }
+      }
+
+      // At this point candidates are persisted; continue to final status update below.
+    } finally {
+      if (frameDir) {
+        await cleanupExtractedFrames(frameDir);
+      }
+    }
     const processedAt = new Date().toISOString();
     await supabase
       .from("wardrobe_videos")
