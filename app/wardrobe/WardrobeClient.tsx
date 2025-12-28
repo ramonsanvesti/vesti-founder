@@ -872,7 +872,7 @@ export default function WardrobeClient() {
           <div className="text-sm font-medium">Your video history</div>
           <button
             type="button"
-            onClick={fetchVideos}
+            onClick={() => fetchVideos()}
             className="text-sm underline text-gray-600"
             disabled={videosLoading}
           >
