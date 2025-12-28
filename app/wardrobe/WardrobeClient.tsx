@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Garment = {
   id: string;
@@ -165,6 +165,9 @@ export default function WardrobeClient() {
   const [processingVideoId, setProcessingVideoId] = useState<string | null>(
     null
   );
+  // Prevent duplicate / rapid re-entrant process triggers per video id
+  const inFlightProcessIdsRef = useRef<Set<string>>(new Set());
+  const lastProcessClickAtRef = useRef<Map<string, number>>(new Map());
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -249,6 +252,17 @@ export default function WardrobeClient() {
   const processVideo = async (id: string) => {
     if (!id) return;
 
+    // Guard 1: already in-flight for this id
+    if (inFlightProcessIdsRef.current.has(id)) return;
+
+    // Guard 2: debounce rapid double fires (mobile taps / synthetic clicks)
+    const now = Date.now();
+    const last = lastProcessClickAtRef.current.get(id) ?? 0;
+    if (now - last < 1500) return;
+    lastProcessClickAtRef.current.set(id, now);
+
+    inFlightProcessIdsRef.current.add(id);
+
     try {
       setProcessingVideoId(id);
       setVideosError(null);
@@ -331,6 +345,7 @@ export default function WardrobeClient() {
       console.error("Unexpected process video error:", e);
       setVideosError(e?.message || "Unexpected error.");
     } finally {
+      inFlightProcessIdsRef.current.delete(id);
       setProcessingVideoId(null);
     }
   };
@@ -348,11 +363,16 @@ export default function WardrobeClient() {
   useEffect(() => {
     if (!hasProcessingVideos) return;
 
+    let alive = true;
     const t = setInterval(() => {
+      if (!alive) return;
       fetchVideos();
     }, 3000);
 
-    return () => clearInterval(t);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, [hasProcessingVideos]);
 
   const wardrobeCounts = useMemo(() => {
@@ -737,6 +757,7 @@ export default function WardrobeClient() {
           />
 
           <button
+            type="button"
             onClick={uploadWardrobeVideo}
             disabled={!videoFile || videoUploading}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
@@ -775,6 +796,7 @@ export default function WardrobeClient() {
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="text-sm font-medium">Your video history</div>
           <button
+            type="button"
             onClick={fetchVideos}
             className="text-sm underline text-gray-600"
             disabled={videosLoading}
@@ -848,6 +870,7 @@ export default function WardrobeClient() {
                     </div>
 
                     <button
+                      type="button"
                       onClick={() => processVideo(v.id)}
                       disabled={!canProcess || isProcessing}
                       className="px-3 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
@@ -889,6 +912,7 @@ export default function WardrobeClient() {
           />
 
           <button
+            type="button"
             onClick={handleUpload}
             disabled={!file || uploading}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
@@ -915,6 +939,7 @@ export default function WardrobeClient() {
           />
 
           <button
+            type="button"
             onClick={handleAddByText}
             disabled={!textQuery.trim() || addingText}
             className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
@@ -970,6 +995,7 @@ export default function WardrobeClient() {
             </label>
 
             <button
+              type="button"
               onClick={() => generateOutfit({ regenerate: false })}
               disabled={generating}
               className="px-4 py-2 rounded-md text-sm font-medium bg-black text-white disabled:opacity-50"
@@ -978,6 +1004,7 @@ export default function WardrobeClient() {
             </button>
 
             <button
+              type="button"
               onClick={() => generateOutfit({ regenerate: true })}
               disabled={generating || !canRegenerate}
               className="px-4 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
