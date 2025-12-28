@@ -31,22 +31,33 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
+
 function clampInt(v: unknown, fallback: number, min: number, max: number) {
   const n = typeof v === "number" ? v : Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+function normalizeBaseUrl(raw: string) {
+  const v = (raw || "").trim().replace(/\/$/, "");
+  if (!v) return "";
+  if (v.startsWith("http://") || v.startsWith("https://")) return v;
+  // If someone sets NEXT_PUBLIC_SITE_URL or SITE_URL without a scheme,
+  // assume https in production.
+  return `https://${v}`;
+}
+
 function getBaseUrl(req: NextRequest) {
-  // Prefer explicit site URL (production), then Vercel URL, then request host
+  // Prefer explicit site URL, then Vercel URL, then request host.
+  // NOTE: VERCEL_URL is domain-only (no scheme). QStash requires a full URL with http/https.
   const fromEnv =
-    process.env.NEXT_PUBLIC_SITE_URL ||
-    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+    normalizeBaseUrl(process.env.SITE_URL || "") ||
+    normalizeBaseUrl(process.env.NEXT_PUBLIC_SITE_URL || "") ||
+    normalizeBaseUrl(process.env.VERCEL_URL || "");
 
-  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
 
-  // req.nextUrl.protocol is usually "https:" on Vercel, but keep it safe.
-  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
+  const proto = (req.headers.get("x-forwarded-proto") || "https").replace(":", "");
   const host = req.headers.get("x-forwarded-host") || req.nextUrl.host;
   return `${proto}://${host}`;
 }
@@ -89,7 +100,8 @@ async function enqueueProcessJob(args: {
     max_candidates: maxCandidates,
   };
 
-  const targetUrl = `${baseUrl}/api/wardrobe-videos/process`;
+  const safeBaseUrl = normalizeBaseUrl(baseUrl);
+  const targetUrl = new URL("/api/wardrobe-videos/process", safeBaseUrl).toString();
 
   const dedupeId = `wardrobe_video:${wardrobeVideoId}:process:${sampleEverySeconds}:${maxFrames}:${maxWidth}:${maxCandidates}`;
 
@@ -294,16 +306,20 @@ export async function POST(req: NextRequest) {
         maxCandidates,
       });
 
-      // If enqueue failed, do NOT leave the row in `processing` with no message id.
+      // If enqueue failed, do NOT leave the row in `processing`.
       if (!enqueue.ok) {
-        // Best-effort: mark failed only if it was uploaded OR it was stuck processing with no message id.
+        // Best-effort: mark failed so UI doesn't get stuck.
         try {
           await supabase
             .from("wardrobe_videos")
-            .update({ status: "failed" })
+            .update({
+              status: "failed",
+              // Keep traceability fields empty so reprocess can enqueue again.
+              last_process_message_id: null,
+              last_process_retried: true,
+            })
             .eq("id", video.id)
-            .eq("user_id", FOUNDER_USER_ID)
-            .or(`status.eq.uploaded,and(status.eq.processing,last_process_message_id.is.null)`);
+            .eq("user_id", FOUNDER_USER_ID);
         } catch {
           // ignore
         }
@@ -313,10 +329,10 @@ export async function POST(req: NextRequest) {
             ok: false,
             wardrobe_video_id: video.id,
             wardrobe_video: video,
-            status: video.status,
-            message_id: video.last_process_message_id ?? null,
-            last_process_message_id: video.last_process_message_id ?? null,
-            last_process_retried: (video as any).last_process_retried ?? null,
+            status: "failed",
+            message_id: null,
+            last_process_message_id: null,
+            last_process_retried: true,
             last_processed_at: (video as any).last_processed_at ?? null,
             enqueued: enqueue,
             error: "Failed to enqueue processing job",
@@ -340,8 +356,7 @@ export async function POST(req: NextRequest) {
             last_process_retried: wasRetry,
           })
           .eq("id", video.id)
-          .eq("user_id", FOUNDER_USER_ID)
-          .or(`status.in.(uploaded,failed),and(status.eq.processing,last_process_message_id.is.null)`);
+          .eq("user_id", FOUNDER_USER_ID);
       } catch {
         // ignore
       }
@@ -444,8 +459,7 @@ export async function POST(req: NextRequest) {
               last_process_retried: false,
             })
             .eq("id", row.id)
-            .eq("user_id", FOUNDER_USER_ID)
-            .in("status", ["uploaded", "failed", "processing"]);
+            .eq("user_id", FOUNDER_USER_ID);
         } catch {
           // ignore
         }
