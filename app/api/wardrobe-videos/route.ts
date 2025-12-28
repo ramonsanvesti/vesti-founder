@@ -69,10 +69,11 @@ function isConfiguredQStash() {
 }
 
 function qstashPublishUrl(targetUrl: string) {
-  // QStash publish endpoint expects the destination URL as part of the path.
-  // We keep this in one place to avoid scattering string logic.
-  const encoded = encodeURIComponent(targetUrl);
-  return `https://qstash.upstash.io/v2/publish/${encoded}`;
+  // QStash v2 publish endpoint expects the destination URL as part of the path.
+  // IMPORTANT: Do NOT encodeURIComponent() the destination here.
+  // If you encode it, QStash may treat the scheme as `https%3A...` and reject it.
+  // Upstash docs show: https://qstash.upstash.io/v2/publish/https://example.com
+  return `https://qstash.upstash.io/v2/publish/${targetUrl}`;
 }
 
 async function enqueueProcessJob(args: {
@@ -107,7 +108,7 @@ async function enqueueProcessJob(args: {
 
   // If QStash isn't configured, do a best-effort direct call (does not block response).
   if (!isConfiguredQStash()) {
-    void fetch(targetUrl, {
+    fetch(targetUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -128,6 +129,16 @@ async function enqueueProcessJob(args: {
   const receiverIsSigned = Boolean(process.env.QSTASH_CURRENT_SIGNING_KEY);
 
   const publishUrl = qstashPublishUrl(targetUrl);
+  if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+    return {
+      ok: false,
+      enqueued: false,
+      target_url: targetUrl,
+      dedupe_id: dedupeId,
+      message_id: null as string | null,
+      qstash_error: { status: 400, body: "target_url missing http/https scheme" },
+    };
+  }
   const retries = 5;
 
   const r = await fetch(publishUrl, {
@@ -149,7 +160,7 @@ async function enqueueProcessJob(args: {
 
     // Only attempt direct fetch fallback if receiver is not enforcing signatures.
     if (!receiverIsSigned) {
-      void fetch(targetUrl, {
+      fetch(targetUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
