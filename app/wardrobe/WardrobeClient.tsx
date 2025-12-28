@@ -148,6 +148,16 @@ function parseSupabaseTsMs(ts?: string | null): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+// Video history polling controls
+const VIDEO_POLL_MS = 8000;
+
+// If a video is `processing` but has no QStash job id yet, we only poll briefly.
+// This prevents infinite polling loops when the row is stuck in `processing`.
+const PROCESSING_NO_JOB_GRACE_MS = 60 * 1000; // 1 minute
+
+// If it stays `processing` with no job id beyond this, treat as stuck and allow Reprocess.
+const STUCK_NO_JOB_MS = 2 * 60 * 1000; // 2 minutes
+
 async function getVideoDurationSeconds(file: File): Promise<number | null> {
   try {
     const url = URL.createObjectURL(file);
@@ -431,22 +441,20 @@ export default function WardrobeClient() {
 
   const hasProcessingVideos = useMemo(() => {
     const now = Date.now();
-    const MAX_POLL_MS = 10 * 60 * 1000; // 10 minutes
 
     return videos.some((v) => {
       if (String(v.status) !== "processing") return false;
 
+      // If we have a real job id, keep polling until the backend flips status.
       const jobId = v.last_process_message_id ?? v.last_message_id ?? null;
       if (jobId) return true;
 
+      // If we do NOT have a job id, only poll briefly (queued grace window).
+      // This prevents infinite polling when the row is stuck in `processing`.
       const createdMs = parseSupabaseTsMs(v.created_at ?? null);
-
-      // IMPORTANT: if we can't parse the timestamp, do NOT poll forever.
-      // Treat as "stuck" and let the user manually re-process.
       if (createdMs == null) return false;
 
-      // If it's been processing too long with no job id, treat as stuck and stop polling.
-      return now - createdMs < MAX_POLL_MS;
+      return now - createdMs < PROCESSING_NO_JOB_GRACE_MS;
     });
   }, [videos]);
 
@@ -458,7 +466,7 @@ export default function WardrobeClient() {
     const t = setInterval(() => {
       if (!alive) return;
       fetchVideos({ silent: true });
-    }, 8000);
+    }, VIDEO_POLL_MS);
 
     return () => {
       alive = false;
@@ -919,7 +927,7 @@ export default function WardrobeClient() {
                 s === "processing" &&
                 !jobId &&
                 createdMs != null &&
-                Date.now() - createdMs > 2 * 60 * 1000; // 2 minutes
+                Date.now() - createdMs > STUCK_NO_JOB_MS;
 
               const isProcessing = (s === "processing" && !isStuckProcessing) || processingVideoId === v.id;
 
