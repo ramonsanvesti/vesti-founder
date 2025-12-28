@@ -57,18 +57,23 @@ type WardrobeVideoRow = {
   id: string;
   user_id: string | null;
   video_url: string;
+
+  // API returns `playback_url` (preferred). Keep `signed_url` as legacy alias.
+  playback_url?: string | null;
+  signed_url?: string | null;
+
   status: "uploaded" | "processing" | "processed" | "failed";
   created_at?: string;
-  signed_url?: string | null;
+
   // debug (from QStash / processing trace)
   // (support both legacy + new names; API likely returns snake_case from Supabase)
   last_process_message_id?: string | null;
-  last_process_retried?: string | null;
+  last_process_retried?: boolean | null;
   last_processed_at?: string | null;
 
   // legacy aliases (keep to avoid breaking older responses)
   last_message_id?: string | null;
-  last_retried?: string | null;
+  last_retried?: boolean | null;
 };
 
 type UploadVideoResponse = {
@@ -106,6 +111,20 @@ async function getSupabase() {
 function httpsify(url?: string | null) {
   if (!url) return null;
   return url.startsWith("http://") ? url.replace("http://", "https://") : url;
+}
+
+function getPlaybackUrl(v: WardrobeVideoRow) {
+  return httpsify(v.playback_url ?? v.signed_url ?? null);
+}
+
+function normalizeVideoRow(v: WardrobeVideoRow): WardrobeVideoRow {
+  // If the backend only provides one of the fields, mirror it into the other.
+  const playback = (v.playback_url ?? v.signed_url ?? null) as string | null;
+  return {
+    ...v,
+    playback_url: playback,
+    signed_url: v.signed_url ?? playback,
+  };
 }
 
 function displayName(g: Garment) {
@@ -168,6 +187,8 @@ export default function WardrobeClient() {
   // Prevent duplicate / rapid re-entrant process triggers per video id
   const inFlightProcessIdsRef = useRef<Set<string>>(new Set());
   const lastProcessClickAtRef = useRef<Map<string, number>>(new Map());
+  // Prevent overlapping GET /api/wardrobe-videos calls (polling can re-enter)
+  const videosFetchInFlightRef = useRef(false);
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -223,6 +244,8 @@ export default function WardrobeClient() {
   // History endpoint (GET /api/wardrobe-videos)
   const fetchVideos = async () => {
     try {
+      if (videosFetchInFlightRef.current) return;
+      videosFetchInFlightRef.current = true;
       setVideosLoading(true);
       setVideosError(null);
 
@@ -238,12 +261,13 @@ export default function WardrobeClient() {
       }
 
       const rows = Array.isArray(json.videos) ? json.videos : [];
-      setVideos(rows);
+      setVideos(rows.map((r) => normalizeVideoRow(r)));
     } catch (e: any) {
       console.error("Unexpected error loading video history:", e);
       setVideosError(e?.message || "Unexpected error.");
       setVideos([]);
     } finally {
+      videosFetchInFlightRef.current = false;
       setVideosLoading(false);
     }
   };
@@ -284,7 +308,7 @@ export default function WardrobeClient() {
       }
 
       const messageId = (json?.job_id ?? json?.message_id) ?? null;
-      const retried = json?.qstash_retried ?? null;
+      const retried = typeof json?.qstash_retried === "boolean" ? json.qstash_retried : null;
       const updatedRow = (json?.video ?? null) as WardrobeVideoRow | null;
 
       // Optimistic update: status + debug ids; if API returned the full row, prefer it.
@@ -783,7 +807,7 @@ export default function WardrobeClient() {
               <video
                 controls
                 className="w-full max-w-xl rounded border border-white/10"
-                src={lastVideo.signedUrl}
+                src={getPlaybackUrl(normalizeVideoRow(lastVideo.row)) ?? undefined}
               />
             ) : (
               <div>Signed URL unavailable (check warnings in console).</div>
@@ -816,11 +840,12 @@ export default function WardrobeClient() {
             {videos.map((v) => {
               const s = String(v.status);
 
-              const jobId =
-                v.last_process_message_id ?? v.last_message_id ?? null;
+              const vv = normalizeVideoRow(v);
+              const jobId = vv.last_process_message_id ?? vv.last_message_id ?? null;
               const retried =
-                v.last_process_retried ?? v.last_retried ?? null;
-              const lastProcessedAt = v.last_processed_at ?? null;
+                vv.last_process_retried ?? vv.last_retried ?? null;
+              const lastProcessedAt = vv.last_processed_at ?? null;
+              const playback = getPlaybackUrl(vv);
 
               const isProcessing = s === "processing" || processingVideoId === v.id;
               const canProcess =
@@ -847,10 +872,10 @@ export default function WardrobeClient() {
                         <div className="break-all">
                           <span className="text-gray-300">Job:</span>{" "}
                           {String(jobId)}
-                          {retried ? (
+                          {retried !== null ? (
                             <span className="text-gray-500">
                               {" "}
-                              · retried {String(retried)}
+                              · retried {retried ? "yes" : "no"}
                             </span>
                           ) : null}
                         </div>
@@ -880,11 +905,11 @@ export default function WardrobeClient() {
                     </button>
                   </div>
 
-                  {v.signed_url ? (
+                  {playback ? (
                     <video
                       controls
                       className="w-full max-w-xl rounded border border-white/10"
-                      src={httpsify(v.signed_url) ?? undefined}
+                      src={playback ?? undefined}
                     />
                   ) : (
                     <div className="text-xs text-gray-500">
