@@ -212,6 +212,8 @@ export default function WardrobeClient() {
   const lastProcessClickAtRef = useRef<Map<string, number>>(new Map());
   // Prevent overlapping GET /api/wardrobe-videos calls (polling can re-enter)
   const videosFetchInFlightRef = useRef(false);
+  // Ensure we never register more than one polling interval (prevents duplicate timers)
+  const videosPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Prevent UI blink: do not re-render if history payload hasn't changed
   const lastVideosJsonRef = useRef<string>("");
@@ -459,18 +461,36 @@ export default function WardrobeClient() {
   }, [videos]);
 
   // Poll only while processing (silent: no loading state flicker)
+  // NOTE: we guard against duplicate intervals (can happen with re-mounts / fast refresh)
   useEffect(() => {
-    if (!hasProcessingVideos) return;
+    // Stop polling when nothing is processing
+    if (!hasProcessingVideos) {
+      if (videosPollTimerRef.current) {
+        clearInterval(videosPollTimerRef.current);
+        videosPollTimerRef.current = null;
+      }
+      return;
+    }
 
-    let alive = true;
-    const t = setInterval(() => {
-      if (!alive) return;
+    // Already polling
+    if (videosPollTimerRef.current) return;
+
+    const tick = () => {
+      // Don’t poll when tab is hidden (prevents background churn)
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
       fetchVideos({ silent: true });
-    }, VIDEO_POLL_MS);
+    };
+
+    // Prime one tick quickly so UI updates soon after queueing
+    tick();
+
+    videosPollTimerRef.current = setInterval(tick, VIDEO_POLL_MS);
 
     return () => {
-      alive = false;
-      clearInterval(t);
+      if (videosPollTimerRef.current) {
+        clearInterval(videosPollTimerRef.current);
+        videosPollTimerRef.current = null;
+      }
     };
   }, [hasProcessingVideos]);
 
