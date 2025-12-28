@@ -135,6 +135,19 @@ function norm(s: string) {
   return s.toLowerCase().trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }
 
+function parseSupabaseTsMs(ts?: string | null): number | null {
+  if (!ts) return null;
+
+  // Supabase often returns microseconds (6 digits) like: 2025-12-24T00:42:54.228617+00:00
+  // Some browsers parse that inconsistently. Normalize to milliseconds.
+  const normalized = ts
+    .replace(/(\.\d{3})\d+/, "$1") // .228617 -> .228
+    .replace(/\+00:00$/, "Z"); // +00:00 -> Z
+
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 async function getVideoDurationSeconds(file: File): Promise<number | null> {
   try {
     const url = URL.createObjectURL(file);
@@ -426,11 +439,14 @@ export default function WardrobeClient() {
       const jobId = v.last_process_message_id ?? v.last_message_id ?? null;
       if (jobId) return true;
 
-      const createdAt = v.created_at ? Date.parse(v.created_at) : NaN;
-      if (!Number.isFinite(createdAt)) return true;
+      const createdMs = parseSupabaseTsMs(v.created_at ?? null);
+
+      // IMPORTANT: if we can't parse the timestamp, do NOT poll forever.
+      // Treat as "stuck" and let the user manually re-process.
+      if (createdMs == null) return false;
 
       // If it's been processing too long with no job id, treat as stuck and stop polling.
-      return now - createdAt < MAX_POLL_MS;
+      return now - createdMs < MAX_POLL_MS;
     });
   }, [videos]);
 
@@ -898,9 +914,19 @@ export default function WardrobeClient() {
               const lastProcessedAt = vv.last_processed_at ?? null;
               const playback = getPlaybackUrl(vv);
 
-              const isProcessing = s === "processing" || processingVideoId === v.id;
+              const createdMs = parseSupabaseTsMs(v.created_at ?? null);
+              const isStuckProcessing =
+                s === "processing" &&
+                !jobId &&
+                createdMs != null &&
+                Date.now() - createdMs > 2 * 60 * 1000; // 2 minutes
+
+              const isProcessing = (s === "processing" && !isStuckProcessing) || processingVideoId === v.id;
+
+              // Allow user to re-trigger if processing looks stuck (no job id after a short window)
               const canProcess =
-                !isProcessing && (s === "uploaded" || s === "failed" || s === "processed");
+                !isProcessing &&
+                (s === "uploaded" || s === "failed" || s === "processed" || isStuckProcessing);
 
               return (
                 <div
@@ -930,10 +956,16 @@ export default function WardrobeClient() {
                             </span>
                           ) : null}
                         </div>
-                      ) : s === "processing" ? (
+                      ) : s === "processing" && !isStuckProcessing ? (
                         <div className="break-all">
                           <span className="text-gray-300">Job:</span>{" "}
                           <span className="text-gray-500">queued…</span>
+                        </div>
+                      ) : isStuckProcessing ? (
+                        <div className="break-all">
+                          <span className="text-gray-300">Job:</span>{" "}
+                          <span className="text-yellow-300">stuck</span>
+                          <span className="text-gray-500"> · tap Reprocess</span>
                         </div>
                       ) : null}
 
@@ -952,7 +984,7 @@ export default function WardrobeClient() {
                       className="px-3 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
                       title={canProcess ? "Trigger processing pipeline" : "Not available"}
                     >
-                      {isProcessing ? "Processing…" : s === "processed" ? "Reprocess" : "Process"}
+                      {isProcessing ? "Processing…" : s === "processed" || isStuckProcessing ? "Reprocess" : "Process"}
                     </button>
                   </div>
 
@@ -1141,7 +1173,7 @@ export default function WardrobeClient() {
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-medium">Your wardrobe</h2>
-          <button onClick={fetchGarments} className="text-sm underline text-gray-600">
+          <button onClick={() => fetchGarments()} className="text-sm underline text-gray-600">
             Refresh
           </button>
         </div>
