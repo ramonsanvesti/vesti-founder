@@ -111,12 +111,11 @@ async function enqueueProcessJob(args: {
     };
   }
 
-  // QStash HTTP API (no SDK dependency) — retry-safe + clean dedupe.
-  // Docs: https://upstash.com/docs/qstash
-  const publishUrl = qstashPublishUrl(targetUrl);
+  // If receiver signing keys are configured, the receiver will reject unsigned direct calls.
+  // In that case, do NOT attempt direct_fetch fallback when QStash publish fails.
+  const receiverIsSigned = Boolean(process.env.QSTASH_CURRENT_SIGNING_KEY);
 
-  // Dedupe should collapse identical requests (retry-safe) but allow a fresh run
-  // when the caller changes sampling params.
+  const publishUrl = qstashPublishUrl(targetUrl);
   const retries = 5;
 
   const r = await fetch(publishUrl, {
@@ -124,12 +123,10 @@ async function enqueueProcessJob(args: {
     headers: {
       Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
       "Content-Type": "application/json",
-      // These headers control QStash behavior
       "Upstash-Method": "POST",
       "Upstash-Content-Type": "application/json",
       "Upstash-Deduplication-Id": dedupeId,
       "Upstash-Retries": String(retries),
-      // Keep messages short-lived if they get stuck (seconds)
       "Upstash-Timeout": "120",
     },
     body: JSON.stringify(payload),
@@ -137,17 +134,29 @@ async function enqueueProcessJob(args: {
 
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    // Fallback to direct call (best effort). Do not throw: enqueue should not break upload/process UX.
-    void fetch(targetUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
+
+    // Only attempt direct fetch fallback if receiver is not enforcing signatures.
+    if (!receiverIsSigned) {
+      void fetch(targetUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+
+      return {
+        ok: true,
+        enqueued: false,
+        fallback: "direct_fetch" as const,
+        target_url: targetUrl,
+        dedupe_id: dedupeId,
+        message_id: null as string | null,
+        qstash_error: { status: r.status, body: txt.slice(0, 500) },
+      };
+    }
 
     return {
-      ok: true,
+      ok: false,
       enqueued: false,
-      fallback: "direct_fetch" as const,
       target_url: targetUrl,
       dedupe_id: dedupeId,
       message_id: null as string | null,
@@ -156,7 +165,6 @@ async function enqueueProcessJob(args: {
   }
 
   const qstashJson = await r.json().catch(() => null);
-
   const messageId =
     (qstashJson && (qstashJson.messageId || qstashJson.message_id || qstashJson.id)) || null;
 
@@ -270,36 +278,12 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Retry-safe status flip:
-      // - If already processing, keep it.
-      // - If failed/uploaded, move to processing.
-      if (video.status !== "processing") {
-        // Retry-safe: only advance states that are allowed to move to processing.
-        // Prevent accidental rewinds from processed.
-        const { error: stErr } = await supabase
-          .from("wardrobe_videos")
-          .update({ status: "processing" })
-          .eq("id", video.id)
-          .eq("user_id", FOUNDER_USER_ID)
-          .in("status", ["uploaded", "failed"]);
-
-        if (stErr) {
-          return NextResponse.json(
-            { ok: false, error: "Failed to update status", details: stErr.message },
-            { status: 500, headers: { "Cache-Control": "no-store" } }
-          );
-        }
-      }
-
       const sampleEverySeconds = clampInt(b.sample_every_seconds, 2, 1, 10);
       const maxFrames = clampInt(b.max_frames, 24, 6, 120);
       const maxWidth = clampInt(b.max_width, 960, 480, 1920);
       const maxCandidates = clampInt(b.max_candidates, 12, 1, 25);
 
       const baseUrl = getBaseUrl(req);
-
-      // Guard: baseUrl must be absolute https URL in prod.
-      // If someone misconfigures env vars, we still try to proceed.
 
       const enqueue = await enqueueProcessJob({
         wardrobeVideoId: video.id,
@@ -310,21 +294,56 @@ export async function POST(req: NextRequest) {
         maxCandidates,
       });
 
-      // Persist QStash message id for traceability (best-effort; do not fail the request if this update fails).
-      if (enqueue?.message_id) {
+      // If enqueue failed, do NOT leave the row in `processing` with no message id.
+      if (!enqueue.ok) {
+        // Best-effort: mark failed only if it was uploaded OR it was stuck processing with no message id.
         try {
-          const wasRetry = video.status === "failed" || Boolean(video.last_process_message_id);
           await supabase
             .from("wardrobe_videos")
-            .update({
-              last_process_message_id: enqueue.message_id,
-              last_process_retried: wasRetry,
-            })
+            .update({ status: "failed" })
             .eq("id", video.id)
-            .eq("user_id", FOUNDER_USER_ID);
+            .eq("user_id", FOUNDER_USER_ID)
+            .or(`status.eq.uploaded,and(status.eq.processing,last_process_message_id.is.null)`);
         } catch {
           // ignore
         }
+
+        return NextResponse.json(
+          {
+            ok: false,
+            wardrobe_video_id: video.id,
+            wardrobe_video: video,
+            status: video.status,
+            message_id: video.last_process_message_id ?? null,
+            last_process_message_id: video.last_process_message_id ?? null,
+            last_process_retried: (video as any).last_process_retried ?? null,
+            last_processed_at: (video as any).last_processed_at ?? null,
+            enqueued: enqueue,
+            error: "Failed to enqueue processing job",
+          },
+          { status: 200, headers: { "Cache-Control": "no-store" } }
+        );
+      }
+
+      // Ensure we ALWAYS set a message id when we enter processing.
+      const messageId = enqueue.message_id || `direct:${Date.now()}`;
+      const wasRetry = video.status === "failed" || Boolean(video.last_process_message_id) || Boolean((video as any).last_process_retried);
+
+      // Atomic-ish update: move to processing and stamp traceability.
+      // Allow if status is uploaded/failed OR if it is processing but missing message id (stuck).
+      try {
+        await supabase
+          .from("wardrobe_videos")
+          .update({
+            status: "processing",
+            last_process_message_id: messageId,
+            last_process_retried: wasRetry,
+          })
+          .eq("id", video.id)
+          .eq("user_id", FOUNDER_USER_ID)
+          .or(`status.in.(uploaded,failed),and(status.eq.processing,last_process_message_id.is.null)`);
+      } catch {
+        // ignore
       }
 
       // Re-load the row so the client always gets the latest status + traceability fields.
@@ -335,25 +354,16 @@ export async function POST(req: NextRequest) {
         .eq("user_id", FOUNDER_USER_ID)
         .single();
 
-      // Return immediately. Processing is async.
       return NextResponse.json(
         {
           ok: true,
           wardrobe_video_id: video.id,
           wardrobe_video: updatedVideo ?? null,
           status: (updatedVideo?.status ?? "processing") as any,
-          message_id:
-            (enqueue as any)?.message_id ??
-            (updatedVideo as any)?.last_process_message_id ??
-            video.last_process_message_id ??
-            null,
-          last_process_message_id:
-            (enqueue as any)?.message_id ??
-            (updatedVideo as any)?.last_process_message_id ??
-            video.last_process_message_id ??
-            null,
-          last_process_retried: (updatedVideo as any)?.last_process_retried ?? (video as any)?.last_process_retried ?? null,
-          last_processed_at: (updatedVideo as any)?.last_processed_at ?? (video as any)?.last_processed_at ?? null,
+          message_id: (updatedVideo as any)?.last_process_message_id ?? messageId,
+          last_process_message_id: (updatedVideo as any)?.last_process_message_id ?? messageId,
+          last_process_retried: (updatedVideo as any)?.last_process_retried ?? wasRetry,
+          last_processed_at: (updatedVideo as any)?.last_processed_at ?? null,
           enqueued: enqueue,
         },
         { status: 200, headers: { "Cache-Control": "no-store" } }
@@ -392,27 +402,15 @@ export async function POST(req: NextRequest) {
         try {
           const { data: latest } = await supabase
             .from("wardrobe_videos")
-            .select("id,status")
+            .select("id,status,last_process_message_id")
             .eq("id", row.id)
             .eq("user_id", FOUNDER_USER_ID)
             .single();
 
-          if (latest?.status === "processing" || latest?.status === "processed") {
-            return;
-          }
+          if (latest?.status === "processed") return;
+          if (latest?.status === "processing" && latest?.last_process_message_id) return;
         } catch {
-          // best-effort; do not block response
-        }
-
-        try {
-          await supabase
-            .from("wardrobe_videos")
-            .update({ status: "processing" })
-            .eq("id", row.id)
-            .eq("user_id", FOUNDER_USER_ID)
-            .in("status", ["uploaded", "failed"]);
-        } catch {
-          // best-effort; do not block response
+          // ignore
         }
 
         try {
@@ -421,22 +419,35 @@ export async function POST(req: NextRequest) {
             baseUrl: getBaseUrl(req),
           });
 
-          if ((enq as any)?.message_id) {
+          if (!enq.ok) {
+            // best-effort: mark failed so UI doesn't show a stuck processing state
             try {
               await supabase
                 .from("wardrobe_videos")
-                .update({
-                  last_process_message_id: (enq as any).message_id,
-                  last_process_retried: false,
-                })
+                .update({ status: "failed" })
                 .eq("id", row.id)
-                .eq("user_id", FOUNDER_USER_ID);
+                .eq("user_id", FOUNDER_USER_ID)
+                .in("status", ["uploaded", "processing"]);
             } catch {
               // ignore
             }
+            return;
           }
+
+          const messageId = enq.message_id || `direct:${Date.now()}`;
+
+          await supabase
+            .from("wardrobe_videos")
+            .update({
+              status: "processing",
+              last_process_message_id: messageId,
+              last_process_retried: false,
+            })
+            .eq("id", row.id)
+            .eq("user_id", FOUNDER_USER_ID)
+            .in("status", ["uploaded", "failed", "processing"]);
         } catch {
-          // best-effort; do not block response
+          // ignore
         }
       })();
     }
