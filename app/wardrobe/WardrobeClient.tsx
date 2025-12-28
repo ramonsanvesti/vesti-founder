@@ -190,6 +190,19 @@ export default function WardrobeClient() {
   // Prevent overlapping GET /api/wardrobe-videos calls (polling can re-enter)
   const videosFetchInFlightRef = useRef(false);
 
+  // Prevent UI blink: do not re-render if history payload hasn't changed
+  const lastVideosJsonRef = useRef<string>("");
+
+  const stableVideoKey = (v: WardrobeVideoRow) => ({
+    id: v.id,
+    status: v.status,
+    created_at: v.created_at ?? null,
+    playback_url: v.playback_url ?? v.signed_url ?? null,
+    last_process_message_id: v.last_process_message_id ?? v.last_message_id ?? null,
+    last_process_retried: v.last_process_retried ?? v.last_retried ?? null,
+    last_processed_at: v.last_processed_at ?? null,
+  });
+
   // Outfit generation
   const [useCase, setUseCase] = useState<
     | "casual"
@@ -242,12 +255,17 @@ export default function WardrobeClient() {
   };
 
   // History endpoint (GET /api/wardrobe-videos)
-  const fetchVideos = async () => {
+  const fetchVideos = async (opts?: { silent?: boolean }) => {
+    const silent = Boolean(opts?.silent);
+
     try {
       if (videosFetchInFlightRef.current) return;
       videosFetchInFlightRef.current = true;
-      setVideosLoading(true);
-      setVideosError(null);
+
+      if (!silent) {
+        setVideosLoading(true);
+        setVideosError(null);
+      }
 
       const res = await fetch("/api/wardrobe-videos", { method: "GET" });
       const json = (await res.json().catch(() => ({}))) as ListVideosResponse;
@@ -256,19 +274,32 @@ export default function WardrobeClient() {
         const msg =
           json?.details || json?.error || "Failed to load video history.";
         setVideosError(msg);
-        setVideos([]);
+        if (!silent) setVideos([]);
         return;
       }
 
       const rows = Array.isArray(json.videos) ? json.videos : [];
-      setVideos(rows.map((r) => normalizeVideoRow(r)));
+      const normalized = rows.map((r) => normalizeVideoRow(r));
+
+      // Avoid re-render if payload didn't change
+      const nextJson = JSON.stringify(
+        normalized
+          .slice()
+          .sort((a, b) => a.id.localeCompare(b.id))
+          .map(stableVideoKey)
+      );
+
+      if (nextJson !== lastVideosJsonRef.current) {
+        lastVideosJsonRef.current = nextJson;
+        setVideos(normalized);
+      }
     } catch (e: any) {
       console.error("Unexpected error loading video history:", e);
       setVideosError(e?.message || "Unexpected error.");
-      setVideos([]);
+      if (!silent) setVideos([]);
     } finally {
       videosFetchInFlightRef.current = false;
-      setVideosLoading(false);
+      if (!silent) setVideosLoading(false);
     }
   };
 
@@ -308,7 +339,13 @@ export default function WardrobeClient() {
       }
 
       const messageId = (json?.job_id ?? json?.message_id) ?? null;
-      const retried = typeof json?.qstash_retried === "boolean" ? json.qstash_retried : null;
+      const retriedRaw: any = (json as any)?.qstash_retried;
+      const retried =
+        typeof retriedRaw === "boolean"
+          ? retriedRaw
+          : typeof retriedRaw === "string"
+            ? retriedRaw.toLowerCase() === "true"
+            : null;
       const updatedRow = (json?.video ?? null) as WardrobeVideoRow | null;
 
       // Optimistic update: status + debug ids; if API returned the full row, prefer it.
@@ -363,7 +400,7 @@ export default function WardrobeClient() {
 
       // Quick refresh shortly after queueing
       setTimeout(() => {
-        fetchVideos();
+        fetchVideos({ silent: true });
       }, 600);
     } catch (e: any) {
       console.error("Unexpected process video error:", e);
@@ -380,18 +417,32 @@ export default function WardrobeClient() {
   }, []);
 
   const hasProcessingVideos = useMemo(() => {
-    return videos.some((v) => String(v.status) === "processing");
+    const now = Date.now();
+    const MAX_POLL_MS = 10 * 60 * 1000; // 10 minutes
+
+    return videos.some((v) => {
+      if (String(v.status) !== "processing") return false;
+
+      const jobId = v.last_process_message_id ?? v.last_message_id ?? null;
+      if (jobId) return true;
+
+      const createdAt = v.created_at ? Date.parse(v.created_at) : NaN;
+      if (!Number.isFinite(createdAt)) return true;
+
+      // If it's been processing too long with no job id, treat as stuck and stop polling.
+      return now - createdAt < MAX_POLL_MS;
+    });
   }, [videos]);
 
-  // Poll only while processing
+  // Poll only while processing (silent: no loading state flicker)
   useEffect(() => {
     if (!hasProcessingVideos) return;
 
     let alive = true;
     const t = setInterval(() => {
       if (!alive) return;
-      fetchVideos();
-    }, 3000);
+      fetchVideos({ silent: true });
+    }, 8000);
 
     return () => {
       alive = false;
