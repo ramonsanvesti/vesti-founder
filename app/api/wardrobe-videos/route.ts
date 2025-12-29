@@ -167,7 +167,10 @@ async function publishToQstash(args: {
     };
   }
 
-  const endpoint = `${apiBase}/publish/${encodeURIComponent(dest)}`;
+  // QStash HTTP API expects the destination URL as a path suffix (it can include `https://`).
+  // If we fully `encodeURIComponent()` the URL, it becomes `https%3A%2F%2F...` and QStash will treat
+  // the scheme as invalid. We use `encodeURI()` to keep the `https://` scheme intact.
+  const endpoint = `${apiBase}/publish/${encodeURI(dest)}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
