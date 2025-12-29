@@ -36,8 +36,8 @@ async function handler(req: NextRequest) {
 
     const supabase = getSupabaseServerClient();
 
-    // TODO: aquí va tu pipeline real (extract frames, classify, insert garments, etc.)
-    // Por ahora dejamos el endpoint funcionando end-to-end marcando como processed.
+    // TODO: replace with the real pipeline (extract frames, classify, insert garments, etc.)
+    // For now we mark the video as processed so the end-to-end loop works.
     const nowIso = new Date().toISOString();
 
     const { data, error } = await supabase
@@ -72,13 +72,11 @@ async function handler(req: NextRequest) {
   }
 }
 
-// En local/dev, si NO tienes signing key, permite llamadas directas.
-// En prod, si QSTASH_CURRENT_SIGNING_KEY o QSTASH_NEXT_SIGNING_KEY está seteado, exige firma.
+// In local/dev, if you do NOT have signing keys, allow direct calls.
+// In prod, if QSTASH_CURRENT_SIGNING_KEY or QSTASH_NEXT_SIGNING_KEY is set, require signature.
 const requireSignature = Boolean(
   asString(process.env.QSTASH_CURRENT_SIGNING_KEY) ||
     asString(process.env.QSTASH_NEXT_SIGNING_KEY)
 );
 
-export const POST = requireSignature
-  ? verifySignatureAppRouter(handler)
-  : handler;
+export const POST = requireSignature ? verifySignatureAppRouter(handler) : handler;

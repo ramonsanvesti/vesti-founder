@@ -672,8 +672,8 @@ export default function WardrobeClient() {
       const form = new FormData();
       form.append("video", videoFile);
 
-      // Consolidated endpoint (POST /api/wardrobe-videos)
-      const res = await fetch("/api/wardrobe-videos", {
+      // Upload endpoint (POST /api/wardrobe-videos/upload)
+      const res = await fetch("/api/wardrobe-videos/upload", {
         method: "POST",
         body: form,
       });
