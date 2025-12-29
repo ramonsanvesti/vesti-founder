@@ -132,7 +132,14 @@ function getQstashApiBase() {
 }
 
 function getQstashToken() {
-  return asString(process.env.QSTASH_TOKEN);
+  // Upstash docs use QSTASH_TOKEN. Some templates/tools expose alternative names.
+  return (
+    asString(process.env.QSTASH_TOKEN) ||
+    asString(process.env.UPSTASH_QSTASH_TOKEN) ||
+    asString(process.env.UPSTASH_QSTASH_REST_TOKEN) ||
+    asString(process.env.UPSTASH_WORKFLOW_TOKEN) ||
+    asString(process.env.UPSTASH_TOKEN)
+  );
 }
 
 function isConfiguredQStash() {
@@ -151,7 +158,8 @@ async function publishToQstash(args: {
     return {
       ok: false as const,
       status: 500,
-      body: "Missing QSTASH_TOKEN",
+      body:
+        "Missing QStash token. Set QSTASH_TOKEN (recommended) or UPSTASH_QSTASH_TOKEN/UPSTASH_QSTASH_REST_TOKEN.",
       data: null as any,
     };
   }
@@ -539,6 +547,12 @@ export async function POST(req: NextRequest) {
           last_process_message_id: null,
           last_process_retried: true,
         });
+        console.error("[wardrobe-videos] enqueue failed", {
+          target_url: (enq as any)?.target_url,
+          qstash_error: (enq as any)?.qstash_error,
+          body: (enq as any)?.body,
+          status: (enq as any)?.status,
+        });
       } else {
         const msgId = pickMessageIdFromEnqueue(
           enq,
@@ -694,6 +708,12 @@ export async function POST(req: NextRequest) {
             enqueued: enqueue,
             update_error: (upd as any).error ?? null,
             error: "Failed to enqueue processing job",
+            error_details:
+              (enqueue as any)?.qstash_error?.body ||
+              (enqueue as any)?.body ||
+              "Check QStash configuration and environment variables.",
+            qstash_error: (enqueue as any)?.qstash_error ?? null,
+            qstash_target_url: (enqueue as any)?.target_url ?? null,
           },
           { status: 200, headers: { "Cache-Control": "no-store" } }
         );
@@ -715,6 +735,12 @@ export async function POST(req: NextRequest) {
         last_process_message_id: messageId,
         last_process_retried: wasRetry,
       });
+      if ((upd2 as any)?.error) {
+        console.error("[wardrobe-videos] failed to update row to processing", {
+          wardrobe_video_id: video.id,
+          error: (upd2 as any).error,
+        });
+      }
 
       const { data: updatedVideo } = await supabase
         .from("wardrobe_videos")
