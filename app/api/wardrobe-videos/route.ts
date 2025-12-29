@@ -162,7 +162,7 @@ async function publishToQstash(args: {
   destinationUrl: string;
   body: any;
   dedupeId?: string;
-  retries?: number;
+  retries?: number; // optional; if omitted, header is omitted
   timeoutSeconds?: number;
 }) {
   const token = getQstashToken();
@@ -199,8 +199,18 @@ async function publishToQstash(args: {
   };
 
   if (args.dedupeId) headers["Upstash-Deduplication-Id"] = args.dedupeId;
-  if (typeof args.retries === "number") headers["Upstash-Retries"] = String(args.retries);
-  if (typeof args.timeoutSeconds === "number") headers["Upstash-Timeout"] = `${args.timeoutSeconds}s`;
+
+  // IMPORTANT: Some QStash plans enforce a maximum allowed retries quota.
+  // When that quota is exceeded, QStash returns 412. We allow omitting this header
+  // entirely so the platform default can apply.
+  if (typeof args.retries === "number" && Number.isFinite(args.retries) && args.retries >= 0) {
+    headers["Upstash-Retries"] = String(Math.floor(args.retries));
+  }
+
+  if (typeof args.timeoutSeconds === "number" && Number.isFinite(args.timeoutSeconds) && args.timeoutSeconds > 0) {
+    // QStash accepts values like "120s".
+    headers["Upstash-Timeout"] = `${Math.floor(args.timeoutSeconds)}s`;
+  }
 
   try {
     const res = await fetch(endpoint, {
@@ -336,14 +346,35 @@ async function enqueueProcessJob(args: {
   }
 
   // Publish via HTTP API directly to avoid SDK version/option mismatches.
-  const published = await publishToQstash({
+  const requestedRetries = getQstashRetries();
+
+  let published = await publishToQstash({
     destinationUrl: targetUrl,
     body: payload,
     dedupeId,
-    retries: getQstashRetries(),
+    retries: requestedRetries,
     timeoutSeconds: 120,
   });
 
+  // HARDENING: Some plans reject custom retries with 412 even when the value seems valid.
+  // If we detect that specific quota error, retry once with NO Upstash-Retries header
+  // so QStash applies its default behavior.
+  if (
+    !published.ok &&
+    published.status === 412 &&
+    String(published.body || "").toLowerCase().includes("quota") &&
+    String(published.body || "").toLowerCase().includes("maxretries")
+  ) {
+    published = await publishToQstash({
+      destinationUrl: targetUrl,
+      body: payload,
+      dedupeId,
+      // omit retries header entirely
+      timeoutSeconds: 120,
+    });
+  }
+
+  // If still not ok, surface the error to the caller.
   if (!published.ok) {
     const txt = String(published.body || "").slice(0, 1200);
     return {
