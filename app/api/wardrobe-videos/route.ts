@@ -669,7 +669,13 @@ export async function POST(req: NextRequest) {
 
       if (video.status === "processed") {
         return NextResponse.json(
-          { ok: true, wardrobe_video: video, message: "Already processed" },
+          {
+            ok: true,
+            wardrobe_video: video,
+            // Back-compat for existing client bundle
+            video,
+            message: "Already processed",
+          },
           { status: 200, headers: { "Cache-Control": "no-store" } }
         );
       }
@@ -703,6 +709,9 @@ export async function POST(req: NextRequest) {
             last_process_retried: (video as any).last_process_retried ?? null,
             last_processed_at: (video as any).last_processed_at ?? null,
             enqueued: { ok: true, enqueued: false, reason: "already_processing" },
+            // Back-compat for existing client bundle
+            wardrobe_video: video,
+            video,
           },
           { status: 200, headers: { "Cache-Control": "no-store" } }
         );
@@ -742,6 +751,9 @@ export async function POST(req: NextRequest) {
             ok: false,
             wardrobe_video_id: video.id,
             wardrobe_video: { ...video, status: nextStatus },
+            // Back-compat for existing client bundle
+            video: { ...video, status: nextStatus },
+            qstash_retried: true,
             status: nextStatus,
             job_id: null,
             message_id: null,
@@ -799,15 +811,14 @@ export async function POST(req: NextRequest) {
           ok: true,
           wardrobe_video_id: video.id,
           wardrobe_video: updatedVideo ?? null,
+          // Back-compat for existing client bundle
+          video: updatedVideo ?? null,
+          qstash_retried: (updatedVideo as any)?.last_process_retried ?? wasRetry,
           status: (updatedVideo?.status ?? "processing") as any,
-          job_id:
-            (updatedVideo as any)?.last_process_message_id ?? messageId,
-          message_id:
-            (updatedVideo as any)?.last_process_message_id ?? messageId,
-          last_process_message_id:
-            (updatedVideo as any)?.last_process_message_id ?? messageId,
-          last_process_retried:
-            (updatedVideo as any)?.last_process_retried ?? wasRetry,
+          job_id: (updatedVideo as any)?.last_process_message_id ?? messageId,
+          message_id: (updatedVideo as any)?.last_process_message_id ?? messageId,
+          last_process_message_id: (updatedVideo as any)?.last_process_message_id ?? messageId,
+          last_process_retried: (updatedVideo as any)?.last_process_retried ?? wasRetry,
           last_processed_at: (updatedVideo as any)?.last_processed_at ?? null,
           enqueued: enqueue,
           update_error: (upd2 as any).error ?? null,
