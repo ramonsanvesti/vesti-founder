@@ -42,6 +42,18 @@ function clampInt(v: unknown, fallback: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+function getQstashRetries() {
+  // NOTE: Upstash QStash plan quota can cap maxRetries.
+  // We hard-cap at 3 to avoid 412 errors like:
+  // "quota maxRetries exceeded, current limit: 3".
+  const raw = asString(process.env.QSTASH_RETRIES);
+  if (!raw) return 3;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 3;
+  // clamp to [0, 3]
+  return Math.max(0, Math.min(3, Math.floor(n)));
+}
+
 // Helper: Retry update if column does not exist error is returned (Supabase)
 async function safeUpdateWardrobeVideo(
   supabase: ReturnType<typeof getSupabaseServerClient>,
@@ -328,7 +340,7 @@ async function enqueueProcessJob(args: {
     destinationUrl: targetUrl,
     body: payload,
     dedupeId,
-    retries: 5,
+    retries: getQstashRetries(),
     timeoutSeconds: 120,
   });
 
