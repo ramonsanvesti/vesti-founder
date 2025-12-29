@@ -1,25 +1,16 @@
 // app/api/wardrobe-videos/process/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServerClient } from "@/lib/supabaseClient.server";
-import { Client as QStashClient, Receiver as QStashReceiver } from "@upstash/qstash";
+import { Receiver as QStashReceiver } from "@upstash/qstash";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Founder-only scope (Founder Edition)
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
 
 type VideoStatus = "uploaded" | "processing" | "processed" | "failed";
-
-type ProcessActionBody = {
-  action: "process";
-  wardrobe_video_id: string;
-  force?: boolean;
-  sample_every_seconds?: number;
-  max_frames?: number;
-  max_width?: number;
-  max_candidates?: number;
-};
 
 type QStashJobBody = {
   wardrobe_video_id: string;
@@ -48,68 +39,16 @@ function clampInt(v: unknown, fallback: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
-function pickSiteUrl(req: NextRequest): string {
-  const explicit = asString(process.env.NEXT_PUBLIC_SITE_URL);
-  if (explicit) return explicit.replace(/\/$/, "");
-
-  // Vercel sets VERCEL_URL without protocol.
-  const vercelUrl = asString(process.env.VERCEL_URL);
-  if (vercelUrl) {
-    const proto = asString(req.headers.get("x-forwarded-proto")) || "https";
-    return `${proto}://${vercelUrl}`;
-  }
-
-  const proto = asString(req.headers.get("x-forwarded-proto")) || "https";
-  const host = asString(req.headers.get("x-forwarded-host")) || asString(req.headers.get("host"));
-  if (host) return `${proto}://${host}`;
-
-  return "";
-}
-
-async function verifyQStashOrThrow(req: NextRequest, rawBody: string) {
-  // In production we REQUIRE signature verification.
-  const signature = asString(
+function getUpstashSignature(req: NextRequest): string {
+  return asString(
     req.headers.get("upstash-signature") || req.headers.get("Upstash-Signature")
   );
-
-  const currentSigningKey = asString(process.env.QSTASH_CURRENT_SIGNING_KEY);
-  const nextSigningKey = asString(process.env.QSTASH_NEXT_SIGNING_KEY);
-
-  const isProd = process.env.NODE_ENV === "production";
-
-  if (!signature) {
-    if (isProd) throw new Error("Missing Upstash-Signature header");
-    return; // allow local/manual calls in dev
-  }
-
-  if (!currentSigningKey) {
-    if (isProd) throw new Error("Missing QSTASH_CURRENT_SIGNING_KEY");
-    return;
-  }
-
-  const siteUrl = pickSiteUrl(req);
-  const url = siteUrl ? `${siteUrl}${req.nextUrl.pathname}` : req.nextUrl.toString();
-
-  // ReceiverConfig expects both keys. If NEXT key is not set yet, reuse the current key.
-  // (Rotation is optional; verification still works with a single key.)
-  const receiverConfig = {
-    currentSigningKey,
-    nextSigningKey: nextSigningKey || currentSigningKey,
-  };
-
-  const receiver = new QStashReceiver(receiverConfig);
-
-  const ok = await receiver.verify({
-    signature,
-    body: rawBody,
-    url,
-  });
-
-  if (!ok) throw new Error("Invalid QStash signature");
 }
 
 function getUpstashMessageId(req: NextRequest): string {
-  return asString(req.headers.get("upstash-message-id") || req.headers.get("Upstash-Message-Id"));
+  return asString(
+    req.headers.get("upstash-message-id") || req.headers.get("Upstash-Message-Id")
+  );
 }
 
 function getUpstashRetryCount(req: NextRequest): number {
@@ -119,6 +58,42 @@ function getUpstashRetryCount(req: NextRequest): number {
     0,
     99
   );
+}
+
+async function verifyQStashOrThrow(req: NextRequest, rawBody: string) {
+  // Production MUST be verified.
+  // Dev: allow local/manual calls (no signature), but if a signature is present, verify it.
+  const signature = getUpstashSignature(req);
+  const isProd = process.env.NODE_ENV === "production";
+
+  if (!signature) {
+    if (isProd) throw new Error("Missing Upstash-Signature header");
+    return;
+  }
+
+  const currentSigningKey = asString(process.env.QSTASH_CURRENT_SIGNING_KEY);
+  const nextSigningKey = asString(process.env.QSTASH_NEXT_SIGNING_KEY);
+
+  if (!currentSigningKey) {
+    throw new Error("Missing QSTASH_CURRENT_SIGNING_KEY");
+  }
+
+  // ReceiverConfig requires strings; if NEXT is not set, reuse CURRENT.
+  const receiver = new QStashReceiver({
+    currentSigningKey,
+    nextSigningKey: nextSigningKey || currentSigningKey,
+  });
+
+  // Must be the EXACT URL QStash called, including scheme.
+  const url = req.nextUrl.toString();
+
+  const ok = await receiver.verify({
+    signature,
+    body: rawBody,
+    url,
+  });
+
+  if (!ok) throw new Error("Invalid QStash signature");
 }
 
 async function loadVideoRow(supabase: any, wardrobe_video_id: string) {
@@ -134,8 +109,9 @@ async function loadVideoRow(supabase: any, wardrobe_video_id: string) {
 
 /**
  * POST /api/wardrobe-videos/process
- * - UI enqueue: { action: 'process', wardrobe_video_id, ... }
- * - QStash execution: { wardrobe_video_id, ... } + Upstash-Signature header
+ *
+ * QStash *worker* (execution endpoint).
+ * It should be called by QStash (signed) after /api/wardrobe-videos enqueues a job.
  */
 export async function POST(req: NextRequest) {
   const supabase = getSupabaseServerClient();
@@ -149,179 +125,213 @@ export async function POST(req: NextRequest) {
     }
   })();
 
+  // Reject accidental UI calls that send { action: "process" }
+  if (parsed && typeof parsed === "object" && (parsed as any).action) {
+    return jsonNoStore(
+      {
+        ok: false,
+        error:
+          "This endpoint is the QStash worker. Use POST /api/wardrobe-videos with { action: 'process', wardrobe_video_id }.",
+      },
+      400
+    );
+  }
+
+  const body = (parsed ?? {}) as Partial<QStashJobBody>;
+  const wardrobe_video_id = asString(body.wardrobe_video_id);
+  if (!wardrobe_video_id) {
+    return jsonNoStore({ ok: false, error: "Missing wardrobe_video_id" }, 400);
+  }
+
+  // Verify signature (required in prod)
+  try {
+    await verifyQStashOrThrow(req, raw);
+  } catch (e: any) {
+    return jsonNoStore({ ok: false, error: e?.message || "Unauthorized" }, 401);
+  }
+
+  const incomingMessageId = getUpstashMessageId(req) || null;
+  const retryCount = getUpstashRetryCount(req);
+  const force = Boolean(body.force);
+
+  const { data: video, error: vErr } = await loadVideoRow(
+    supabase,
+    wardrobe_video_id
+  );
+  if (vErr || !video) {
+    return jsonNoStore({ ok: false, error: "Video not found" }, 404);
+  }
+
+  // Supersession guard: if UI already enqueued a newer job, skip this run.
+  if (
+    incomingMessageId &&
+    video.last_process_message_id &&
+    incomingMessageId !== video.last_process_message_id &&
+    !force
+  ) {
+    return jsonNoStore(
+      {
+        ok: true,
+        message: "Superseded by newer job",
+        video_id: wardrobe_video_id,
+        incoming_message_id: incomingMessageId,
+        expected_message_id: video.last_process_message_id,
+      },
+      200
+    );
+  }
+
+  // If already processed, acknowledge idempotently.
+  if (video.status === "processed" && video.last_processed_at && !force) {
+    return jsonNoStore(
+      {
+        ok: true,
+        message: "Already processed",
+        video_id: wardrobe_video_id,
+        message_id: incomingMessageId,
+        retry_count: retryCount,
+      },
+      200
+    );
+  }
+
+  // CLAIM the job to prevent concurrent retries from racing.
+  // Only one worker (messageId) should be allowed to proceed unless force.
+  // If messageId is missing (dev/manual), only allow when no message is stored.
+  {
+    const claimUpdate: Record<string, any> = {
+      status: "processing" as VideoStatus,
+    };
+    if (incomingMessageId) claimUpdate.last_process_message_id = incomingMessageId;
+    if (retryCount > 0) claimUpdate.last_process_retried = true;
+
+    let claim = supabase
+      .from("wardrobe_videos")
+      .update(claimUpdate)
+      .eq("id", wardrobe_video_id)
+      .eq("user_id", FOUNDER_USER_ID);
+
+    if (!force) {
+      if (incomingMessageId) {
+        // allow if NULL or same message id
+        claim = claim.or(
+          `last_process_message_id.is.null,last_process_message_id.eq.${incomingMessageId}`
+        );
+      } else {
+        // manual/dev call: only if there isn't already a claimed message
+        claim = claim.is("last_process_message_id", null);
+      }
+    }
+
+    const { data: claimed, error: cErr } = await claim
+      .select(
+        "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
+      )
+      .single();
+
+    // If claim didn't match (0 rows), someone else owns it now.
+    if (cErr || !claimed) {
+      return jsonNoStore(
+        {
+          ok: true,
+          message: "Not claimed (another worker/job owns this video)",
+          video_id: wardrobe_video_id,
+          message_id: incomingMessageId,
+          retry_count: retryCount,
+        },
+        200
+      );
+    }
+  }
+
   // -----------------------------
-  // 1) QStash execution path
+  // PROCESSING PIPELINE
   // -----------------------------
-  if (parsed && typeof parsed === "object" && !(parsed as any).action && (parsed as any).wardrobe_video_id) {
-    try {
-      await verifyQStashOrThrow(req, raw);
-    } catch (e: any) {
-      return jsonNoStore({ ok: false, error: e?.message || "Unauthorized" }, 401);
-    }
+  // NOTE: keep this idempotent. If any step is retried, it should not corrupt the record.
+  // For now we only flip to processed. Next tickets will implement frame extraction + candidate creation.
 
-    const body = parsed as QStashJobBody;
-    const wardrobe_video_id = asString(body.wardrobe_video_id);
-    if (!wardrobe_video_id) return jsonNoStore({ ok: false, error: "Missing wardrobe_video_id" }, 400);
+  try {
+    // TODO (VESTI-5.4 .. 5.6):
+    // - Extract frames (ephemeral)
+    // - Detect garment candidates
+    // - Insert candidate rows linked to wardrobe_video_id
 
-    const incomingMessageId = getUpstashMessageId(req);
-    const retryCount = getUpstashRetryCount(req);
+    const nowIso = new Date().toISOString();
 
-    const { data: video, error: vErr } = await loadVideoRow(supabase, wardrobe_video_id);
-    if (vErr || !video) return jsonNoStore({ ok: false, error: "Video not found" }, 404);
-
-    // Idempotency: already processed => acknowledge.
-    if (video.status === "processed" && video.last_processed_at) {
-      return jsonNoStore({ ok: true, message: "Already processed", video_id: wardrobe_video_id }, 200);
-    }
-
-    // Persist trace fields (best effort)
-    if (incomingMessageId && video.last_process_message_id !== incomingMessageId) {
-      await supabase
-        .from("wardrobe_videos")
-        .update({ last_process_message_id: incomingMessageId })
-        .eq("id", wardrobe_video_id)
-        .eq("user_id", FOUNDER_USER_ID);
-    }
-
-    if (retryCount > 0) {
-      await supabase
-        .from("wardrobe_videos")
-        .update({ last_process_retried: true })
-        .eq("id", wardrobe_video_id)
-        .eq("user_id", FOUNDER_USER_ID);
-    }
-
-    // TODO (next tickets):
-    // - Extract frames (ffmpeg)
-    // - Detect candidates
-    // - Insert candidate rows
-
-    const { error: doneErr } = await supabase
+    let done = supabase
       .from("wardrobe_videos")
       .update({
         status: "processed" as VideoStatus,
-        last_processed_at: new Date().toISOString(),
+        last_processed_at: nowIso,
       })
       .eq("id", wardrobe_video_id)
       .eq("user_id", FOUNDER_USER_ID);
 
-    if (doneErr) {
-      // Return 200 to avoid hammering retries; we record failure state.
-      await supabase
-        .from("wardrobe_videos")
-        .update({ status: "failed" as VideoStatus })
-        .eq("id", wardrobe_video_id)
-        .eq("user_id", FOUNDER_USER_ID);
-
-      return jsonNoStore({ ok: false, error: doneErr.message, video_id: wardrobe_video_id }, 200);
+    // Prevent older/superseded workers from flipping the state after a newer job took over.
+    if (!force) {
+      if (incomingMessageId) done = done.eq("last_process_message_id", incomingMessageId);
+      else done = done.is("last_process_message_id", null);
     }
 
-    return jsonNoStore({ ok: true, message: "Processed", video_id: wardrobe_video_id }, 200);
-  }
+    const { data: updated, error: doneErr } = await done
+      .select(
+        "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
+      )
+      .single();
 
-  // -----------------------------
-  // 2) UI enqueue path
-  // -----------------------------
-  const body = parsed as ProcessActionBody | null;
-  if (!body || body.action !== "process") {
-    return jsonNoStore({ ok: false, error: "Unsupported request" }, 400);
-  }
+    if (doneErr || !updated) {
+      // If we didn't match due to supersession, treat as success (no retries needed)
+      return jsonNoStore(
+        {
+          ok: true,
+          message: "Completed but not applied (superseded)",
+          video_id: wardrobe_video_id,
+          message_id: incomingMessageId,
+          retry_count: retryCount,
+        },
+        200
+      );
+    }
 
-  const videoId = asString(body.wardrobe_video_id);
-  if (!videoId) return jsonNoStore({ ok: false, error: "Missing wardrobe_video_id" }, 400);
+    return jsonNoStore(
+      {
+        ok: true,
+        message: "Processed",
+        video_id: wardrobe_video_id,
+        message_id: incomingMessageId,
+        retry_count: retryCount,
+        video: updated,
+      },
+      200
+    );
+  } catch (err: any) {
+    // Mark failed, but only if this worker still owns the message_id (race-safe)
+    let fail = supabase
+      .from("wardrobe_videos")
+      .update({
+        status: "failed" as VideoStatus,
+        last_process_retried: retryCount > 0,
+      })
+      .eq("id", wardrobe_video_id)
+      .eq("user_id", FOUNDER_USER_ID);
 
-  const { data: video, error: vErr } = await loadVideoRow(supabase, videoId);
-  if (vErr || !video) return jsonNoStore({ ok: false, error: "Video not found" }, 404);
+    if (!force) {
+      if (incomingMessageId) fail = fail.eq("last_process_message_id", incomingMessageId);
+      else fail = fail.is("last_process_message_id", null);
+    }
 
-  const force = Boolean(body.force);
+    await fail;
 
-  // True idempotency: if already processing and we have a job id, do not enqueue again.
-  if (video.status === "processing" && video.last_process_message_id && !force) {
-    return jsonNoStore({
-      ok: true,
-      message: "Already processing",
-      job_id: video.last_process_message_id,
-      video,
-    });
-  }
-
-  const siteUrl = pickSiteUrl(req);
-  if (!siteUrl) {
+    // Return non-2xx to allow QStash retries (safe because we claim + guard by message_id)
     return jsonNoStore(
       {
         ok: false,
-        error: "Missing site url. Set NEXT_PUBLIC_SITE_URL or ensure VERCEL_URL exists.",
+        error: err?.message || "Processing failed",
+        video_id: wardrobe_video_id,
+        message_id: incomingMessageId,
+        retry_count: retryCount,
       },
       500
     );
   }
-
-  const token = asString(process.env.QSTASH_TOKEN);
-  if (!token) return jsonNoStore({ ok: false, error: "Missing QSTASH_TOKEN" }, 500);
-
-  const qstash = new QStashClient({ token });
-  const callbackUrl = `${siteUrl}/api/wardrobe-videos/process`;
-
-  const sample_every_seconds = clampInt(body.sample_every_seconds, 2, 1, 10);
-  const max_frames = clampInt(body.max_frames, 24, 6, 120);
-  const max_width = clampInt(body.max_width, 960, 480, 1920);
-  const max_candidates = clampInt(body.max_candidates, 12, 1, 25);
-
-  // QStash dedupe: same videoId = same queue message (unless force).
-  const dedupeId = force ? `wardrobe_video:${videoId}:${Date.now()}` : `wardrobe_video:${videoId}`;
-
-  const publishResult: any = await qstash.publishJSON({
-    url: callbackUrl,
-    body: {
-      wardrobe_video_id: videoId,
-      sample_every_seconds,
-      max_frames,
-      max_width,
-      max_candidates,
-      force,
-      reason: "user_click",
-    } satisfies QStashJobBody,
-    headers: { "Content-Type": "application/json" },
-    deduplicationId: dedupeId,
-  });
-
-  const messageId =
-    (typeof publishResult?.messageId === "string" && publishResult.messageId) ||
-    (typeof publishResult?.message_id === "string" && publishResult.message_id) ||
-    null;
-
-  if (!messageId) {
-    await supabase
-      .from("wardrobe_videos")
-      .update({ status: "failed" as VideoStatus })
-      .eq("id", videoId)
-      .eq("user_id", FOUNDER_USER_ID);
-
-    return jsonNoStore({ ok: false, error: "QStash publish returned no message id" }, 500);
-  }
-
-  // Persist processing + message id BEFORE returning.
-  const { data: updated, error: upErr } = await supabase
-    .from("wardrobe_videos")
-    .update({
-      status: "processing" as VideoStatus,
-      last_process_message_id: messageId,
-      last_process_retried: false,
-    })
-    .eq("id", videoId)
-    .eq("user_id", FOUNDER_USER_ID)
-    .select(
-      "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
-    )
-    .single();
-
-  if (upErr || !updated) {
-    return jsonNoStore({ ok: false, error: upErr?.message || "Failed to persist job id" }, 500);
-  }
-
-  return jsonNoStore({
-    ok: true,
-    job_id: messageId,
-    video: updated,
-  });
 }
