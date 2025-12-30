@@ -47,7 +47,7 @@ type VideoRow = {
   video_url: string;
   created_at: string;
   last_process_message_id?: string | null;
-  last_process_retried?: boolean | null;
+  last_process_retried?: number | null;
   last_processed_at?: string | null;
 };
 
@@ -222,13 +222,16 @@ async function enqueueProcessJob(args: {
     `wardrobe_video-${wardrobeVideoId}-process-${sampleEverySeconds}-${maxFrames}-${maxWidth}-${maxCandidates}`
   );
 
+  const maxRetries = String(clampInt(process.env.QSTASH_MAX_RETRIES, 3, 0, 3));
+
   const headers = {
     Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
     "Content-Type": "application/json",
     // QStash controls
     "Upstash-Method": "POST",
+    "Upstash-Content-Type": "application/json",
     "Upstash-Deduplication-Id": dedupeId,
-    "Upstash-Retries": "5",
+    "Upstash-Retries": maxRetries,
     "Upstash-Timeout": "120",
   } as Record<string, string>;
 
@@ -487,7 +490,7 @@ export async function POST(req: NextRequest) {
           .from("wardrobe_videos")
           .update({
             last_process_message_id: enqueued.message_id,
-            last_process_retried: false,
+            last_process_retried: 0,
           })
           .eq("id", row.id)
           .eq("user_id", FOUNDER_USER_ID);
