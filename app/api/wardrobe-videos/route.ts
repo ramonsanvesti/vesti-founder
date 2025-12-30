@@ -78,13 +78,36 @@ function clampInt(v: unknown, fallback: number, min: number, max: number) {
 }
 
 function getBaseUrl(req: NextRequest) {
-  // Works for Vercel + local dev
-  const url = req.nextUrl;
-  const origin = url?.origin;
-  if (origin) return origin;
-  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "";
-  const proto = req.headers.get("x-forwarded-proto") ?? "https";
-  return `${proto}://${host}`;
+  // Prefer Next.js' parsed URL when it includes a real scheme.
+  const origin = req.nextUrl?.origin;
+  if (origin && /^https?:\/\//i.test(origin)) return origin;
+
+  // Otherwise derive from forwarded headers (Vercel) or env.
+  const proto = (req.headers.get("x-forwarded-proto") ?? "https").split(",")[0].trim();
+  const hostHeader =
+    (req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "").split(",")[0].trim();
+
+  const envHost =
+    (process.env.NEXT_PUBLIC_SITE_URL ??
+      process.env.SITE_URL ??
+      process.env.VERCEL_URL ??
+      "")
+      .trim()
+      .replace(/^https?:\/\//i, "");
+
+  const host = hostHeader || envHost;
+  if (!host) {
+    // Last-resort fallback for local/dev.
+    return `${proto}://localhost:3000`;
+  }
+
+  const candidate = /^https?:\/\//i.test(host) ? host : `${proto}://${host}`;
+  try {
+    return new URL(candidate).origin;
+  } catch {
+    // If parsing fails, return the best-effort candidate.
+    return candidate;
+  }
 }
 
 function isConfiguredQStash() {
@@ -133,7 +156,7 @@ async function enqueueProcessJob(args: {
 }) {
   const { baseUrl, wardrobeVideoId, sampleEverySeconds, maxFrames, maxWidth, maxCandidates } = args;
 
-  const targetUrl = `${baseUrl}/api/wardrobe-videos/process`;
+  const targetUrl = new URL("/api/wardrobe-videos/process", baseUrl).toString();
   const payload = {
     wardrobe_video_id: wardrobeVideoId,
     sample_every_seconds: sampleEverySeconds,
