@@ -223,6 +223,7 @@ async function enqueueProcessJob(args: {
   );
 
   const maxRetries = String(clampInt(process.env.QSTASH_MAX_RETRIES, 3, 0, 3));
+  const timeoutSeconds = clampInt(process.env.QSTASH_TIMEOUT_SECONDS, 120, 1, 300);
 
   const headers = {
     Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
@@ -232,7 +233,7 @@ async function enqueueProcessJob(args: {
     "Upstash-Content-Type": "application/json",
     "Upstash-Deduplication-Id": dedupeId,
     "Upstash-Retries": maxRetries,
-    "Upstash-Timeout": "120",
+    "Upstash-Timeout": `${timeoutSeconds}s`,
   } as Record<string, string>;
 
   // First attempt: raw destination in the path (matches Upstash docs).
