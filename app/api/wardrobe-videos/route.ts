@@ -246,7 +246,7 @@ export async function GET(_req: NextRequest) {
     if (error) {
       return NextResponse.json(
         { ok: false, error: "Failed to load video history", details: error.message },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
+        { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
       );
     }
 
@@ -255,12 +255,12 @@ export async function GET(_req: NextRequest) {
 
     return NextResponse.json(
       { ok: true, videos: withUrls },
-      { status: 200, headers: { "Cache-Control": "no-store" } }
+      { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
     );
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
+      { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
     );
   }
 }
@@ -270,6 +270,7 @@ export async function OPTIONS() {
     status: 204,
     headers: {
       "Cache-Control": "no-store",
+      Allow: "GET,POST,OPTIONS",
     },
   });
 }
@@ -290,7 +291,7 @@ export async function POST(req: NextRequest) {
       if (!isFileLike) {
         return NextResponse.json(
           { ok: false, error: "Missing video file (field name must be 'video')" },
-          { status: 400, headers: { "Cache-Control": "no-store" } }
+          { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
         );
       }
 
@@ -311,7 +312,7 @@ export async function POST(req: NextRequest) {
       if (uploadErr) {
         return NextResponse.json(
           { ok: false, error: "Video upload failed", details: uploadErr.message },
-          { status: 500, headers: { "Cache-Control": "no-store" } }
+          { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
         );
       }
 
@@ -330,7 +331,7 @@ export async function POST(req: NextRequest) {
       if (insertErr || !inserted) {
         return NextResponse.json(
           { ok: false, error: "Failed to create wardrobe video row", details: insertErr?.message },
-          { status: 500, headers: { "Cache-Control": "no-store" } }
+          { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
         );
       }
 
@@ -343,7 +344,7 @@ export async function POST(req: NextRequest) {
           wardrobe_video: withUrl,
           video: withUrl,
         },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
       );
     }
 
@@ -355,7 +356,7 @@ export async function POST(req: NextRequest) {
       if (!wardrobeVideoId) {
         return NextResponse.json(
           { ok: false, error: "Missing wardrobe_video_id" },
-          { status: 400, headers: { "Cache-Control": "no-store" } }
+          { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
         );
       }
 
@@ -378,7 +379,7 @@ export async function POST(req: NextRequest) {
       if (loadErr || !row) {
         return NextResponse.json(
           { ok: false, error: "Video not found", details: loadErr?.message ?? "missing row" },
-          { status: 404, headers: { "Cache-Control": "no-store" } }
+          { status: 404, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
         );
       }
 
@@ -441,7 +442,7 @@ export async function POST(req: NextRequest) {
           error: enqueued?.ok ? null : (enqueued as any)?.details ?? "Failed to enqueue processing job",
           error_details: !enqueued?.ok ? JSON.stringify((enqueued as any)?.qstash_error ?? {}) : null,
         },
-        { status: enqueued?.ok ? 200 : 500, headers: { "Cache-Control": "no-store" } }
+        { status: enqueued?.ok ? 200 : 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
       );
     }
 
@@ -450,7 +451,7 @@ export async function POST(req: NextRequest) {
     if (!videoUrl) {
       return NextResponse.json(
         { ok: false, error: "Unsupported request. Use multipart upload or {action:'process'}" },
-        { status: 400, headers: { "Cache-Control": "no-store" } }
+        { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
       );
     }
 
@@ -469,7 +470,7 @@ export async function POST(req: NextRequest) {
     if (insertErr || !inserted) {
       return NextResponse.json(
         { ok: false, error: "Failed to create wardrobe video row", details: insertErr?.message },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
+        { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
       );
     }
 
@@ -477,12 +478,12 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json(
       { ok: true, wardrobe_video: withUrl, video: withUrl },
-      { status: 200, headers: { "Cache-Control": "no-store" } }
+      { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
     );
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
+      { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
     );
   }
 }
