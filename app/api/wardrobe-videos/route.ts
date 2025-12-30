@@ -113,8 +113,10 @@ function isConfiguredQStash() {
 }
 
 function qstashPublishUrl(targetUrl: string) {
-  // QStash publish endpoint format
-  return `https://qstash.upstash.io/v2/publish/${encodeURIComponent(targetUrl)}`;
+  // QStash expects the destination URL appended raw (not encodeURIComponent).
+  // Example: https://qstash.upstash.io/v2/publish/https://example.com/api/job
+  // `encodeURI` is safe here (keeps `https://` intact, only encodes spaces etc.).
+  return `https://qstash.upstash.io/v2/publish/${encodeURI(targetUrl)}`;
 }
 
 function safeDedupeId(raw: string) {
@@ -155,6 +157,16 @@ async function enqueueProcessJob(args: {
   const { req, wardrobeVideoId, sampleEverySeconds, maxFrames, maxWidth, maxCandidates } = args;
 
   const targetUrl = getAbsoluteUrl(req, "/api/wardrobe-videos/process");
+  if (!/^https?:\/\//i.test(targetUrl)) {
+    return {
+      ok: false,
+      enqueued: false,
+      target_url: targetUrl,
+      dedupe_id: null,
+      message_id: null,
+      details: "Invalid destination URL (missing http/https scheme).",
+    };
+  }
   const payload = {
     wardrobe_video_id: wardrobeVideoId,
     sample_every_seconds: sampleEverySeconds,
