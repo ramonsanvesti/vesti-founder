@@ -77,37 +77,35 @@ function clampInt(v: unknown, fallback: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
-function getBaseUrl(req: NextRequest) {
+function getAbsoluteUrl(req: NextRequest, path: string) {
   // Prefer Next.js' parsed URL when it includes a real scheme.
   const origin = req.nextUrl?.origin;
-  if (origin && /^https?:\/\//i.test(origin)) return origin;
+  if (origin && /^https?:\/\//i.test(origin)) {
+    return new URL(path, origin).toString();
+  }
 
   // Otherwise derive from forwarded headers (Vercel) or env.
-  const proto = (req.headers.get("x-forwarded-proto") ?? "https").split(",")[0].trim();
+  const protoRaw = req.headers.get("x-forwarded-proto") ?? "https";
+  const proto = (protoRaw.split(",")[0].trim() || "https").replace(/:$/, "");
+
   const hostHeader =
-    (req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "").split(",")[0].trim();
+    (req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "")
+      .split(",")[0]
+      .trim();
 
-  const envHost =
-    (process.env.NEXT_PUBLIC_SITE_URL ??
-      process.env.SITE_URL ??
-      process.env.VERCEL_URL ??
-      "")
-      .trim()
-      .replace(/^https?:\/\//i, "");
-
-  const host = hostHeader || envHost;
-  if (!host) {
-    // Last-resort fallback for local/dev.
-    return `${proto}://localhost:3000`;
+  // If you provide an explicit site URL, it must include the scheme.
+  const envOrigin = (process.env.NEXT_PUBLIC_SITE_URL ?? process.env.SITE_URL ?? "").trim();
+  if (envOrigin && /^https?:\/\//i.test(envOrigin)) {
+    return new URL(path, envOrigin).toString();
   }
 
-  const candidate = /^https?:\/\//i.test(host) ? host : `${proto}://${host}`;
-  try {
-    return new URL(candidate).origin;
-  } catch {
-    // If parsing fails, return the best-effort candidate.
-    return candidate;
-  }
+  // VERCEL_URL typically has no scheme.
+  const envHost = (process.env.VERCEL_URL ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "");
+
+  const host = hostHeader || envHost || "localhost:3000";
+  return new URL(path, `${proto}://${host}`).toString();
 }
 
 function isConfiguredQStash() {
@@ -147,16 +145,16 @@ async function attachSignedUrl(
 }
 
 async function enqueueProcessJob(args: {
-  baseUrl: string;
+  req: NextRequest;
   wardrobeVideoId: string;
   sampleEverySeconds: number;
   maxFrames: number;
   maxWidth: number;
   maxCandidates: number;
 }) {
-  const { baseUrl, wardrobeVideoId, sampleEverySeconds, maxFrames, maxWidth, maxCandidates } = args;
+  const { req, wardrobeVideoId, sampleEverySeconds, maxFrames, maxWidth, maxCandidates } = args;
 
-  const targetUrl = new URL("/api/wardrobe-videos/process", baseUrl).toString();
+  const targetUrl = getAbsoluteUrl(req, "/api/wardrobe-videos/process");
   const payload = {
     wardrobe_video_id: wardrobeVideoId,
     sample_every_seconds: sampleEverySeconds,
@@ -392,9 +390,8 @@ export async function POST(req: NextRequest) {
           .eq("user_id", FOUNDER_USER_ID);
       }
 
-      const baseUrl = getBaseUrl(req);
       const enqueued = await enqueueProcessJob({
-        baseUrl,
+        req,
         wardrobeVideoId: row.id,
         sampleEverySeconds,
         maxFrames,

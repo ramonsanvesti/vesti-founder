@@ -1,7 +1,13 @@
-// app/api/wardrobe-videos/process/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
+
+function getAbsoluteUrl(req: NextRequest, path: string) {
+  const proto = req.headers.get("x-forwarded-proto") ?? "https";
+  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
+  if (!host) throw new Error("Missing host header");
+  return new URL(path, `${proto}://${host}`).toString();
+}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
