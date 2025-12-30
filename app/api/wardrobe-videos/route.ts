@@ -6,6 +6,8 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
+const RESPONSE_HEADERS = { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } as const;
+
 // Founder Edition: single-user scope
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
@@ -130,7 +132,7 @@ function getAbsoluteUrl(req: NextRequest, path: string) {
 }
 
 function isConfiguredQStash() {
-  return !!process.env.QSTASH_TOKEN;
+  return typeof process.env.QSTASH_TOKEN === "string" && process.env.QSTASH_TOKEN.trim().length > 0;
 }
 
 function qstashPublishUrl(targetUrl: string, mode: "raw" | "encoded" = "raw") {
@@ -143,10 +145,9 @@ function qstashPublishUrl(targetUrl: string, mode: "raw" | "encoded" = "raw") {
 }
 
 function safeDedupeId(raw: string) {
-  // QStash DeduplicationId cannot contain ':' (and keeping it url/header safe is best).
-  // Allow only alnum, '-', '_' and '.'
+  // Keep deterministic and header-safe; Upstash commonly enforces short dedupe IDs.
   const cleaned = raw.replace(/[^a-zA-Z0-9._-]+/g, "_");
-  return cleaned.slice(0, 190);
+  return cleaned.length <= 64 ? cleaned : cleaned.slice(0, 64);
 }
 
 async function attachSignedUrl(
@@ -198,8 +199,20 @@ async function enqueueProcessJob(args: {
     max_candidates: maxCandidates,
   };
 
-  // If QStash isn't configured, fall back to direct call (dev-friendly).
+  // If QStash isn't configured, NEVER process inline in production.
   if (!isConfiguredQStash()) {
+    if (process.env.NODE_ENV === "production") {
+      return {
+        ok: false,
+        enqueued: false,
+        target_url: targetUrl,
+        dedupe_id: null,
+        message_id: null,
+        details: "QStash is not configured in production.",
+      };
+    }
+
+    // Dev-friendly fallback: allow direct processing when not in production.
     const res = await fetch(targetUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -214,7 +227,7 @@ async function enqueueProcessJob(args: {
       target_url: targetUrl,
       dedupe_id: null,
       message_id: null,
-      details: ok ? "Processed directly (QStash not configured)." : "Direct process call failed.",
+      details: ok ? "Processed directly (dev; QStash not configured)." : "Direct process call failed (dev).",
     };
   }
 
@@ -330,7 +343,7 @@ export async function GET(_req: NextRequest) {
     if (error) {
       return NextResponse.json(
         { ok: false, error: "Failed to load video history", details: error.message },
-        { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+        { status: 500, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -339,12 +352,12 @@ export async function GET(_req: NextRequest) {
 
     return NextResponse.json(
       { ok: true, videos: withUrls },
-      { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+      { status: 200, headers: RESPONSE_HEADERS }
     );
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+      { status: 500, headers: RESPONSE_HEADERS }
     );
   }
 }
@@ -352,10 +365,7 @@ export async function GET(_req: NextRequest) {
 export async function OPTIONS() {
   return new NextResponse(null, {
     status: 204,
-    headers: {
-      "Cache-Control": "no-store",
-      Allow: "GET,POST,OPTIONS",
-    },
+    headers: RESPONSE_HEADERS,
   });
 }
 
@@ -375,7 +385,7 @@ export async function POST(req: NextRequest) {
       if (!isFileLike) {
         return NextResponse.json(
           { ok: false, error: "Missing video file (field name must be 'video')" },
-          { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+          { status: 400, headers: RESPONSE_HEADERS }
         );
       }
 
@@ -396,7 +406,7 @@ export async function POST(req: NextRequest) {
       if (uploadErr) {
         return NextResponse.json(
           { ok: false, error: "Video upload failed", details: uploadErr.message },
-          { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+          { status: 500, headers: RESPONSE_HEADERS }
         );
       }
 
@@ -415,8 +425,43 @@ export async function POST(req: NextRequest) {
       if (insertErr || !inserted) {
         return NextResponse.json(
           { ok: false, error: "Failed to create wardrobe video row", details: insertErr?.message },
-          { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+          { status: 500, headers: RESPONSE_HEADERS }
         );
+      }
+
+      // Automatically enqueue processing by default (async via QStash)
+      const enqueued = await enqueueProcessJob({
+        req,
+        wardrobeVideoId: inserted.id,
+        sampleEverySeconds: 3,
+        maxFrames: 20,
+        maxWidth: 900,
+        maxCandidates: 12,
+      });
+
+      // Mark as processing ONLY if the job was accepted/enqueued.
+      if (enqueued.ok && enqueued.enqueued) {
+        const { data: updatedRow } = await supabase
+          .from("wardrobe_videos")
+          .update({
+            status: "processing",
+            last_process_message_id: enqueued.message_id,
+            last_process_retried: 0,
+          })
+          .eq("id", inserted.id)
+          .eq("user_id", FOUNDER_USER_ID)
+          .select(
+            "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+          )
+          .single();
+
+        if (updatedRow) {
+          (inserted as any).status = (updatedRow as any).status;
+          (inserted as any).last_process_message_id = (updatedRow as any).last_process_message_id;
+          (inserted as any).last_process_retried = (updatedRow as any).last_process_retried;
+        } else {
+          (inserted as any).status = "processing";
+        }
       }
 
       const withUrl = await attachSignedUrl(supabase, inserted as VideoRow);
@@ -424,11 +469,19 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           ok: true,
+          wardrobe_video_id: (withUrl as any).id,
           signed_url: (withUrl as any).signed_url ?? null,
           wardrobe_video: withUrl,
           video: withUrl,
+          status: (withUrl as any)?.status ?? "uploaded",
+          enqueued: (withUrl as any)?.status === "processing",
+          message_id: (withUrl as any)?.last_process_message_id ?? null,
+          enqueue: enqueued,
         },
-        { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+        {
+          status: (withUrl as any)?.status === "processing" ? 202 : 201,
+          headers: RESPONSE_HEADERS,
+        }
       );
     }
 
@@ -440,7 +493,7 @@ export async function POST(req: NextRequest) {
       if (!wardrobeVideoId) {
         return NextResponse.json(
           { ok: false, error: "Missing wardrobe_video_id" },
-          { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+          { status: 400, headers: RESPONSE_HEADERS }
         );
       }
 
@@ -463,18 +516,10 @@ export async function POST(req: NextRequest) {
       if (loadErr || !row) {
         return NextResponse.json(
           { ok: false, error: "Video not found", details: loadErr?.message ?? "missing row" },
-          { status: 404, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+          { status: 404, headers: RESPONSE_HEADERS }
         );
       }
 
-      // Mark processing (idempotent)
-      if (String(row.status) !== "processing") {
-        await supabase
-          .from("wardrobe_videos")
-          .update({ status: "processing" })
-          .eq("id", row.id)
-          .eq("user_id", FOUNDER_USER_ID);
-      }
 
       const enqueued = await enqueueProcessJob({
         req,
@@ -485,11 +530,12 @@ export async function POST(req: NextRequest) {
         maxCandidates,
       });
 
-      // Persist message id if present
-      if (enqueued?.message_id) {
+      // Mark processing ONLY if job was accepted/enqueued.
+      if (enqueued.ok && enqueued.enqueued) {
         await supabase
           .from("wardrobe_videos")
           .update({
+            status: "processing",
             last_process_message_id: enqueued.message_id,
             last_process_retried: 0,
           })
@@ -525,7 +571,7 @@ export async function POST(req: NextRequest) {
           error: enqueued?.ok ? null : (enqueued as any)?.details ?? "Failed to enqueue processing job",
           error_details: !enqueued?.ok ? JSON.stringify((enqueued as any)?.qstash_error ?? {}) : null,
         },
-        { status: enqueued?.ok ? 200 : 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+        { status: enqueued?.ok ? 202 : 500, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -534,9 +580,11 @@ export async function POST(req: NextRequest) {
     if (!videoUrl) {
       return NextResponse.json(
         { ok: false, error: "Unsupported request. Use multipart upload or {action:'process'}" },
-        { status: 400, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+        { status: 400, headers: RESPONSE_HEADERS }
       );
     }
+
+    const autoProcess = (body as CreateBody)?.auto_process !== false;
 
     const { data: inserted, error: insertErr } = await supabase
       .from("wardrobe_videos")
@@ -553,20 +601,68 @@ export async function POST(req: NextRequest) {
     if (insertErr || !inserted) {
       return NextResponse.json(
         { ok: false, error: "Failed to create wardrobe video row", details: insertErr?.message },
-        { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+        { status: 500, headers: RESPONSE_HEADERS }
       );
+    }
+
+    let enqueued: any = null;
+    if (autoProcess) {
+      enqueued = await enqueueProcessJob({
+        req,
+        wardrobeVideoId: inserted.id,
+        sampleEverySeconds: 3,
+        maxFrames: 20,
+        maxWidth: 900,
+        maxCandidates: 12,
+      });
+
+      if (enqueued.ok && enqueued.enqueued) {
+        await supabase
+          .from("wardrobe_videos")
+          .update({
+            status: "processing",
+            last_process_message_id: enqueued.message_id,
+            last_process_retried: 0,
+          })
+          .eq("id", inserted.id)
+          .eq("user_id", FOUNDER_USER_ID);
+
+        // Keep the in-memory row consistent with the DB update for the response.
+        (inserted as any).status = "processing";
+        (inserted as any).last_process_message_id = enqueued.message_id;
+        (inserted as any).last_process_retried = 0;
+      }
+    }
+
+    // Defensive: if enqueue succeeded, ensure the response row shows the processing state.
+    if (enqueued?.ok && enqueued?.enqueued) {
+      (inserted as any).status = (inserted as any).status || "processing";
+      (inserted as any).last_process_message_id = (inserted as any).last_process_message_id ?? enqueued.message_id;
+      (inserted as any).last_process_retried = (inserted as any).last_process_retried ?? 0;
     }
 
     const withUrl = await attachSignedUrl(supabase, inserted as VideoRow);
 
     return NextResponse.json(
-      { ok: true, wardrobe_video: withUrl, video: withUrl },
-      { status: 200, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+      {
+        ok: true,
+        wardrobe_video_id: (withUrl as any).id,
+        wardrobe_video: withUrl,
+        video: withUrl,
+        status: (withUrl as any)?.status ?? "uploaded",
+        enqueued: (withUrl as any)?.status === "processing",
+        message_id: (withUrl as any)?.last_process_message_id ?? null,
+        enqueue: enqueued,
+      },
+      {
+        status: (withUrl as any)?.status === "processing" ? 202 : 201,
+        headers: RESPONSE_HEADERS,
+      }
     );
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500, headers: { "Cache-Control": "no-store", Allow: "GET,POST,OPTIONS" } }
+      { status: 500, headers: RESPONSE_HEADERS }
     );
   }
 }
