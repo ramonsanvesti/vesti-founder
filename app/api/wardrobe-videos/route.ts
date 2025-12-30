@@ -71,6 +71,29 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
+function stripWrappingQuotes(s: string) {
+  const t = (s ?? "").trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1).trim();
+  }
+  return t;
+}
+
+function removeNonPrintable(s: string) {
+  // Remove hidden/newline/non-printable chars that can break URL parsing.
+  return (s ?? "").replace(/[\u0000-\u001F\u007F]+/g, "");
+}
+
+function sanitizeUrlLike(s: string) {
+  return removeNonPrintable(stripWrappingQuotes(String(s ?? ""))).trim();
+}
+
+function sanitizeOrigin(s: string) {
+  const t = sanitizeUrlLike(s);
+  // Remove trailing slash to keep `new URL(path, origin)` predictable.
+  return t.replace(/\/+$/, "");
+}
+
 function clampInt(v: unknown, fallback: number, min: number, max: number) {
   const n = typeof v === "number" ? v : Number(v);
   if (!Number.isFinite(n)) return fallback;
@@ -94,15 +117,13 @@ function getAbsoluteUrl(req: NextRequest, path: string) {
       .trim();
 
   // If you provide an explicit site URL, it must include the scheme.
-  const envOrigin = (process.env.NEXT_PUBLIC_SITE_URL ?? process.env.SITE_URL ?? "").trim();
+  const envOrigin = sanitizeOrigin(process.env.NEXT_PUBLIC_SITE_URL ?? process.env.SITE_URL ?? "");
   if (envOrigin && /^https?:\/\//i.test(envOrigin)) {
     return new URL(path, envOrigin).toString();
   }
 
   // VERCEL_URL typically has no scheme.
-  const envHost = (process.env.VERCEL_URL ?? "")
-    .trim()
-    .replace(/^https?:\/\//i, "");
+  const envHost = sanitizeUrlLike(process.env.VERCEL_URL ?? "").replace(/^https?:\/\//i, "");
 
   const host = hostHeader || envHost || "localhost:3000";
   return new URL(path, `${proto}://${host}`).toString();
@@ -112,11 +133,13 @@ function isConfiguredQStash() {
   return !!process.env.QSTASH_TOKEN;
 }
 
-function qstashPublishUrl(targetUrl: string) {
-  // QStash expects the destination URL appended raw (not encodeURIComponent).
-  // Example: https://qstash.upstash.io/v2/publish/https://example.com/api/job
-  // `encodeURI` is safe here (keeps `https://` intact, only encodes spaces etc.).
-  return `https://qstash.upstash.io/v2/publish/${encodeURI(targetUrl)}`;
+function qstashPublishUrl(targetUrl: string, mode: "raw" | "encoded" = "raw") {
+  const t = sanitizeUrlLike(targetUrl);
+  // QStash REST publish uses the destination URL as a path segment.
+  // Most examples show it unencoded, but some environments/proxies can mangle `://` inside a path.
+  // So we keep the default as raw and optionally fall back to an encoded form.
+  const dest = mode === "encoded" ? encodeURIComponent(t) : t;
+  return `https://qstash.upstash.io/v2/publish/${dest}`;
 }
 
 function safeDedupeId(raw: string) {
@@ -156,7 +179,7 @@ async function enqueueProcessJob(args: {
 }) {
   const { req, wardrobeVideoId, sampleEverySeconds, maxFrames, maxWidth, maxCandidates } = args;
 
-  const targetUrl = getAbsoluteUrl(req, "/api/wardrobe-videos/process");
+  const targetUrl = sanitizeUrlLike(getAbsoluteUrl(req, "/api/wardrobe-videos/process"));
   if (!/^https?:\/\//i.test(targetUrl)) {
     return {
       ok: false,
@@ -199,24 +222,71 @@ async function enqueueProcessJob(args: {
     `wardrobe_video-${wardrobeVideoId}-process-${sampleEverySeconds}-${maxFrames}-${maxWidth}-${maxCandidates}`
   );
 
-  const publishUrl = qstashPublishUrl(targetUrl);
-  const res = await fetch(publishUrl, {
+  const headers = {
+    Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
+    "Content-Type": "application/json",
+    // QStash controls
+    "Upstash-Method": "POST",
+    "Upstash-Deduplication-Id": dedupeId,
+    "Upstash-Retries": "5",
+    "Upstash-Timeout": "120",
+  } as Record<string, string>;
+
+  // First attempt: raw destination in the path (matches Upstash docs).
+  const publishUrlRaw = qstashPublishUrl(targetUrl, "raw");
+  let res = await fetch(publishUrlRaw, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
-      "Content-Type": "application/json",
-      // QStash controls
-      "Upstash-Method": "POST",
-      "Upstash-Content-Type": "application/json",
-      "Upstash-Deduplication-Id": dedupeId,
-      "Upstash-Retries": "5",
-      "Upstash-Timeout": "120",
-    },
+    headers,
     body: JSON.stringify(payload),
     cache: "no-store",
   });
 
-  const body = await res.json().catch(() => ({} as any));
+  let body: any = await res.json().catch(() => ({}));
+
+  // Fallback: if something in the HTTP stack mangles `://` inside the path,
+  // try an encoded destination. This only triggers on the specific "invalid scheme" error.
+  if (
+    !res.ok &&
+    res.status === 400 &&
+    typeof body?.error === "string" &&
+    /invalid destination url/i.test(body.error) &&
+    /invalid scheme/i.test(body.error)
+  ) {
+    const publishUrlEncoded = qstashPublishUrl(targetUrl, "encoded");
+    res = await fetch(publishUrlEncoded, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
+    body = await res.json().catch(() => ({}));
+
+    if (res.ok) {
+      return {
+        ok: true,
+        enqueued: true,
+        target_url: targetUrl,
+        dedupe_id: dedupeId,
+        message_id: body?.messageId ?? body?.message_id ?? null,
+        qstash_response: { ...body, _publish_mode: "encoded" },
+      };
+    }
+
+    return {
+      ok: false,
+      enqueued: false,
+      target_url: targetUrl,
+      dedupe_id: dedupeId,
+      message_id: null,
+      qstash_error: {
+        status: res.status,
+        body,
+        publish_url_raw: publishUrlRaw,
+        publish_url_encoded: publishUrlEncoded,
+      },
+      details: body?.error ?? "Failed to enqueue processing job",
+    };
+  }
 
   if (!res.ok) {
     return {
@@ -225,7 +295,7 @@ async function enqueueProcessJob(args: {
       target_url: targetUrl,
       dedupe_id: dedupeId,
       message_id: null,
-      qstash_error: { status: res.status, body },
+      qstash_error: { status: res.status, body, publish_url: publishUrlRaw },
       details: body?.error ?? "Failed to enqueue processing job",
     };
   }
@@ -236,7 +306,7 @@ async function enqueueProcessJob(args: {
     target_url: targetUrl,
     dedupe_id: dedupeId,
     message_id: body?.messageId ?? body?.message_id ?? null,
-    qstash_response: body,
+    qstash_response: { ...body, _publish_mode: "raw" },
   };
 }
 

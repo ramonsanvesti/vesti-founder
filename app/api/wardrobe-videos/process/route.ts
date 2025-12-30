@@ -1,13 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
-
-function getAbsoluteUrl(req: NextRequest, path: string) {
-  const proto = req.headers.get("x-forwarded-proto") ?? "https";
-  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
-  if (!host) throw new Error("Missing host header");
-  return new URL(path, `${proto}://${host}`).toString();
-}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,7 +47,7 @@ function asString(v: unknown) {
   return typeof v === "string" ? v.trim() : "";
 }
 
-async function handler(req: NextRequest) {
+async function handler(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as ProcessPayload;
 
@@ -65,6 +58,13 @@ async function handler(req: NextRequest) {
         { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
+
+    const qstashMessageId = req.headers.get("Upstash-Message-Id") ?? null;
+    const qstashRetriedRaw = req.headers.get("Upstash-Retried");
+    const qstashRetried = qstashRetriedRaw != null && qstashRetriedRaw !== ""
+      ? Number.parseInt(qstashRetriedRaw, 10)
+      : null;
+    const qstashRetriedSafe = Number.isFinite(qstashRetried as any) ? qstashRetried : null;
 
     const supabase = getSupabaseAdminClient();
 
@@ -77,6 +77,8 @@ async function handler(req: NextRequest) {
       .update({
         status: "processed",
         last_processed_at: nowIso,
+        last_process_message_id: qstashMessageId,
+        last_process_retried: qstashRetriedSafe,
       })
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -113,7 +115,7 @@ const hasSigningKeys = Boolean(
 
 export const POST = hasSigningKeys
   ? verifySignatureAppRouter(handler)
-  : async (req: NextRequest) => {
+  : async (req: Request) => {
       if (process.env.NODE_ENV === "production") {
         return NextResponse.json(
           {
