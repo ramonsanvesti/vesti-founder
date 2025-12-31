@@ -187,9 +187,11 @@ async function extractFramesWithFfmpeg(params: {
     child.kill("SIGKILL");
   }, timeoutMs);
 
-  const exitCode: number = await new Promise((resolve, reject) => {
+  const exitCode: number = await new Promise<number>((resolve, reject) => {
     child.on("error", reject);
-    child.on("close", resolve);
+    child.on("close", (code) => {
+      resolve(typeof code === "number" ? code : -1);
+    });
   }).finally(() => clearTimeout(timeout));
 
   if (exitCode !== 0) {
