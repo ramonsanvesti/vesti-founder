@@ -2,12 +2,246 @@ import { NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
 
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
+
+const WARDROBE_VIDEOS_BUCKET =
+  process.env.WARDROBE_VIDEOS_BUCKET ?? "wardrobe-videos";
+
+function log(event: string, meta: Record<string, any>) {
+  // Single-line JSON logs that are easy to grep in Vercel.
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ...meta,
+    })
+  );
+}
+
+type ExtractedFrame = {
+  index: number;
+  tsMs: number;
+  path: string; // /tmp/.../frame_001.jpg
+};
+
+function parsePtsTimesFromFfmpegShowinfo(stderr: string): number[] {
+  // showinfo lines include: pts_time:12.345
+  const times: number[] = [];
+  const re = /pts_time:([0-9.]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stderr)) !== null) {
+    times.push(Number(m[1]));
+  }
+  return times;
+}
+
+async function safeRm(dir: string, meta: Record<string, any>) {
+  try {
+    await fsp.rm(dir, { recursive: true, force: true });
+  } catch (e: any) {
+    log("tmp.cleanup_failed", { ...meta, dir, err: String(e?.message ?? e) });
+  }
+}
+
+async function getFfmpegPath(): Promise<string> {
+  // Prefer an explicit path in env for production reliability.
+  const envPath = asString(process.env.FFMPEG_PATH);
+  if (envPath) return envPath;
+
+  // Fall back to ffmpeg-static if installed.
+  try {
+    const mod: any = await import("ffmpeg-static");
+    const p = (mod?.default ?? mod) as string;
+    if (p) return p;
+  } catch {
+    // ignore
+  }
+
+  throw new Error(
+    "FFmpeg binary not available. Set FFMPEG_PATH or install ffmpeg-static."
+  );
+}
+
+async function downloadVideoToTmp(params: {
+  supabase: ReturnType<typeof getSupabaseAdminClient>;
+  bucket: string;
+  objectPathOrUrl: string;
+  outPath: string;
+  meta: Record<string, any>;
+}): Promise<{ bytes: number }> {
+  const { supabase, bucket, objectPathOrUrl, outPath, meta } = params;
+
+  // If the stored value is already a URL, fetch directly.
+  const isHttpUrl = /^https?:\/\//i.test(objectPathOrUrl);
+
+  let url: string;
+  if (isHttpUrl) {
+    url = objectPathOrUrl;
+  } else {
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(objectPathOrUrl, 90);
+    if (error || !data?.signedUrl) {
+      throw new Error(`createSignedUrl failed: ${error?.message ?? "unknown"}`);
+    }
+    url = data.signedUrl;
+  }
+
+  const res = await fetch(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`video fetch failed: ${res.status} ${res.statusText}`);
+  }
+
+  await fsp.mkdir(path.dirname(outPath), { recursive: true });
+
+  // Stream to disk (do not buffer the whole file in RAM).
+  // Node fetch body is a Web ReadableStream.
+  const nodeStream = Readable.fromWeb(res.body as any);
+  const fileStream = fs.createWriteStream(outPath);
+
+  let bytes = 0;
+  nodeStream.on("data", (chunk) => {
+    bytes += Buffer.byteLength(chunk);
+  });
+
+  await pipeline(nodeStream, fileStream);
+
+  log("video.downloaded", { ...meta, outPath, bytes });
+  return { bytes };
+}
+
+async function extractFramesWithFfmpeg(params: {
+  inputPath: string;
+  jobDir: string;
+  sampleEverySeconds: number;
+  maxFrames: number;
+  maxWidth: number;
+  meta: Record<string, any>;
+}): Promise<ExtractedFrame[]> {
+  const {
+    inputPath,
+    jobDir,
+    sampleEverySeconds,
+    maxFrames,
+    maxWidth,
+    meta,
+  } = params;
+
+  const ffmpeg = await getFfmpegPath();
+  const framesDir = path.join(jobDir, "frames");
+  await fsp.mkdir(framesDir, { recursive: true });
+
+  // 1 frame every N seconds (configurable)
+  const vf = `fps=1/${sampleEverySeconds},scale='min(${maxWidth},iw)':-2:flags=lanczos,showinfo`;
+  const outPattern = path.join(framesDir, "frame_%03d.jpg");
+
+  const args = [
+    "-hide_banner",
+    "-nostats",
+    "-loglevel",
+    "info",
+    "-i",
+    inputPath,
+    "-vf",
+    vf,
+    "-vsync",
+    "vfr",
+    "-q:v",
+    "3",
+    "-frames:v",
+    String(maxFrames),
+    outPattern,
+  ];
+
+  log("ffmpeg.extract.start", { ...meta, ffmpeg, args, framesDir });
+
+  const t0 = Date.now();
+  const child = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"] });
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d) => {
+    stderr += d;
+    // Keep stderr bounded to avoid memory blowups.
+    if (stderr.length > 200_000) stderr = stderr.slice(-120_000);
+  });
+
+  // Hard kill guard. Keep this < route maxDuration.
+  const timeoutMs = Math.min(45_000, 5_000 + maxFrames * 1_000);
+  const timeout = setTimeout(() => {
+    log("ffmpeg.extract.timeout_kill", { ...meta, timeoutMs });
+    child.kill("SIGKILL");
+  }, timeoutMs);
+
+  const exitCode: number = await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", resolve);
+  }).finally(() => clearTimeout(timeout));
+
+  if (exitCode !== 0) {
+    log("ffmpeg.extract.failed", {
+      ...meta,
+      exitCode,
+      stderrTail: stderr.slice(-4000),
+    });
+    throw new Error(`ffmpeg exited with code ${exitCode}`);
+  }
+
+  const files = (await fsp.readdir(framesDir))
+    .filter((f) => f.endsWith(".jpg"))
+    .sort((a, b) => a.localeCompare(b));
+
+  if (files.length === 0) {
+    log("ffmpeg.extract.no_frames", { ...meta, stderrTail: stderr.slice(-4000) });
+    throw new Error("No frames extracted");
+  }
+
+  const ptsTimes = parsePtsTimesFromFfmpegShowinfo(stderr); // seconds
+
+  const frames: ExtractedFrame[] = files.map((file, i) => {
+    const ptsSec = ptsTimes[i];
+    const tsMs = Number.isFinite(ptsSec)
+      ? Math.round(ptsSec * 1000)
+      : i * sampleEverySeconds * 1000;
+    return {
+      index: i,
+      tsMs,
+      path: path.join(framesDir, file),
+    };
+  });
+
+  log("ffmpeg.extract.done", {
+    ...meta,
+    extracted: frames.length,
+    durationMs: Date.now() - t0,
+    stderrTail: stderr.slice(-800),
+  });
+
+  return frames;
+}
+
+function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string } {
+  const msg = String(err?.message ?? err ?? "");
+  if (msg.includes("FFmpeg binary not available")) return { nonRetriable: true, reason: "ffmpeg_missing" };
+  if (msg.includes("createSignedUrl failed")) return { nonRetriable: true, reason: "signed_url_failed" };
+  if (msg.includes("video_url_missing")) return { nonRetriable: true, reason: "video_url_missing" };
+  if (msg.includes("Wardrobe video not found")) return { nonRetriable: true, reason: "row_not_found" };
+  return { nonRetriable: false, reason: "transient_or_unknown" };
+}
 
 function getSupabaseAdminClient() {
   const url =
@@ -121,11 +355,38 @@ async function handler(req: Request) {
       );
     }
 
-    // Normalize processing params (reserved for the real pipeline).
-    const sampleEverySeconds = asInt(body.sample_every_seconds, 3, 1, 60);
-    const maxFrames = asInt(body.max_frames, 20, 1, 300);
-    const maxWidth = asInt(body.max_width, 900, 200, 4000);
-    const maxCandidates = asInt(body.max_candidates, 12, 1, 50);
+    // Hard guard: if another job/message is already processing this video, dedupe.
+    if (
+      String((existing as any).status) === "processing" &&
+      (existing as any).last_process_message_id &&
+      qstashMessageId &&
+      (existing as any).last_process_message_id !== qstashMessageId
+    ) {
+      log("process.deduped_already_processing", {
+        wardrobeVideoId,
+        currentMessageId: qstashMessageId,
+        activeMessageId: (existing as any).last_process_message_id,
+        retried: qstashRetriedSafe,
+      });
+
+      return NextResponse.json(
+        {
+          ok: true,
+          deduped: true,
+          reason: "already_processing",
+          active_message_id: (existing as any).last_process_message_id,
+        },
+        { status: 200, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    // VESTI-5.4 (Frame extraction) config. Conservative defaults for serverless.
+    const sampleEverySeconds = asInt(body.sample_every_seconds, 2, 1, 60);
+    const maxFrames = asInt(body.max_frames, 40, 1, 300);
+    const maxWidth = asInt(body.max_width, 1280, 200, 4000);
+
+    // Reserved for downstream candidate detection (VESTI-5.5).
+    const maxCandidates = asInt(body.max_candidates, 8, 1, 50);
 
     // Mark as processing at job start (safe for retries).
     await supabase
@@ -137,51 +398,149 @@ async function handler(req: Request) {
       })
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
-      .in("status", ["uploaded", "processing"]);
+      .in("status", ["uploaded", "processing", "failed"]);
 
-    // TODO (Pipeline):
-    // - Download video from Supabase Storage (existing.video_url)
-    // - Extract frames using sampleEverySeconds/maxFrames/maxWidth
-    // - Run Vision classification
-    // - Persist garments + scores
-    // - Update wardrobe_videos with results
-    // For now we just mark the video as processed so the end-to-end loop works.
-    void sampleEverySeconds;
-    void maxFrames;
-    void maxWidth;
-    void maxCandidates;
+    // ------------------------------
+    // VESTI-5.4 — Extract frames (ephemeral)
+    // ------------------------------
 
-    const nowIso = new Date().toISOString();
+    const jobId = qstashMessageId ?? crypto.randomUUID();
+    const jobDir = path.join(os.tmpdir(), "vesti", "wardrobe-videos", wardrobeVideoId, jobId);
+    const meta = {
+      jobId,
+      wardrobeVideoId,
+      messageId: qstashMessageId,
+      retried: qstashRetriedSafe,
+      sampleEverySeconds,
+      maxFrames,
+      maxWidth,
+    };
 
-    const { data, error } = await supabase
-      .from("wardrobe_videos")
-      .update({
-        status: "processed",
-        last_processed_at: nowIso,
-      })
-      .eq("id", wardrobeVideoId)
-      .eq("user_id", FOUNDER_USER_ID)
-      .select(
-        "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
-      )
-      .single();
+    log("process.start", meta);
 
-    if (error) {
+    // Validate source.
+    const videoUrl = asString((existing as any).video_url);
+    if (!videoUrl) {
+      const reason = "video_url_missing";
+      log("process.non_retriable", { ...meta, reason });
+
+      await supabase
+        .from("wardrobe_videos")
+        .update({ status: "failed" })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID);
+
       return NextResponse.json(
-        { ok: false, error: "DB update failed", details: error.message },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
+        { ok: false, error: "Missing video_url on wardrobe_videos row", non_retriable: true },
+        { status: 200, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    return NextResponse.json(
-      {
-        ok: true,
-        video: data,
-        message_id: qstashMessageId,
-        retried: qstashRetriedSafe,
-      },
-      { status: 200, headers: { "Cache-Control": "no-store" } }
-    );
+    const inputPath = path.join(jobDir, "input.mp4");
+
+    let frames: ExtractedFrame[] = [];
+    let pipelineErr: any = null;
+
+    try {
+      // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
+      await downloadVideoToTmp({
+        supabase,
+        bucket: WARDROBE_VIDEOS_BUCKET,
+        objectPathOrUrl: videoUrl,
+        outPath: inputPath,
+        meta,
+      });
+
+      // Extract sampled frames to /tmp (ephemeral).
+      frames = await extractFramesWithFfmpeg({
+        inputPath,
+        jobDir,
+        sampleEverySeconds,
+        maxFrames,
+        maxWidth,
+        meta,
+      });
+
+      // NOTE: VESTI-5.5 (candidate detection) will run next, using these /tmp frames.
+      // For VESTI-5.4, we only prove reliable extraction + safe status transitions.
+
+      const nowIso = new Date().toISOString();
+
+      const { data, error } = await supabase
+        .from("wardrobe_videos")
+        .update({
+          status: "processed",
+          last_processed_at: nowIso,
+        })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID)
+        .select(
+          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
+        )
+        .single();
+
+      if (error) {
+        // DB update failure is retriable.
+        throw new Error(`DB update failed: ${error.message}`);
+      }
+
+      log("process.success", { ...meta, framesExtracted: frames.length });
+
+      return NextResponse.json(
+        {
+          ok: true,
+          video: data,
+          message_id: qstashMessageId,
+          retried: qstashRetriedSafe,
+          frames_extracted: frames.length,
+          sample_every_seconds: sampleEverySeconds,
+        },
+        { status: 200, headers: { "Cache-Control": "no-store" } }
+      );
+    } catch (err: any) {
+      pipelineErr = err;
+
+      const classification = classifyNonRetriable(err);
+      log("process.failed", {
+        ...meta,
+        nonRetriable: classification.nonRetriable,
+        reason: classification.reason,
+        err: String(err?.message ?? err),
+      });
+
+      if (classification.nonRetriable) {
+        // Fail closed and stop QStash retries for permanent config/data issues.
+        await supabase
+          .from("wardrobe_videos")
+          .update({ status: "failed" })
+          .eq("id", wardrobeVideoId)
+          .eq("user_id", FOUNDER_USER_ID);
+
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "Processing failed (non-retriable)",
+            reason: classification.reason,
+            details: String(err?.message ?? err),
+          },
+          { status: 200, headers: { "Cache-Control": "no-store" } }
+        );
+      }
+
+      // Retriable failures: keep status as processing and return 500 so QStash retries.
+      // The status machine remains consistent (no corruption).
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Processing failed (retriable)",
+          details: String(err?.message ?? err),
+        },
+        { status: 500, headers: { "Cache-Control": "no-store" } }
+      );
+    } finally {
+      // Ephemeral guarantee: remove /tmp artifacts.
+      await safeRm(jobDir, meta);
+    }
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
