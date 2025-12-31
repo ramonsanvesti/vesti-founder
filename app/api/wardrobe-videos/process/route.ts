@@ -49,6 +49,57 @@ function parsePtsTimesFromFfmpegShowinfo(stderr: string): number[] {
   return times;
 }
 
+// Helper: probe duration (fast metadata parse)
+async function probeDurationSeconds(params: {
+  inputPath: string;
+  meta: Record<string, any>;
+}): Promise<number | null> {
+  const { inputPath, meta } = params;
+  const ffmpeg = await getFfmpegPath();
+
+  // ffmpeg prints duration to stderr during probe.
+  const args = ["-hide_banner", "-nostats", "-i", inputPath];
+
+  const child = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"] });
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d) => {
+    stderr += d;
+    if (stderr.length > 80_000) stderr = stderr.slice(-60_000);
+  });
+
+  const timeoutMs = 8_000;
+  const timeout = setTimeout(() => {
+    log("ffmpeg.probe.timeout_kill", { ...meta, timeoutMs });
+    child.kill("SIGKILL");
+  }, timeoutMs);
+
+  const exitCode: number = await new Promise<number>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => resolve(typeof code === "number" ? code : -1));
+  }).finally(() => clearTimeout(timeout));
+
+  // ffmpeg -i exits non-zero when no output is specified; that's fine.
+  void exitCode;
+
+  // Duration: 00:01:02.34
+  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!m) {
+    log("ffmpeg.probe.no_duration", { ...meta, stderrTail: stderr.slice(-800) });
+    return null;
+  }
+
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const ss = Number(m[3]);
+  if (![hh, mm, ss].every((x) => Number.isFinite(x))) return null;
+
+  const dur = hh * 3600 + mm * 60 + ss;
+  log("ffmpeg.probe.duration", { ...meta, durationSeconds: dur });
+  return dur;
+}
+
 async function safeRm(dir: string, meta: Record<string, any>) {
   try {
     await fsp.rm(dir, { recursive: true, force: true });
@@ -145,6 +196,146 @@ async function extractFramesWithFfmpeg(params: {
   const framesDir = path.join(jobDir, "frames");
   await fsp.mkdir(framesDir, { recursive: true });
 
+  // Default to a faster seek-based mode. Allow override for debugging.
+  const mode = (asString(process.env.FFMPEG_EXTRACT_MODE) || "seek").toLowerCase();
+
+  // ------------------------------
+  // Mode A (recommended): SEEK extraction
+  // One process per timestamp: ffmpeg -ss T -i input -frames:v 1 ... out.jpg
+  // ------------------------------
+  if (mode !== "fps") {
+    const t0 = Date.now();
+
+    const durationSeconds = await probeDurationSeconds({ inputPath, meta });
+
+    // Build timestamp list.
+    const timestamps: number[] = [];
+    for (let i = 0; i < maxFrames; i++) {
+      const t = i * sampleEverySeconds;
+      if (durationSeconds != null && t > durationSeconds + 0.2) break;
+      timestamps.push(t);
+    }
+
+    // Safety: always attempt at least one frame.
+    if (timestamps.length === 0) timestamps.push(0);
+
+    log("ffmpeg.extract.seek.plan", {
+      ...meta,
+      mode: "seek",
+      planned: timestamps.length,
+      durationSeconds,
+    });
+
+    const concurrency = 2; // serverless-safe
+
+    async function runOne(index: number, tSec: number): Promise<ExtractedFrame | null> {
+      const outName = `frame_${String(index).padStart(3, "0")}.jpg`;
+      const outPath = path.join(framesDir, outName);
+
+      // Fast seek with -ss before -i. Disable audio.
+      const vf = `scale='min(${maxWidth},iw)':-2:flags=bicubic`;
+      const args = [
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-ss",
+        String(tSec),
+        "-i",
+        inputPath,
+        "-an",
+        "-frames:v",
+        "1",
+        "-vf",
+        vf,
+        "-q:v",
+        "3",
+        "-y",
+        outPath,
+      ];
+
+      const child = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"] });
+
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (d) => {
+        stderr += d;
+        if (stderr.length > 40_000) stderr = stderr.slice(-20_000);
+      });
+
+      const timeoutMs = 12_000;
+      const timeout = setTimeout(() => {
+        log("ffmpeg.extract.seek.timeout_kill", { ...meta, index, tSec, timeoutMs });
+        child.kill("SIGKILL");
+      }, timeoutMs);
+
+      const exitCode: number = await new Promise<number>((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code) => resolve(typeof code === "number" ? code : -1));
+      }).finally(() => clearTimeout(timeout));
+
+      if (exitCode !== 0) {
+        log("ffmpeg.extract.seek.frame_failed", {
+          ...meta,
+          index,
+          tSec,
+          exitCode,
+          stderrTail: stderr.slice(-800),
+        });
+        return null;
+      }
+
+      // Verify file exists and has content.
+      try {
+        const st = await fsp.stat(outPath);
+        if (!st.isFile() || st.size <= 0) {
+          log("ffmpeg.extract.seek.empty_frame", { ...meta, index, tSec });
+          return null;
+        }
+      } catch {
+        log("ffmpeg.extract.seek.missing_frame", { ...meta, index, tSec });
+        return null;
+      }
+
+      return {
+        index,
+        tsMs: Math.round(tSec * 1000),
+        path: outPath,
+      };
+    }
+
+    const results: Array<ExtractedFrame | null> = [];
+
+    for (let i = 0; i < timestamps.length; i += concurrency) {
+      const batch = timestamps.slice(i, i + concurrency);
+      const batchPromises = batch.map((tSec, j) => runOne(i + j, tSec));
+      const batchRes = await Promise.all(batchPromises);
+      results.push(...batchRes);
+    }
+
+    const frames = results.filter(Boolean) as ExtractedFrame[];
+
+    if (frames.length === 0) {
+      log("ffmpeg.extract.no_frames", { ...meta, mode: "seek" });
+      throw new Error("No frames extracted");
+    }
+
+    log("ffmpeg.extract.done", {
+      ...meta,
+      mode: "seek",
+      extracted: frames.length,
+      planned: timestamps.length,
+      durationMs: Date.now() - t0,
+    });
+
+    return frames;
+  }
+
+  // ------------------------------
+  // Mode B (fallback): FPS filter extraction
+  // Useful for debugging and comparison.
+  // ------------------------------
+
   // 1 frame every N seconds (configurable)
   const vf = `fps=1/${sampleEverySeconds},scale='min(${maxWidth},iw)':-2:flags=lanczos,showinfo`;
   const outPattern = path.join(framesDir, "frame_%03d.jpg");
@@ -167,7 +358,7 @@ async function extractFramesWithFfmpeg(params: {
     outPattern,
   ];
 
-  log("ffmpeg.extract.start", { ...meta, ffmpeg, args, framesDir });
+  log("ffmpeg.extract.start", { ...meta, mode: "fps", ffmpeg, args, framesDir });
 
   const t0 = Date.now();
   const child = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -183,7 +374,7 @@ async function extractFramesWithFfmpeg(params: {
   // Hard kill guard. Keep this < route maxDuration.
   const timeoutMs = Math.min(45_000, 5_000 + maxFrames * 1_000);
   const timeout = setTimeout(() => {
-    log("ffmpeg.extract.timeout_kill", { ...meta, timeoutMs });
+    log("ffmpeg.extract.timeout_kill", { ...meta, mode: "fps", timeoutMs });
     child.kill("SIGKILL");
   }, timeoutMs);
 
@@ -197,6 +388,7 @@ async function extractFramesWithFfmpeg(params: {
   if (exitCode !== 0) {
     log("ffmpeg.extract.failed", {
       ...meta,
+      mode: "fps",
       exitCode,
       stderrTail: stderr.slice(-4000),
     });
@@ -208,7 +400,11 @@ async function extractFramesWithFfmpeg(params: {
     .sort((a, b) => a.localeCompare(b));
 
   if (files.length === 0) {
-    log("ffmpeg.extract.no_frames", { ...meta, stderrTail: stderr.slice(-4000) });
+    log("ffmpeg.extract.no_frames", {
+      ...meta,
+      mode: "fps",
+      stderrTail: stderr.slice(-4000),
+    });
     throw new Error("No frames extracted");
   }
 
@@ -228,6 +424,7 @@ async function extractFramesWithFfmpeg(params: {
 
   log("ffmpeg.extract.done", {
     ...meta,
+    mode: "fps",
     extracted: frames.length,
     durationMs: Date.now() - t0,
     stderrTail: stderr.slice(-800),
