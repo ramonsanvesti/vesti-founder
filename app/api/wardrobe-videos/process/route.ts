@@ -34,6 +34,14 @@ const MAX_RETRIES = (() => {
   return Math.max(0, Math.min(20, n));
 })();
 
+const MAX_VIDEO_SECONDS = (() => {
+  const raw = (process.env.WARDROBE_VIDEO_MAX_SECONDS ?? "60").trim();
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n)) return 60;
+  // Keep this bounded to protect cost even if misconfigured.
+  return Math.max(1, Math.min(300, n));
+})();
+
 function log(event: string, meta: Record<string, any>) {
   // Single-line JSON logs that are easy to grep in Vercel.
   console.log(
@@ -203,6 +211,7 @@ async function extractFramesWithFfmpeg(params: {
   sampleEverySeconds: number;
   maxFrames: number;
   maxWidth: number;
+  durationSeconds?: number | null;
   meta: Record<string, any>;
 }): Promise<ExtractedFrame[]> {
   const {
@@ -211,6 +220,7 @@ async function extractFramesWithFfmpeg(params: {
     sampleEverySeconds,
     maxFrames,
     maxWidth,
+    durationSeconds,
     meta,
   } = params;
 
@@ -229,13 +239,14 @@ async function extractFramesWithFfmpeg(params: {
   if (mode !== "fps") {
     const t0 = Date.now();
 
-    const durationSeconds = await probeDurationSeconds({ inputPath, meta });
+    const probedDurationSeconds =
+      durationSeconds ?? (await probeDurationSeconds({ inputPath, meta }));
 
     // Build timestamp list.
     const timestamps: number[] = [];
     for (let i = 0; i < maxFrames; i++) {
       const t = i * sampleEverySeconds;
-      if (durationSeconds != null && t > durationSeconds + 0.2) break;
+      if (probedDurationSeconds != null && t > probedDurationSeconds + 0.2) break;
       timestamps.push(t);
     }
 
@@ -246,7 +257,7 @@ async function extractFramesWithFfmpeg(params: {
       ...meta,
       mode: "seek",
       planned: timestamps.length,
-      durationSeconds,
+      durationSeconds: probedDurationSeconds,
     });
 
     const concurrency = 2; // serverless-safe
@@ -474,6 +485,8 @@ function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string
     return { nonRetriable: true, reason: "ffmpeg_missing" };
   if (msg.includes("createSignedUrl failed")) return { nonRetriable: true, reason: "signed_url_failed" };
   if (msg.includes("video_url_missing")) return { nonRetriable: true, reason: "video_url_missing" };
+  if (msg.includes("video_too_long") || msg.includes("Video duration exceeds"))
+    return { nonRetriable: true, reason: "video_too_long" };
   if (msg.includes("Wardrobe video not found")) return { nonRetriable: true, reason: "row_not_found" };
   return { nonRetriable: false, reason: "transient_or_unknown" };
 }
@@ -590,7 +603,7 @@ async function handler(req: Request) {
     const { data: existing, error: readErr } = await supabase
       .from("wardrobe_videos")
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used"
       )
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -696,6 +709,8 @@ async function handler(req: Request) {
       status: "processing",
       last_process_message_id: qstashMessageId,
       last_process_retried: qstashRetriedSafe,
+      sample_every_seconds_used: sampleEverySeconds,
+      max_width_used: maxWidth,
     };
     if (qstashRetriedSafe === 0) {
       markPayload.last_process_error = null;
@@ -708,7 +723,7 @@ async function handler(req: Request) {
       .eq("user_id", FOUNDER_USER_ID)
       .in("status", ["uploaded", "processing", "failed"])
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used"
       )
       .maybeSingle();
 
@@ -792,6 +807,9 @@ async function handler(req: Request) {
           status: "failed",
           last_processed_at: new Date().toISOString(),
           last_process_error: "video_url_missing",
+          frames_extracted_count: 0,
+          sample_every_seconds_used: sampleEverySeconds,
+          max_width_used: maxWidth,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
@@ -816,6 +834,14 @@ async function handler(req: Request) {
         meta,
       });
 
+      // Guardrail: enforce max duration (product constraint) to protect cost/time.
+      const durationSeconds = await probeDurationSeconds({ inputPath, meta });
+      if (durationSeconds != null && durationSeconds > MAX_VIDEO_SECONDS + 0.2) {
+        throw new Error(
+          `video_too_long: Video duration exceeds ${MAX_VIDEO_SECONDS}s (got ${durationSeconds.toFixed(2)}s)`
+        );
+      }
+
       // Extract sampled frames to /tmp (ephemeral).
       frames = await extractFramesWithFfmpeg({
         inputPath,
@@ -823,6 +849,7 @@ async function handler(req: Request) {
         sampleEverySeconds,
         maxFrames,
         maxWidth,
+        durationSeconds,
         meta,
       });
 
@@ -837,11 +864,14 @@ async function handler(req: Request) {
           status: "processed",
           last_processed_at: nowIso,
           last_process_error: null,
+          frames_extracted_count: frames.length,
+          sample_every_seconds_used: sampleEverySeconds,
+          max_width_used: maxWidth,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID)
         .select(
-          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at"
+          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at,frames_extracted_count,sample_every_seconds_used,max_width_used"
         )
         .single();
 
@@ -859,7 +889,8 @@ async function handler(req: Request) {
           message_id: qstashMessageId,
           retried: qstashRetriedSafe,
           frames_extracted: frames.length,
-          sample_every_seconds: sampleEverySeconds,
+          sample_every_seconds_used: sampleEverySeconds,
+          max_width_used: maxWidth,
           max_candidates: maxCandidates,
         },
         { status: 200, headers: RESPONSE_HEADERS }
@@ -898,6 +929,9 @@ async function handler(req: Request) {
             last_processed_at: nowIso,
             last_process_retried: qstashRetriedSafe,
             last_process_error: errStr,
+            frames_extracted_count: frames.length,
+            sample_every_seconds_used: sampleEverySeconds,
+            max_width_used: maxWidth,
           })
           .eq("id", wardrobeVideoId)
           .eq("user_id", FOUNDER_USER_ID);
@@ -924,6 +958,9 @@ async function handler(req: Request) {
           status: "processing",
           last_process_retried: qstashRetriedSafe,
           last_process_error: errStr,
+          frames_extracted_count: frames.length,
+          sample_every_seconds_used: sampleEverySeconds,
+          max_width_used: maxWidth,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
