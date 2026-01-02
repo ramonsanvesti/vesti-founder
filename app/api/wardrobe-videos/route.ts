@@ -451,6 +451,7 @@ export async function POST(req: NextRequest) {
           })
           .eq("id", inserted.id)
           .eq("user_id", FOUNDER_USER_ID)
+          .eq("status", "uploaded")
           .select(
             "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
           )
@@ -566,7 +567,7 @@ export async function POST(req: NextRequest) {
         maxCandidates,
       });
 
-      // Mark processing ONLY if job was accepted/enqueued.
+      // Mark processing ONLY if job was accepted/enqueued, and only transition from allowed states.
       if (enqueued.ok && enqueued.enqueued) {
         await supabase
           .from("wardrobe_videos")
@@ -577,7 +578,9 @@ export async function POST(req: NextRequest) {
             last_process_error: null,
           })
           .eq("id", row.id)
-          .eq("user_id", FOUNDER_USER_ID);
+          .eq("user_id", FOUNDER_USER_ID)
+          .in("status", ["uploaded", "failed", "processing"])
+          .neq("status", "processed");
       }
 
       const { data: updated } = await supabase
@@ -607,7 +610,7 @@ export async function POST(req: NextRequest) {
           error: enqueued?.ok ? null : (enqueued as any)?.details ?? "Failed to enqueue processing job",
           error_details: !enqueued?.ok ? JSON.stringify((enqueued as any)?.qstash_error ?? {}) : null,
         },
-        { status: enqueued?.ok && enqueued?.enqueued ? 202 : 500, headers: RESPONSE_HEADERS }
+        { status: enqueued?.ok && enqueued?.enqueued ? 202 : 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -662,7 +665,8 @@ export async function POST(req: NextRequest) {
             last_process_error: null,
           })
           .eq("id", inserted.id)
-          .eq("user_id", FOUNDER_USER_ID);
+          .eq("user_id", FOUNDER_USER_ID)
+          .eq("status", "uploaded");
 
         // Keep the in-memory row consistent with the DB update for the response.
         (inserted as any).status = "processing";
