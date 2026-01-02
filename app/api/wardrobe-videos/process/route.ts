@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
 
+import ffmpegStatic from "ffmpeg-static";
+
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -67,6 +69,7 @@ async function probeDurationSeconds(params: {
 }): Promise<number | null> {
   const { inputPath, meta } = params;
   const ffmpeg = await getFfmpegPath();
+  log("ffmpeg.path", { ...meta, ffmpegPath: ffmpeg });
 
   // ffmpeg prints duration to stderr during probe.
   const args = ["-hide_banner", "-nostats", "-i", inputPath];
@@ -120,22 +123,30 @@ async function safeRm(dir: string, meta: Record<string, any>) {
 }
 
 async function getFfmpegPath(): Promise<string> {
-  // Prefer an explicit path in env for production reliability.
+  // Optional override (useful for local/dev or custom binaries)
   const envPath = asString(process.env.FFMPEG_PATH);
-  if (envPath) return envPath;
-
-  // Fall back to ffmpeg-static if installed.
-  try {
-    const mod: any = await import("ffmpeg-static");
-    const p = (mod?.default ?? mod) as string;
-    if (p) return p;
-  } catch {
-    // ignore
+  if (envPath) {
+    if (fs.existsSync(envPath)) return envPath;
+    throw new Error(`FFMPEG_PATH was set but file does not exist: ${envPath}`);
   }
 
-  throw new Error(
-    "FFmpeg binary not available. Set FFMPEG_PATH or install ffmpeg-static."
-  );
+  // Static import is required so Next/Vercel file tracing can include the binary.
+  const resolved = (ffmpegStatic as unknown as string) || "";
+  if (!resolved) {
+    throw new Error(
+      "ffmpeg-static did not resolve a binary path (empty). Ensure ffmpeg-static is installed as a production dependency."
+    );
+  }
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(
+      `FFmpeg binary not found at resolved path: ${resolved}. ` +
+        `This usually means the binary was not included in the serverless bundle. ` +
+        `This route uses a static import; if it still fails on Vercel, force-include node_modules/ffmpeg-static/** via Vercel includeFiles/outputFileTracingIncludes.`
+    );
+  }
+
+  return resolved;
 }
 
 async function downloadVideoToTmp(params: {
@@ -204,6 +215,7 @@ async function extractFramesWithFfmpeg(params: {
   } = params;
 
   const ffmpeg = await getFfmpegPath();
+  log("ffmpeg.path", { ...meta, ffmpegPath: ffmpeg });
   const framesDir = path.join(jobDir, "frames");
   await fsp.mkdir(framesDir, { recursive: true });
 
@@ -453,7 +465,13 @@ function toErrorString(err: any, maxLen = 1200) {
 
 function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string } {
   const msg = String(err?.message ?? err ?? "");
-  if (msg.includes("FFmpeg binary not available")) return { nonRetriable: true, reason: "ffmpeg_missing" };
+  if (
+    msg.includes("FFmpeg binary not available") ||
+    msg.includes("FFmpeg binary not found") ||
+    msg.includes("FFMPEG_PATH was set but file does not exist") ||
+    msg.includes("ENOENT")
+  )
+    return { nonRetriable: true, reason: "ffmpeg_missing" };
   if (msg.includes("createSignedUrl failed")) return { nonRetriable: true, reason: "signed_url_failed" };
   if (msg.includes("video_url_missing")) return { nonRetriable: true, reason: "video_url_missing" };
   if (msg.includes("Wardrobe video not found")) return { nonRetriable: true, reason: "row_not_found" };
