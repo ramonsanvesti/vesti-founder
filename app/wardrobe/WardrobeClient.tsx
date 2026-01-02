@@ -68,12 +68,12 @@ type WardrobeVideoRow = {
   // debug (from QStash / processing trace)
   // (support both legacy + new names; API likely returns snake_case from Supabase)
   last_process_message_id?: string | null;
-  last_process_retried?: boolean | null;
+  last_process_retried?: number | boolean | null;
   last_processed_at?: string | null;
 
   // legacy aliases (keep to avoid breaking older responses)
   last_message_id?: string | null;
-  last_retried?: boolean | null;
+  last_retried?: number | boolean | null;
 };
 
 type UploadVideoResponse = {
@@ -157,6 +157,8 @@ const PROCESSING_NO_JOB_GRACE_MS = 60 * 1000; // 1 minute
 
 // If it stays `processing` with no job id beyond this, treat as stuck and allow Reprocess.
 const STUCK_NO_JOB_MS = 2 * 60 * 1000; // 2 minutes
+// If it stays `processing` with a job id beyond this, treat as stuck to avoid endless polling.
+const STUCK_WITH_JOB_MS = 10 * 60 * 1000; // 10 minutes
 
 async function getVideoDurationSeconds(file: File): Promise<number | null> {
   try {
@@ -212,8 +214,10 @@ export default function WardrobeClient() {
   const lastProcessClickAtRef = useRef<Map<string, number>>(new Map());
   // Prevent overlapping GET /api/wardrobe-videos calls (polling can re-enter)
   const videosFetchInFlightRef = useRef(false);
-  // Ensure we never register more than one polling interval (prevents duplicate timers)
-  const videosPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Polling timer (use setTimeout chaining to avoid overlapping intervals)
+  const videosPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasProcessingVideosRef = useRef<boolean>(false);
+  const isMountedRef = useRef<boolean>(true);
 
   // Prevent UI blink: do not re-render if history payload hasn't changed
   const lastVideosJsonRef = useRef<string>("");
@@ -292,7 +296,7 @@ export default function WardrobeClient() {
         setVideosError(null);
       }
 
-      const res = await fetch("/api/wardrobe-videos", { method: "GET" });
+      const res = await fetch("/api/wardrobe-videos", { method: "GET", cache: "no-store" });
       const json = (await res.json().catch(() => ({}))) as ListVideosResponse;
 
       if (!res.ok || !json?.ok) {
@@ -325,6 +329,14 @@ export default function WardrobeClient() {
     } finally {
       videosFetchInFlightRef.current = false;
       if (!silent) setVideosLoading(false);
+    }
+  };
+
+  // Helper to stop polling timer for videos
+  const stopVideosPolling = () => {
+    if (videosPollTimerRef.current) {
+      clearTimeout(videosPollTimerRef.current);
+      videosPollTimerRef.current = null;
     }
   };
 
@@ -366,11 +378,19 @@ export default function WardrobeClient() {
       const messageId = (json?.job_id ?? json?.message_id) ?? null;
       const retriedRaw: any = (json as any)?.qstash_retried;
       const retried =
-        typeof retriedRaw === "boolean"
+        typeof retriedRaw === "number"
           ? retriedRaw
-          : typeof retriedRaw === "string"
-            ? retriedRaw.toLowerCase() === "true"
-            : null;
+          : typeof retriedRaw === "boolean"
+            ? (retriedRaw ? 1 : 0)
+            : typeof retriedRaw === "string"
+              ? (() => {
+                  const s = retriedRaw.toLowerCase().trim();
+                  if (s === "true") return 1;
+                  if (s === "false") return 0;
+                  const n = Number(s);
+                  return Number.isFinite(n) ? n : null;
+                })()
+              : null;
       const updatedRow = (json?.video ?? null) as WardrobeVideoRow | null;
 
       // Optimistic update: status + debug ids; if API returned the full row, prefer it.
@@ -437,8 +457,14 @@ export default function WardrobeClient() {
   };
 
   useEffect(() => {
+    isMountedRef.current = true;
     fetchGarments();
     fetchVideos();
+
+    return () => {
+      isMountedRef.current = false;
+      stopVideosPolling();
+    };
   }, []);
 
   const hasProcessingVideos = useMemo(() => {
@@ -447,9 +473,13 @@ export default function WardrobeClient() {
     return videos.some((v) => {
       if (String(v.status) !== "processing") return false;
 
-      // If we have a real job id, keep polling until the backend flips status.
+      // If we have a real job id, poll, but not forever.
       const jobId = v.last_process_message_id ?? v.last_message_id ?? null;
-      if (jobId) return true;
+      if (jobId) {
+        const createdMs = parseSupabaseTsMs(v.created_at ?? null);
+        if (createdMs == null) return true;
+        return now - createdMs < STUCK_WITH_JOB_MS;
+      }
 
       // If we do NOT have a job id, only poll briefly (queued grace window).
       // This prevents infinite polling when the row is stuck in `processing`.
@@ -460,37 +490,45 @@ export default function WardrobeClient() {
     });
   }, [videos]);
 
-  // Poll only while processing (silent: no loading state flicker)
-  // NOTE: we guard against duplicate intervals (can happen with re-mounts / fast refresh)
+  // Poll only while there are processing videos (silent: no loading state flicker)
+  // Uses setTimeout chaining to avoid overlapping intervals and to allow clean stop conditions.
   useEffect(() => {
+    hasProcessingVideosRef.current = hasProcessingVideos;
+
     // Stop polling when nothing is processing
     if (!hasProcessingVideos) {
-      if (videosPollTimerRef.current) {
-        clearInterval(videosPollTimerRef.current);
-        videosPollTimerRef.current = null;
-      }
+      stopVideosPolling();
       return;
     }
 
-    // Already polling
+    // Already scheduled
     if (videosPollTimerRef.current) return;
 
-    const tick = () => {
+    const tick = async () => {
+      if (!isMountedRef.current) return;
+
       // Don’t poll when tab is hidden (prevents background churn)
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      fetchVideos({ silent: true });
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        // reschedule without calling the API
+        videosPollTimerRef.current = setTimeout(tick, VIDEO_POLL_MS);
+        return;
+      }
+
+      await fetchVideos({ silent: true });
+
+      // Reschedule only if still needed
+      if (isMountedRef.current && hasProcessingVideosRef.current) {
+        videosPollTimerRef.current = setTimeout(tick, VIDEO_POLL_MS);
+      } else {
+        stopVideosPolling();
+      }
     };
 
     // Prime one tick quickly so UI updates soon after queueing
-    tick();
-
-    videosPollTimerRef.current = setInterval(tick, VIDEO_POLL_MS);
+    videosPollTimerRef.current = setTimeout(tick, 250);
 
     return () => {
-      if (videosPollTimerRef.current) {
-        clearInterval(videosPollTimerRef.current);
-        videosPollTimerRef.current = null;
-      }
+      stopVideosPolling();
     };
   }, [hasProcessingVideos]);
 
@@ -687,7 +725,7 @@ export default function WardrobeClient() {
         return;
       }
 
-      const uploadedRow = (json.video ?? null) as WardrobeVideoRow | null;
+      const uploadedRow = ((json.video ?? (json as any).wardrobe_video) ?? null) as WardrobeVideoRow | null;
       setLastVideo({ signedUrl: json.signed_url ?? null, row: uploadedRow });
 
       await fetchVideos();
@@ -937,17 +975,24 @@ export default function WardrobeClient() {
 
               const vv = normalizeVideoRow(v);
               const jobId = vv.last_process_message_id ?? vv.last_message_id ?? null;
+              const retriedRaw = vv.last_process_retried ?? vv.last_retried ?? null;
               const retried =
-                vv.last_process_retried ?? vv.last_retried ?? null;
+                typeof retriedRaw === "number"
+                  ? retriedRaw
+                  : typeof retriedRaw === "boolean"
+                    ? (retriedRaw ? 1 : 0)
+                    : typeof retriedRaw === "string"
+                      ? Number(retriedRaw)
+                      : null;
               const lastProcessedAt = vv.last_processed_at ?? null;
               const playback = getPlaybackUrl(vv);
 
               const createdMs = parseSupabaseTsMs(v.created_at ?? null);
               const isStuckProcessing =
                 s === "processing" &&
-                !jobId &&
                 createdMs != null &&
-                Date.now() - createdMs > STUCK_NO_JOB_MS;
+                ((!!jobId && Date.now() - createdMs > STUCK_WITH_JOB_MS) ||
+                  (!jobId && Date.now() - createdMs > STUCK_NO_JOB_MS));
 
               const isProcessing = (s === "processing" && !isStuckProcessing) || processingVideoId === v.id;
 
@@ -980,7 +1025,7 @@ export default function WardrobeClient() {
                           {retried !== null ? (
                             <span className="text-gray-500">
                               {" "}
-                              · retried {retried ? "yes" : "no"}
+                              · retried {Number.isFinite(retried as any) ? String(retried) : (retried ? "yes" : "no")}
                             </span>
                           ) : null}
                         </div>
