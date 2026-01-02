@@ -231,9 +231,8 @@ async function enqueueProcessJob(args: {
     };
   }
 
-  const dedupeId = safeDedupeId(
-    `wardrobe_video-${wardrobeVideoId}-process-${sampleEverySeconds}-${maxFrames}-${maxWidth}-${maxCandidates}`
-  );
+  // Anti-loop: dedupe per video id (not per params) so repeated calls don't enqueue new messages.
+  const dedupeId = safeDedupeId(`wardrobe_video_${wardrobeVideoId}_process`);
 
   const maxRetries = String(clampInt(process.env.QSTASH_MAX_RETRIES, 3, 0, 3));
   const timeoutSeconds = clampInt(process.env.QSTASH_TIMEOUT_SECONDS, 120, 1, 300);
@@ -520,6 +519,41 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      const currentStatus = String((row as any).status);
+
+      // Anti-loop: if already processing (and we have a message id), do NOT enqueue again.
+      if (currentStatus === "processing" && (row as any).last_process_message_id) {
+        const withUrl = await attachSignedUrl(supabase, row as VideoRow);
+        return NextResponse.json(
+          {
+            ok: true,
+            status: currentStatus,
+            enqueued: false,
+            reason: "already_processing",
+            wardrobe_video_id: row.id,
+            wardrobe_video: withUrl,
+            message_id: (row as any).last_process_message_id,
+          },
+          { status: 200, headers: RESPONSE_HEADERS }
+        );
+      }
+
+      // Anti-loop: if already processed, acknowledge idempotently.
+      if (currentStatus === "processed") {
+        const withUrl = await attachSignedUrl(supabase, row as VideoRow);
+        return NextResponse.json(
+          {
+            ok: true,
+            status: currentStatus,
+            enqueued: false,
+            reason: "already_processed",
+            wardrobe_video_id: row.id,
+            wardrobe_video: withUrl,
+            message_id: (row as any).last_process_message_id ?? null,
+          },
+          { status: 200, headers: RESPONSE_HEADERS }
+        );
+      }
 
       const enqueued = await enqueueProcessJob({
         req,
@@ -560,7 +594,6 @@ export async function POST(req: NextRequest) {
           status: (updated as any)?.status ?? row.status,
           wardrobe_video_id: row.id,
           wardrobe_video: withUrl ?? row,
-          job_id: enqueued?.message_id ?? null,
           message_id: enqueued?.message_id ?? null,
           last_process_message_id: (updated as any)?.last_process_message_id ?? null,
           last_process_retried: (updated as any)?.last_process_retried ?? null,
@@ -571,7 +604,7 @@ export async function POST(req: NextRequest) {
           error: enqueued?.ok ? null : (enqueued as any)?.details ?? "Failed to enqueue processing job",
           error_details: !enqueued?.ok ? JSON.stringify((enqueued as any)?.qstash_error ?? {}) : null,
         },
-        { status: enqueued?.ok ? 202 : 500, headers: RESPONSE_HEADERS }
+        { status: enqueued?.ok && enqueued?.enqueued ? 202 : 500, headers: RESPONSE_HEADERS }
       );
     }
 
