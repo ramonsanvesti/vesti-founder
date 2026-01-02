@@ -444,6 +444,13 @@ async function extractFramesWithFfmpeg(params: {
   return frames;
 }
 
+function toErrorString(err: any, maxLen = 1200) {
+  const s = String(err?.message ?? err ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return s.length > maxLen ? s.slice(0, maxLen) + "…" : s;
+}
+
 function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string } {
   const msg = String(err?.message ?? err ?? "");
   if (msg.includes("FFmpeg binary not available")) return { nonRetriable: true, reason: "ffmpeg_missing" };
@@ -608,6 +615,7 @@ async function handler(req: Request) {
         status: "processing",
         last_process_message_id: qstashMessageId,
         last_process_retried: qstashRetriedSafe,
+        last_process_error: null,
       })
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -648,7 +656,11 @@ async function handler(req: Request) {
 
       await supabase
         .from("wardrobe_videos")
-        .update({ status: "failed", last_processed_at: new Date().toISOString() })
+        .update({
+          status: "failed",
+          last_processed_at: new Date().toISOString(),
+          last_process_error: "video_url_missing",
+        })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
 
@@ -693,6 +705,7 @@ async function handler(req: Request) {
         .update({
           status: "processed",
           last_processed_at: nowIso,
+          last_process_error: null,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID)
@@ -723,11 +736,12 @@ async function handler(req: Request) {
       pipelineErr = err;
 
       const classification = classifyNonRetriable(err);
+      const errStr = toErrorString(err);
       log("process.failed", {
         ...meta,
         nonRetriable: classification.nonRetriable,
         reason: classification.reason,
-        err: String(err?.message ?? err),
+        err: errStr,
       });
 
       const nowIso = new Date().toISOString();
@@ -752,6 +766,7 @@ async function handler(req: Request) {
             status: "failed",
             last_processed_at: nowIso,
             last_process_retried: qstashRetriedSafe,
+            last_process_error: errStr,
           })
           .eq("id", wardrobeVideoId)
           .eq("user_id", FOUNDER_USER_ID);
@@ -777,6 +792,7 @@ async function handler(req: Request) {
         .update({
           status: "processing",
           last_process_retried: qstashRetriedSafe,
+          last_process_error: errStr,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);

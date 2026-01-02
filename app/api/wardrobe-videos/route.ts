@@ -51,6 +51,7 @@ type VideoRow = {
   last_process_message_id?: string | null;
   last_process_retried?: number | null;
   last_processed_at?: string | null;
+  last_process_error?: string | null;
 };
 
 type ProcessActionBody = {
@@ -333,7 +334,7 @@ export async function GET(_req: NextRequest) {
     const { data, error } = await supabase
       .from("wardrobe_videos")
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
       )
       .eq("user_id", FOUNDER_USER_ID)
       .order("created_at", { ascending: false })
@@ -417,7 +418,7 @@ export async function POST(req: NextRequest) {
           video_url: path,
         })
         .select(
-          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
         )
         .single();
 
@@ -446,11 +447,12 @@ export async function POST(req: NextRequest) {
             status: "processing",
             last_process_message_id: enqueued.message_id,
             last_process_retried: 0,
+            last_process_error: null,
           })
           .eq("id", inserted.id)
           .eq("user_id", FOUNDER_USER_ID)
           .select(
-            "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+            "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
           )
           .single();
 
@@ -506,7 +508,7 @@ export async function POST(req: NextRequest) {
       const { data: row, error: loadErr } = await supabase
         .from("wardrobe_videos")
         .select(
-          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
         )
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID)
@@ -572,6 +574,7 @@ export async function POST(req: NextRequest) {
             status: "processing",
             last_process_message_id: enqueued.message_id,
             last_process_retried: 0,
+            last_process_error: null,
           })
           .eq("id", row.id)
           .eq("user_id", FOUNDER_USER_ID);
@@ -580,7 +583,7 @@ export async function POST(req: NextRequest) {
       const { data: updated } = await supabase
         .from("wardrobe_videos")
         .select(
-          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+          "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
         )
         .eq("id", row.id)
         .eq("user_id", FOUNDER_USER_ID)
@@ -627,7 +630,7 @@ export async function POST(req: NextRequest) {
         video_url: videoUrl,
       })
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
       )
       .single();
 
@@ -656,6 +659,7 @@ export async function POST(req: NextRequest) {
             status: "processing",
             last_process_message_id: enqueued.message_id,
             last_process_retried: 0,
+            last_process_error: null,
           })
           .eq("id", inserted.id)
           .eq("user_id", FOUNDER_USER_ID);
