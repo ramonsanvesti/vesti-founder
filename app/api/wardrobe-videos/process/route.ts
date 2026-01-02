@@ -15,11 +15,22 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
+const RESPONSE_HEADERS = { "Cache-Control": "no-store", Allow: "POST,OPTIONS" } as const;
+
 const FOUNDER_USER_ID =
   process.env.FOUNDER_USER_ID ?? "00000000-0000-0000-0000-000000000001";
 
 const WARDROBE_VIDEOS_BUCKET =
   process.env.WARDROBE_VIDEOS_BUCKET ?? "wardrobe-videos";
+
+// App-level retry cap for QStash-delivered jobs. Upstash-Retried is 0 on first attempt.
+// When Upstash-Retried >= MAX_RETRIES, treat as terminal and mark the row failed.
+const MAX_RETRIES = (() => {
+  const raw = (process.env.WARDROBE_VIDEO_MAX_RETRIES ?? "3").trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 3;
+  return Math.max(0, Math.min(20, n));
+})();
 
 function log(event: string, meta: Record<string, any>) {
   // Single-line JSON logs that are easy to grep in Vercel.
@@ -498,22 +509,25 @@ async function handler(req: Request) {
     if (!wardrobeVideoId) {
       return NextResponse.json(
         { ok: false, error: "Missing wardrobe_video_id" },
-        { status: 400, headers: { "Cache-Control": "no-store" } }
+        { status: 400, headers: RESPONSE_HEADERS }
       );
     }
     if (!isUuid(wardrobeVideoId)) {
       return NextResponse.json(
         { ok: false, error: "Invalid wardrobe_video_id" },
-        { status: 400, headers: { "Cache-Control": "no-store" } }
+        { status: 400, headers: RESPONSE_HEADERS }
       );
     }
 
     const qstashMessageId = req.headers.get("Upstash-Message-Id") ?? null;
     const qstashRetriedRaw = req.headers.get("Upstash-Retried");
-    const qstashRetried = qstashRetriedRaw != null && qstashRetriedRaw !== ""
-      ? Number.parseInt(qstashRetriedRaw, 10)
-      : null;
-    const qstashRetriedSafe = Number.isFinite(qstashRetried as any) ? qstashRetried : null;
+    const qstashRetriedParsed = qstashRetriedRaw != null && qstashRetriedRaw !== ""
+      ? Number.parseInt(String(qstashRetriedRaw).trim(), 10)
+      : 0;
+    const qstashRetriedSafe = Number.isFinite(qstashRetriedParsed as any)
+      ? Math.max(0, qstashRetriedParsed)
+      : 0;
+    const isFinalAttempt = qstashRetriedSafe >= MAX_RETRIES;
 
     const supabase = getSupabaseAdminClient();
 
@@ -530,7 +544,7 @@ async function handler(req: Request) {
     if (readErr) {
       return NextResponse.json(
         { ok: false, error: "DB read failed", details: readErr.message },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
+        { status: 500, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -539,7 +553,7 @@ async function handler(req: Request) {
       // Return 200 to prevent QStash from retrying a permanent failure.
       return NextResponse.json(
         { ok: false, error: "Wardrobe video not found", wardrobe_video_id: wardrobeVideoId },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -550,7 +564,7 @@ async function handler(req: Request) {
     ) {
       return NextResponse.json(
         { ok: true, video: existing, idempotent: true },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -575,7 +589,7 @@ async function handler(req: Request) {
           reason: "already_processing",
           active_message_id: (existing as any).last_process_message_id,
         },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -588,7 +602,7 @@ async function handler(req: Request) {
     const maxCandidates = asInt(body.max_candidates, 8, 1, 50);
 
     // Mark as processing at job start (safe for retries).
-    await supabase
+    const { error: markErr } = await supabase
       .from("wardrobe_videos")
       .update({
         status: "processing",
@@ -598,6 +612,15 @@ async function handler(req: Request) {
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
       .in("status", ["uploaded", "processing", "failed"]);
+
+    if (markErr) {
+      log("db.mark_processing_failed", { wardrobeVideoId, messageId: qstashMessageId, retried: qstashRetriedSafe, err: markErr.message });
+      // Retriable: if we can’t mark processing, return 500 so QStash retries.
+      return NextResponse.json(
+        { ok: false, error: "DB update failed", details: markErr.message },
+        { status: 500, headers: RESPONSE_HEADERS }
+      );
+    }
 
     // ------------------------------
     // VESTI-5.4 — Extract frames (ephemeral)
@@ -625,13 +648,13 @@ async function handler(req: Request) {
 
       await supabase
         .from("wardrobe_videos")
-        .update({ status: "failed" })
+        .update({ status: "failed", last_processed_at: new Date().toISOString() })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
 
       return NextResponse.json(
         { ok: false, error: "Missing video_url on wardrobe_videos row", non_retriable: true },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -694,7 +717,7 @@ async function handler(req: Request) {
           frames_extracted: frames.length,
           sample_every_seconds: sampleEverySeconds,
         },
-        { status: 200, headers: { "Cache-Control": "no-store" } }
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     } catch (err: any) {
       pipelineErr = err;
@@ -707,34 +730,66 @@ async function handler(req: Request) {
         err: String(err?.message ?? err),
       });
 
-      if (classification.nonRetriable) {
-        // Fail closed and stop QStash retries for permanent config/data issues.
+      const nowIso = new Date().toISOString();
+
+      // Terminal failure conditions:
+      // - non-retriable classification
+      // - final attempt (Upstash-Retried >= MAX_RETRIES)
+      if (classification.nonRetriable || isFinalAttempt) {
+        const terminalReason = classification.nonRetriable
+          ? `non_retriable:${classification.reason}`
+          : "max_retries_exceeded";
+
+        log("process.terminal_failed", {
+          ...meta,
+          terminalReason,
+          maxRetries: MAX_RETRIES,
+        });
+
         await supabase
           .from("wardrobe_videos")
-          .update({ status: "failed" })
+          .update({
+            status: "failed",
+            last_processed_at: nowIso,
+            last_process_retried: qstashRetriedSafe,
+          })
           .eq("id", wardrobeVideoId)
           .eq("user_id", FOUNDER_USER_ID);
 
+        // Return 200 to stop further QStash retries.
         return NextResponse.json(
           {
             ok: false,
-            error: "Processing failed (non-retriable)",
-            reason: classification.reason,
+            error: "Processing failed",
+            terminal: true,
+            reason: terminalReason,
+            retried: qstashRetriedSafe,
+            max_retries: MAX_RETRIES,
             details: String(err?.message ?? err),
           },
-          { status: 200, headers: { "Cache-Control": "no-store" } }
+          { status: 200, headers: RESPONSE_HEADERS }
         );
       }
 
-      // Retriable failures: keep status as processing and return 500 so QStash retries.
-      // The status machine remains consistent (no corruption).
+      // Retriable (not final): keep processing and return 500 so QStash retries.
+      await supabase
+        .from("wardrobe_videos")
+        .update({
+          status: "processing",
+          last_process_retried: qstashRetriedSafe,
+        })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID);
+
       return NextResponse.json(
         {
           ok: false,
           error: "Processing failed (retriable)",
+          retried: qstashRetriedSafe,
+          max_retries: MAX_RETRIES,
           details: String(err?.message ?? err),
         },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
+        { status: 500, headers: RESPONSE_HEADERS }
       );
     } finally {
       // Ephemeral guarantee: remove /tmp artifacts.
@@ -743,7 +798,7 @@ async function handler(req: Request) {
   } catch (err: any) {
     return NextResponse.json(
       { ok: false, error: "Server error", details: err?.message ?? "unknown" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
+      { status: 500, headers: RESPONSE_HEADERS }
     );
   }
 }
@@ -766,8 +821,12 @@ export const POST = hasSigningKeys
             details:
               "Set QSTASH_CURRENT_SIGNING_KEY and/or QSTASH_NEXT_SIGNING_KEY in the environment.",
           },
-          { status: 500, headers: { "Cache-Control": "no-store" } }
+          { status: 500, headers: RESPONSE_HEADERS }
         );
       }
       return handler(req);
     };
+
+export const OPTIONS = async () => {
+  return new NextResponse(null, { status: 204, headers: RESPONSE_HEADERS });
+};
