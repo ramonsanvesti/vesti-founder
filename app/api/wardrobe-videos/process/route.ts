@@ -554,6 +554,36 @@ async function handler(req: Request) {
       : 0;
     const isFinalAttempt = qstashRetriedSafe >= MAX_RETRIES;
 
+    // Safety guard: if a message arrives with retried already beyond our cap (e.g. cap lowered after enqueue),
+    // stop the loop by marking failed and ACKing 200.
+    if (qstashRetriedSafe > MAX_RETRIES) {
+      const supabase = getSupabaseAdminClient();
+      const nowIso = new Date().toISOString();
+
+      await supabase
+        .from("wardrobe_videos")
+        .update({
+          status: "failed",
+          last_processed_at: nowIso,
+          last_process_retried: qstashRetriedSafe,
+          last_process_error: `Max retries exceeded (${qstashRetriedSafe}/${MAX_RETRIES})`,
+        })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID);
+
+      return NextResponse.json(
+        {
+          ok: false,
+          wardrobe_video_id: wardrobeVideoId,
+          status: "failed",
+          error: "Max retries exceeded",
+          retried: qstashRetriedSafe,
+          max_retries: MAX_RETRIES,
+        },
+        { status: 200, headers: RESPONSE_HEADERS }
+      );
+    }
+
     const supabase = getSupabaseAdminClient();
 
     // Pre-read for idempotency & clearer errors.
@@ -671,19 +701,63 @@ async function handler(req: Request) {
       markPayload.last_process_error = null;
     }
 
-    const { error: markErr } = await supabase
+    const { data: markedRow, error: markErr } = await supabase
       .from("wardrobe_videos")
       .update(markPayload)
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
-      .in("status", ["uploaded", "processing", "failed"]);
+      .in("status", ["uploaded", "processing", "failed"])
+      .select(
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
+      )
+      .maybeSingle();
 
     if (markErr) {
-      log("db.mark_processing_failed", { wardrobeVideoId, messageId: qstashMessageId, retried: qstashRetriedSafe, err: markErr.message });
+      log("db.mark_processing_failed", {
+        wardrobeVideoId,
+        messageId: qstashMessageId,
+        retried: qstashRetriedSafe,
+        err: markErr.message,
+      });
+
+      // On the final attempt, mark failed and ACK 200 to stop further retries.
+      if (isFinalAttempt) {
+        const nowIso = new Date().toISOString();
+        await supabase
+          .from("wardrobe_videos")
+          .update({
+            status: "failed",
+            last_processed_at: nowIso,
+            last_process_retried: qstashRetriedSafe,
+            last_process_error: `DB mark-processing failed: ${markErr.message}`,
+          })
+          .eq("id", wardrobeVideoId)
+          .eq("user_id", FOUNDER_USER_ID);
+
+        return NextResponse.json(
+          { ok: false, error: "DB update failed", terminal: true, details: markErr.message },
+          { status: 200, headers: RESPONSE_HEADERS }
+        );
+      }
+
       // Retriable: if we can’t mark processing, return 500 so QStash retries.
       return NextResponse.json(
         { ok: false, error: "DB update failed", details: markErr.message },
         { status: 500, headers: RESPONSE_HEADERS }
+      );
+    }
+
+    if (!markedRow) {
+      // Nothing updated (row not eligible / wrong status). Skip heavy work.
+      log("process.skip_not_eligible", {
+        wardrobeVideoId,
+        messageId: qstashMessageId,
+        retried: qstashRetriedSafe,
+      });
+
+      return NextResponse.json(
+        { ok: true, wardrobe_video_id: wardrobeVideoId, skipped: true, reason: "not_eligible" },
+        { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
@@ -706,7 +780,7 @@ async function handler(req: Request) {
     log("process.start", meta);
 
     // Validate source.
-    const videoUrl = asString((existing as any).video_url);
+    const videoUrl = asString((markedRow as any).video_url);
     if (!videoUrl) {
       const reason = "video_url_missing";
       log("process.non_retriable", { ...meta, reason });
