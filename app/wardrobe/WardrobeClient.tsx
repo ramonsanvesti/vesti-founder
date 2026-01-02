@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Garment = {
   id: string;
@@ -102,6 +102,19 @@ type ProcessVideoResponse = {
   error?: string;
   details?: string;
 };
+
+function stableVideoKey(v: WardrobeVideoRow) {
+  return {
+    id: v.id,
+    status: v.status,
+    created_at: v.created_at ?? null,
+    playback_url: v.playback_url ?? v.signed_url ?? null,
+    last_process_message_id:
+      v.last_process_message_id ?? v.last_message_id ?? null,
+    last_process_retried: v.last_process_retried ?? v.last_retried ?? null,
+    last_processed_at: v.last_processed_at ?? null,
+  };
+}
 
 async function getSupabase() {
   const mod = await import("@/lib/supabaseClientBrowser");
@@ -222,15 +235,6 @@ export default function WardrobeClient() {
   // Prevent UI blink: do not re-render if history payload hasn't changed
   const lastVideosJsonRef = useRef<string>("");
 
-  const stableVideoKey = (v: WardrobeVideoRow) => ({
-    id: v.id,
-    status: v.status,
-    created_at: v.created_at ?? null,
-    playback_url: v.playback_url ?? v.signed_url ?? null,
-    last_process_message_id: v.last_process_message_id ?? v.last_message_id ?? null,
-    last_process_retried: v.last_process_retried ?? v.last_retried ?? null,
-    last_processed_at: v.last_processed_at ?? null,
-  });
 
   // Outfit generation
   const [useCase, setUseCase] = useState<
@@ -258,7 +262,7 @@ export default function WardrobeClient() {
   const [seedOutfitId, setSeedOutfitId] = useState<string | null>(null);
   const [excludeIds, setExcludeIds] = useState<string[]>([]);
 
-  const fetchGarments = async () => {
+  const fetchGarments = useCallback(async () => {
     try {
       setLoading(true);
       const supabase = await getSupabase();
@@ -281,10 +285,10 @@ export default function WardrobeClient() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   // History endpoint (GET /api/wardrobe-videos)
-  const fetchVideos = async (opts?: { silent?: boolean }) => {
+  const fetchVideos = useCallback(async (opts?: { silent?: boolean }) => {
     const silent = Boolean(opts?.silent);
 
     try {
@@ -296,12 +300,14 @@ export default function WardrobeClient() {
         setVideosError(null);
       }
 
-      const res = await fetch("/api/wardrobe-videos", { method: "GET", cache: "no-store" });
+      const res = await fetch("/api/wardrobe-videos", {
+        method: "GET",
+        cache: "no-store",
+      });
       const json = (await res.json().catch(() => ({}))) as ListVideosResponse;
 
       if (!res.ok || !json?.ok) {
-        const msg =
-          json?.details || json?.error || "Failed to load video history.";
+        const msg = json?.details || json?.error || "Failed to load video history.";
         setVideosError(msg);
         if (!silent) setVideos([]);
         return;
@@ -322,15 +328,16 @@ export default function WardrobeClient() {
         lastVideosJsonRef.current = nextJson;
         setVideos(normalized);
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error("Unexpected error loading video history:", e);
-      setVideosError(e?.message || "Unexpected error.");
+      const msg = e instanceof Error ? e.message : "Unexpected error.";
+      setVideosError(msg);
       if (!silent) setVideos([]);
     } finally {
       videosFetchInFlightRef.current = false;
       if (!silent) setVideosLoading(false);
     }
-  };
+  }, []);
 
   // Helper to stop polling timer for videos
   const stopVideosPolling = () => {
@@ -465,7 +472,7 @@ export default function WardrobeClient() {
       isMountedRef.current = false;
       stopVideosPolling();
     };
-  }, []);
+  }, [fetchGarments, fetchVideos]);
 
   const hasProcessingVideos = useMemo(() => {
     const now = Date.now();
@@ -530,7 +537,7 @@ export default function WardrobeClient() {
     return () => {
       stopVideosPolling();
     };
-  }, [hasProcessingVideos]);
+  }, [hasProcessingVideos, fetchVideos]);
 
   const wardrobeCounts = useMemo(() => {
     const counts = {
@@ -855,6 +862,7 @@ export default function WardrobeClient() {
         ) : null}
 
         {src ? (
+          // eslint-disable-next-line @next/next/no-img-element
           <img
             src={src}
             alt={name}

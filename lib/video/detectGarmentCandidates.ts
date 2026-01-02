@@ -88,11 +88,6 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function uuidLike(): string {
-  // Lightweight unique id. Deterministic uniqueness is not required here.
-  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
-}
-
 function stableCandidateId(fingerprint: string, frameIndex: number): string {
   // Deterministic id for retry-safe inserts.
   // Using sha1 is fine here (not for security), just compact determinism.

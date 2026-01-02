@@ -327,7 +327,7 @@ async function enqueueProcessJob(args: {
   };
 }
 
-export async function GET(_req: NextRequest) {
+export async function GET() {
   try {
     const supabase = getSupabaseAdminClient();
 

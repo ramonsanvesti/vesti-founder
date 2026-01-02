@@ -196,7 +196,7 @@ async function assertReadableFile(p: string): Promise<void> {
   try {
     const st = await fs.stat(p);
     if (!st.isFile()) throw new Error("not a file");
-  } catch (e: any) {
+  } catch {
     throw new Error(`Video file not found or not readable: ${p}`);
   }
 }

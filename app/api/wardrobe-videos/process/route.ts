@@ -775,6 +775,7 @@ async function handler(req: Request) {
       sampleEverySeconds,
       maxFrames,
       maxWidth,
+      maxCandidates,
     };
 
     log("process.start", meta);
@@ -804,7 +805,6 @@ async function handler(req: Request) {
     const inputPath = path.join(jobDir, "input.mp4");
 
     let frames: ExtractedFrame[] = [];
-    let pipelineErr: any = null;
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
@@ -864,7 +864,6 @@ async function handler(req: Request) {
         { status: 200, headers: RESPONSE_HEADERS }
       );
     } catch (err: any) {
-      pipelineErr = err;
 
       const classification = classifyNonRetriable(err);
       const errStr = toErrorString(err);

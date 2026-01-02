@@ -28,8 +28,6 @@ import { computeDeterministicScores } from "@/lib/scoring";
  * - Back-compat: accepts legacy modes "photo" | "multi_photo" | "outfit_photo" and maps them internally.
  */
 
-type IngestMode = "photo" | "text" | "batch" | "multi_photo" | "outfit_photo";
-
 type IngestRequestBody =
   | { mode: "photo"; payload: { imageUrl: string } }
   | { mode: "text"; payload: { query: string; imageUrl?: string | null } }
@@ -382,8 +380,6 @@ async function insertOneGarment(args: {
   });
 
   // Always persist integer scores, defaulting to 3 if not an integer.
-  const comfortScore = Number.isInteger(scoring?.final?.comfort) ? scoring.final.comfort : 3;
-  const formalityScore = Number.isInteger(scoring?.final?.formality) ? scoring.final.formality : 3;
 
   const lock = enforceSlotCategoryLock({
     slotHint: slotHint ?? null,
@@ -813,7 +809,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "payload.imageUrl is empty" }, { status: 400 });
       }
 
-      const { results, okCount } = await handleBatch({
+      const { results } = await handleBatch({
         supabase,
         userId: fakeUserId,
         imageUrls: [imageUrl],
