@@ -560,7 +560,7 @@ async function handler(req: Request) {
     const { data: existing, error: readErr } = await supabase
       .from("wardrobe_videos")
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error"
       )
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -582,11 +582,45 @@ async function handler(req: Request) {
       );
     }
 
-    // If this message already completed processing, acknowledge idempotently.
+    const baseMeta = {
+      wardrobeVideoId,
+      messageId: qstashMessageId,
+      retried: qstashRetriedSafe,
+    };
+
+    // Reconcile: if we somehow have last_processed_at set with no error, but status is still "processing",
+    // treat it as processed and fix the row. This prevents the UI from being stuck in processing.
     if (
-      String((existing as any).status) === "processed" &&
-      ((existing as any).last_process_message_id == null || (existing as any).last_process_message_id === qstashMessageId)
+      String((existing as any).status) === "processing" &&
+      (existing as any).last_processed_at &&
+      ((existing as any).last_process_error == null || String((existing as any).last_process_error).trim() === "")
     ) {
+      log("process.reconcile_processed", {
+        ...baseMeta,
+        last_processed_at: (existing as any).last_processed_at,
+      });
+
+      await supabase
+        .from("wardrobe_videos")
+        .update({
+          status: "processed",
+          last_process_error: null,
+        })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID);
+
+      return NextResponse.json(
+        {
+          ok: true,
+          video: { ...(existing as any), status: "processed" },
+          reconciled: true,
+        },
+        { status: 200, headers: RESPONSE_HEADERS }
+      );
+    }
+
+    // If already processed, acknowledge idempotently (even if a duplicate message arrives).
+    if (String((existing as any).status) === "processed") {
       return NextResponse.json(
         { ok: true, video: existing, idempotent: true },
         { status: 200, headers: RESPONSE_HEADERS }
@@ -627,14 +661,19 @@ async function handler(req: Request) {
     const maxCandidates = asInt(body.max_candidates, 8, 1, 50);
 
     // Mark as processing at job start (safe for retries).
+    // Important: don't wipe last_process_error on retries; keep the last failure visible.
+    const markPayload: Record<string, any> = {
+      status: "processing",
+      last_process_message_id: qstashMessageId,
+      last_process_retried: qstashRetriedSafe,
+    };
+    if (qstashRetriedSafe === 0) {
+      markPayload.last_process_error = null;
+    }
+
     const { error: markErr } = await supabase
       .from("wardrobe_videos")
-      .update({
-        status: "processing",
-        last_process_message_id: qstashMessageId,
-        last_process_retried: qstashRetriedSafe,
-        last_process_error: null,
-      })
+      .update(markPayload)
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
       .in("status", ["uploaded", "processing", "failed"]);
