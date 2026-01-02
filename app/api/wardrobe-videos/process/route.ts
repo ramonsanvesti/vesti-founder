@@ -42,6 +42,15 @@ const MAX_VIDEO_SECONDS = (() => {
   return Math.max(1, Math.min(300, n));
 })();
 
+class NonRetriableError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "NonRetriableError";
+    this.code = code;
+  }
+}
+
 function log(event: string, meta: Record<string, any>) {
   // Single-line JSON logs that are easy to grep in Vercel.
   console.log(
@@ -475,19 +484,23 @@ function toErrorString(err: any, maxLen = 1200) {
 }
 
 function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string } {
+  if (err?.name === "NonRetriableError" && typeof err?.code === "string") {
+    return { nonRetriable: true, reason: err.code };
+  }
+
   const msg = String(err?.message ?? err ?? "");
   if (
     msg.includes("FFmpeg binary not available") ||
     msg.includes("FFmpeg binary not found") ||
     msg.includes("FFMPEG_PATH was set but file does not exist") ||
     msg.includes("ENOENT")
-  )
+  ) {
     return { nonRetriable: true, reason: "ffmpeg_missing" };
+  }
   if (msg.includes("createSignedUrl failed")) return { nonRetriable: true, reason: "signed_url_failed" };
   if (msg.includes("video_url_missing")) return { nonRetriable: true, reason: "video_url_missing" };
-  if (msg.includes("video_too_long") || msg.includes("Video duration exceeds"))
-    return { nonRetriable: true, reason: "video_too_long" };
   if (msg.includes("Wardrobe video not found")) return { nonRetriable: true, reason: "row_not_found" };
+
   return { nonRetriable: false, reason: "transient_or_unknown" };
 }
 
@@ -603,7 +616,7 @@ async function handler(req: Request) {
     const { data: existing, error: readErr } = await supabase
       .from("wardrobe_videos")
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
       )
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -723,7 +736,7 @@ async function handler(req: Request) {
       .eq("user_id", FOUNDER_USER_ID)
       .in("status", ["uploaded", "processing", "failed"])
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
       )
       .maybeSingle();
 
@@ -810,6 +823,7 @@ async function handler(req: Request) {
           frames_extracted_count: 0,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
+          duration_seconds: null,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
@@ -823,6 +837,7 @@ async function handler(req: Request) {
     const inputPath = path.join(jobDir, "input.mp4");
 
     let frames: ExtractedFrame[] = [];
+    let durationSeconds: number | null = null;
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
@@ -835,10 +850,12 @@ async function handler(req: Request) {
       });
 
       // Guardrail: enforce max duration (product constraint) to protect cost/time.
-      const durationSeconds = await probeDurationSeconds({ inputPath, meta });
+      durationSeconds = await probeDurationSeconds({ inputPath, meta });
       if (durationSeconds != null && durationSeconds > MAX_VIDEO_SECONDS + 0.2) {
-        throw new Error(
-          `video_too_long: Video duration exceeds ${MAX_VIDEO_SECONDS}s (got ${durationSeconds.toFixed(2)}s)`
+        const dur = Number(durationSeconds.toFixed(2));
+        throw new NonRetriableError(
+          "duration_gt_max",
+          `Video longer than ${MAX_VIDEO_SECONDS}s (${dur}s). Please upload a video <= ${MAX_VIDEO_SECONDS}s.`
         );
       }
 
@@ -867,11 +884,12 @@ async function handler(req: Request) {
           frames_extracted_count: frames.length,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
+          duration_seconds: durationSeconds ?? null,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID)
         .select(
-          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at,frames_extracted_count,sample_every_seconds_used,max_width_used"
+          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
         )
         .single();
 
@@ -892,6 +910,7 @@ async function handler(req: Request) {
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
+          duration_seconds: durationSeconds,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -932,6 +951,7 @@ async function handler(req: Request) {
             frames_extracted_count: frames.length,
             sample_every_seconds_used: sampleEverySeconds,
             max_width_used: maxWidth,
+            duration_seconds: durationSeconds ?? null,
           })
           .eq("id", wardrobeVideoId)
           .eq("user_id", FOUNDER_USER_ID);
@@ -961,6 +981,7 @@ async function handler(req: Request) {
           frames_extracted_count: frames.length,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
+          duration_seconds: durationSeconds ?? null,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
