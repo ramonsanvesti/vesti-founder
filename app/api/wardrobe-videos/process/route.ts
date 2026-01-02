@@ -860,6 +860,7 @@ async function handler(req: Request) {
           retried: qstashRetriedSafe,
           frames_extracted: frames.length,
           sample_every_seconds: sampleEverySeconds,
+          max_candidates: maxCandidates,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
