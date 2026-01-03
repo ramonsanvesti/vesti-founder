@@ -893,7 +893,7 @@ export default function WardrobeClient() {
     <main className="p-6 space-y-8">
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">
-          VESTI · Wardrobe OS (Founder Edition)
+          DRESZI - personal style intelligence system - v0.1.1-beta.1.
         </h1>
         <p className="text-sm text-gray-500">
           Upload by photo or add by text. Generate rules-based outfits. Upload a
