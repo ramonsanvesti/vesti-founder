@@ -616,7 +616,7 @@ async function handler(req: Request) {
     const { data: existing, error: readErr } = await supabase
       .from("wardrobe_videos")
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,video_duration_seconds,video_bytes"
       )
       .eq("id", wardrobeVideoId)
       .eq("user_id", FOUNDER_USER_ID)
@@ -736,7 +736,7 @@ async function handler(req: Request) {
       .eq("user_id", FOUNDER_USER_ID)
       .in("status", ["uploaded", "processing", "failed"])
       .select(
-        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
+        "id,user_id,status,video_url,created_at,last_process_message_id,last_process_retried,last_processed_at,last_process_error,frames_extracted_count,sample_every_seconds_used,max_width_used,video_duration_seconds,video_bytes"
       )
       .maybeSingle();
 
@@ -823,7 +823,8 @@ async function handler(req: Request) {
           frames_extracted_count: 0,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
-          duration_seconds: null,
+          video_duration_seconds: null,
+          video_bytes: null,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
@@ -838,19 +839,32 @@ async function handler(req: Request) {
 
     let frames: ExtractedFrame[] = [];
     let durationSeconds: number | null = null;
+    let videoBytes: number | null = null;
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
-      await downloadVideoToTmp({
+      const dl = await downloadVideoToTmp({
         supabase,
         bucket: WARDROBE_VIDEOS_BUCKET,
         objectPathOrUrl: videoUrl,
         outPath: inputPath,
         meta,
       });
+      videoBytes = dl.bytes;
 
       // Guardrail: enforce max duration (product constraint) to protect cost/time.
       durationSeconds = await probeDurationSeconds({ inputPath, meta });
+
+      // Early audit update for duration/bytes even if the job fails later.
+      await supabase
+        .from("wardrobe_videos")
+        .update({
+          video_bytes: videoBytes,
+          video_duration_seconds: durationSeconds ?? null,
+        })
+        .eq("id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID);
+
       if (durationSeconds != null && durationSeconds > MAX_VIDEO_SECONDS + 0.2) {
         const dur = Number(durationSeconds.toFixed(2));
         throw new NonRetriableError(
@@ -884,12 +898,13 @@ async function handler(req: Request) {
           frames_extracted_count: frames.length,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
-          duration_seconds: durationSeconds ?? null,
+          video_duration_seconds: durationSeconds ?? null,
+          video_bytes: videoBytes,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID)
         .select(
-          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at,frames_extracted_count,sample_every_seconds_used,max_width_used,duration_seconds"
+          "id,user_id,video_url,status,created_at,last_process_message_id,last_process_retried,last_processed_at,frames_extracted_count,sample_every_seconds_used,max_width_used,video_duration_seconds,video_bytes"
         )
         .single();
 
@@ -910,7 +925,8 @@ async function handler(req: Request) {
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
-          duration_seconds: durationSeconds,
+          video_duration_seconds: durationSeconds,
+          video_bytes: videoBytes,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -951,7 +967,8 @@ async function handler(req: Request) {
             frames_extracted_count: frames.length,
             sample_every_seconds_used: sampleEverySeconds,
             max_width_used: maxWidth,
-            duration_seconds: durationSeconds ?? null,
+            video_duration_seconds: durationSeconds ?? null,
+            video_bytes: videoBytes,
           })
           .eq("id", wardrobeVideoId)
           .eq("user_id", FOUNDER_USER_ID);
@@ -966,6 +983,8 @@ async function handler(req: Request) {
             retried: qstashRetriedSafe,
             max_retries: MAX_RETRIES,
             details: String(err?.message ?? err),
+            video_duration_seconds: durationSeconds,
+            video_bytes: videoBytes,
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -981,7 +1000,8 @@ async function handler(req: Request) {
           frames_extracted_count: frames.length,
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
-          duration_seconds: durationSeconds ?? null,
+          video_duration_seconds: durationSeconds ?? null,
+          video_bytes: videoBytes,
         })
         .eq("id", wardrobeVideoId)
         .eq("user_id", FOUNDER_USER_ID);
@@ -993,6 +1013,8 @@ async function handler(req: Request) {
           retried: qstashRetriedSafe,
           max_retries: MAX_RETRIES,
           details: String(err?.message ?? err),
+          video_duration_seconds: durationSeconds,
+          video_bytes: videoBytes,
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
