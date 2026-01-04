@@ -10,13 +10,18 @@ export default function Page() {
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [intent, setIntent] = useState("");
   const [consent, setConsent] = useState(true);
   const [company, setCompany] = useState(""); // honeypot
 
   const canSubmit = useMemo(() => {
     if (status === "loading") return false;
-    return email.trim().length > 3;
-  }, [email, status]);
+
+    const e = email.trim();
+    const emailOk = e.length > 3 && e.includes("@") && e.includes(".");
+
+    return emailOk && consent;
+  }, [email, status, consent]);
 
   async function onRequestAccessSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -39,6 +44,7 @@ export default function Page() {
         body: JSON.stringify({
           name,
           email,
+          intent,
           consent,
           company, // honeypot
           utm,
@@ -56,6 +62,7 @@ export default function Page() {
       setStatus("success");
       setName("");
       setEmail("");
+      setIntent("");
       setConsent(true);
       setCompany("");
     } catch {
@@ -71,14 +78,19 @@ export default function Page() {
         <header className="space-y-6">
           <p className="text-xs uppercase tracking-[0.22em] text-[#6B4A34]">DRESZI</p>
           <h1 className="text-4xl font-semibold leading-tight md:text-5xl">
-            Personal style intelligence.
+            Dress better.
             <br />
-            Calm, clarity, intention.
+            Think less.
           </h1>
           <p className="text-lg leading-relaxed text-[#3B2418]">
-            DRESZI is a personal style intelligence system. A guide that brings clarity,
-            intention, and calm to the daily ritual of getting dressed.
+            Personal style intelligence that learns your wardrobe and your rhythm, then gives you clear outfits in seconds.
           </p>
+
+          <ul className="grid gap-2 text-sm leading-relaxed text-[#3B2418]">
+            <li>Outfits that match your day</li>
+            <li>Less decision fatigue</li>
+            <li>More consistency in how you show up</li>
+          </ul>
 
           <div className="flex flex-wrap gap-3 pt-2">
             <a
@@ -95,6 +107,56 @@ export default function Page() {
             </a>
           </div>
         </header>
+
+        {/* How it works */}
+        <section className="mt-14 space-y-6">
+          <h2 className="text-xl font-semibold tracking-tight">How it works</h2>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#6B4A34]">Step 1</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
+                Capture your wardrobe with photos or a short video.
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#6B4A34]">Step 2</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
+                DRESZI learns patterns over time. Colors, silhouettes, and the rhythm of your days.
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#6B4A34]">Step 3</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
+                You get outfits based on context. Weather, time, occasion, energy.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        {/* Who it is for */}
+        <section className="mt-14 space-y-6">
+          <h2 className="text-xl font-semibold tracking-tight">Who it is for</h2>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">People who want ease</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">If getting dressed feels like friction, DRESZI gives you clarity fast.</p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">Professionals building a silhouette</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">Consistency in how you show up, without overthinking.</p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-5 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">Anyone tired of more options</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">Less noise. More intentional choices from what you already own.</p>
+            </div>
+          </div>
+        </section>
 
         {/* Manifesto */}
         <section id="manifesto" className="mt-16 space-y-6">
@@ -115,6 +177,21 @@ export default function Page() {
           </div>
         </section>
 
+        {/* Beta */}
+        <section className="mt-16 space-y-6">
+          <h2 className="text-xl font-semibold tracking-tight">What you get in the beta</h2>
+
+          <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+            <ul className="grid gap-2 text-sm leading-relaxed text-[#3B2418]">
+              <li>Early access to the core wardrobe capture flow</li>
+              <li>Outfit recommendations based on your real closet</li>
+              <li>A short onboarding to learn your preferences</li>
+              <li>Direct feedback loop with the founder</li>
+              <li>Light updates only when something changes</li>
+            </ul>
+          </div>
+        </section>
+
         {/* CTA */}
         <section
           id="request-access"
@@ -123,7 +200,7 @@ export default function Page() {
           <div className="space-y-2">
             <h2 className="text-xl font-semibold tracking-tight">Request access</h2>
             <p className="text-sm leading-relaxed text-[#3B2418]">
-              Leave your email and we’ll reach out when the beta opens. No spam.
+              Leave your email and we’ll reach out when the beta opens. No noise. Just access.
             </p>
           </div>
 
@@ -156,6 +233,23 @@ export default function Page() {
                 </label>
               </div>
 
+              <label className="grid gap-1">
+                <span className="text-xs font-medium text-[#6B4A34]">What do you want DRESZI to help you with? (optional)</span>
+                <select
+                  name="intent"
+                  value={intent}
+                  onChange={(e) => setIntent(e.target.value)}
+                  className="w-full rounded-xl border border-[#2A1B12]/15 bg-white/70 px-4 py-3 text-sm outline-none transition focus:border-[#2A1B12]/30"
+                >
+                  <option value="">Select one</option>
+                  <option value="work_outfits">Work outfits</option>
+                  <option value="weekends">Weekends</option>
+                  <option value="travel">Travel</option>
+                  <option value="minimal_wardrobe">Minimal wardrobe</option>
+                  <option value="less_decisions">Less decisions</option>
+                </select>
+              </label>
+
               {/* Honeypot */}
               <input
                 name="company"
@@ -177,14 +271,18 @@ export default function Page() {
                   className="mt-1"
                 />
                 <span className="text-sm text-[#3B2418]">
-                  I agree to be contacted about DRESZI updates.
+                  I agree to be contacted about early access and product updates.
                 </span>
               </label>
 
-              {status === "error" && (
-                <p className="text-sm text-[#3B2418]">
-                  {errorMsg}
+              {!consent && (
+                <p className="text-xs text-[#6B4A34]">
+                  Consent is required so we can invite you to the beta.
                 </p>
+              )}
+
+              {status === "error" && (
+                <p className="text-sm text-[#3B2418]">{errorMsg}</p>
               )}
 
               <button
@@ -195,17 +293,24 @@ export default function Page() {
                 {status === "loading" ? "Sending…" : "Submit"}
               </button>
 
-              <p className="pt-3 text-xs text-[#6B4A34]">
-                Contact: <a className="underline" href="mailto:hello@dresz.io">hello@dresz.io</a>
-              </p>
+              <div className="pt-3 space-y-1 text-xs text-[#6B4A34]">
+                <p>
+                  Contact: <a className="underline" href="mailto:hello@dresz.io">hello@dresz.io</a>
+                </p>
+                <p>
+                  For investors: request the deck and roadmap at <a className="underline" href="mailto:hello@dresz.io?subject=DRESZI%20Investor%20Info">hello@dresz.io</a>
+                </p>
+              </div>
             </form>
           ) : (
             <div className="mt-6 rounded-2xl border border-[#2A1B12]/10 bg-white/50 p-6">
               <p className="text-lg font-semibold text-[#2A1B12]">You’re in.</p>
               <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
-                We’ll reach out soon with early access details.
+                We’ll reach out when your early access is ready.
                 <br />
-                Quick favor: check your inbox and, if you don’t see us, look in Promotions or Spam and mark us as <span className="font-medium">Not spam</span> so DRESZI can actually reach you.
+                Quick favor: if you don’t see us, check Promotions or Spam and mark us as <span className="font-medium">Not spam</span> so DRESZI can actually reach you.
+                <br />
+                We will never sell your email.
               </p>
               <p className="mt-4 text-xs text-[#6B4A34]">
                 No noise. No blasts. Just product updates and access.
@@ -223,8 +328,54 @@ export default function Page() {
           )}
         </section>
 
+        {/* Investor CTA */}
+        <section className="mt-16">
+          <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+            <h2 className="text-xl font-semibold tracking-tight">For investors</h2>
+            <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
+              If you want the product thesis, deck, and roadmap, email us.
+            </p>
+            <div className="mt-4">
+              <a
+                className="inline-flex items-center justify-center rounded-full bg-[#2A1B12] px-6 py-3 text-sm font-semibold text-[#F2E0C9] shadow-sm transition hover:opacity-95"
+                href="mailto:hello@dresz.io?subject=DRESZI%20Investor%20Info"
+              >
+                Request the deck
+              </a>
+            </div>
+          </div>
+        </section>
+
+        {/* FAQ */}
+        <section className="mt-16 space-y-6">
+          <h2 className="text-xl font-semibold tracking-tight">FAQ</h2>
+
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">Is this a shopping app?</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">No. DRESZI starts with what you already own. Clarity first.</p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">Do I need new clothes?</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">Not for the beta. The goal is better outfits, not more items.</p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">When does the beta start?</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">Rolling invites. Friends and family first, then wider access.</p>
+            </div>
+
+            <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
+              <p className="text-sm font-semibold text-[#2A1B12]">What do you do with my data?</p>
+              <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">We only use your email to contact you about access and updates. We will never sell your email.</p>
+            </div>
+          </div>
+        </section>
+
         <footer className="mt-14 border-t border-[#2A1B12]/10 pt-8 text-xs text-[#6B4A34]">
           © {new Date().getFullYear()} DRESZI. All rights reserved.
+          <span className="block pt-2">Built in Austin.</span>
         </footer>
       </div>
     </main>

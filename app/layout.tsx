@@ -15,12 +15,15 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   metadataBase: new URL("https://www.dresz.io"),
   title: {
-    default: "DRESZI — personal style intelligence system",
+    default: "DRESZI — Dress better. Think less.",
     template: "%s — DRESZI",
   },
   description:
-    "DRESZI is a personal style intelligence system. A guide that brings clarity, intention, and calm to the daily ritual of getting dressed.",
+    "Personal style intelligence that learns your wardrobe and your rhythm, then gives you clear outfits in seconds.",
   applicationName: "DRESZI",
+  alternates: {
+    canonical: "/",
+  },
   robots: {
     index: true,
     follow: true,
@@ -31,17 +34,26 @@ export const metadata: Metadata = {
   },
   openGraph: {
     type: "website",
-    url: "https://www.dresz.io/",
+    url: "/",
     siteName: "DRESZI",
-    title: "DRESZI — personal style intelligence system",
+    title: "DRESZI — Dress better. Think less.",
     description:
-      "DRESZI is a personal style intelligence system. A guide that brings clarity, intention, and calm to the daily ritual of getting dressed.",
+      "Personal style intelligence that learns your wardrobe and your rhythm, then gives you clear outfits in seconds.",
+    images: [
+      {
+        url: "/og.png",
+        width: 1200,
+        height: 630,
+        alt: "DRESZI — Dress better. Think less.",
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "DRESZI — personal style intelligence system",
+    title: "DRESZI — Dress better. Think less.",
     description:
-      "DRESZI is a personal style intelligence system. A guide that brings clarity, intention, and calm to the daily ritual of getting dressed.",
+      "Personal style intelligence that learns your wardrobe and your rhythm, then gives you clear outfits in seconds.",
+    images: ["/og.png"],
   },
 };
 
