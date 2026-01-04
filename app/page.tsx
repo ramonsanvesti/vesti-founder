@@ -74,6 +74,31 @@ export default function Page() {
   return (
     <main className="min-h-screen bg-[#F2E0C9] text-[#2A1B12]">
       <div className="mx-auto max-w-3xl px-6 py-16">
+        {/* Top anchor */}
+        <div id="top" className="scroll-mt-28" />
+
+        {/* Nav */}
+        <nav className="sticky top-0 z-20 -mx-6 mb-10 border-b border-[#2A1B12]/10 bg-[#F2E0C9]/80 px-6 py-4 backdrop-blur">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <a
+              href="#top"
+              className="text-xs font-semibold uppercase tracking-[0.22em] text-[#6B4A34] transition hover:text-[#2A1B12]"
+            >
+              DRESZI
+            </a>
+
+            <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs text-[#6B4A34]">
+              <a className="transition hover:text-[#2A1B12]" href="#how">How it works</a>
+              <a className="transition hover:text-[#2A1B12]" href="#for">Who it’s for</a>
+              <a className="transition hover:text-[#2A1B12]" href="#manifesto">Manifesto</a>
+              <a className="transition hover:text-[#2A1B12]" href="#beta">Beta</a>
+              <a className="transition hover:text-[#2A1B12]" href="#request-access">Request</a>
+              <a className="transition hover:text-[#2A1B12]" href="#investors">Investors</a>
+              <a className="transition hover:text-[#2A1B12]" href="#faq">FAQ</a>
+            </div>
+          </div>
+        </nav>
+
         {/* Hero */}
         <header className="space-y-6">
           <p className="text-xs uppercase tracking-[0.22em] text-[#6B4A34]">DRESZI</p>
@@ -109,7 +134,7 @@ export default function Page() {
         </header>
 
         {/* How it works */}
-        <section className="mt-14 space-y-6">
+        <section id="how" className="mt-14 space-y-6 scroll-mt-28">
           <h2 className="text-xl font-semibold tracking-tight">How it works</h2>
 
           <div className="grid gap-3 md:grid-cols-3">
@@ -137,7 +162,7 @@ export default function Page() {
         </section>
 
         {/* Who it is for */}
-        <section className="mt-14 space-y-6">
+        <section id="for" className="mt-14 space-y-6 scroll-mt-28">
           <h2 className="text-xl font-semibold tracking-tight">Who it is for</h2>
 
           <div className="grid gap-3 md:grid-cols-3">
@@ -159,7 +184,7 @@ export default function Page() {
         </section>
 
         {/* Manifesto */}
-        <section id="manifesto" className="mt-16 space-y-6">
+        <section id="manifesto" className="mt-16 space-y-6 scroll-mt-28">
           <h2 className="text-xl font-semibold tracking-tight">Manifesto</h2>
           <div className="space-y-4 text-[15px] leading-relaxed text-[#3B2418]">
             <p>It is not a stylist. Not a store. Not a trend machine.</p>
@@ -178,7 +203,7 @@ export default function Page() {
         </section>
 
         {/* Beta */}
-        <section className="mt-16 space-y-6">
+        <section id="beta" className="mt-16 space-y-6 scroll-mt-28">
           <h2 className="text-xl font-semibold tracking-tight">What you get in the beta</h2>
 
           <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
@@ -195,7 +220,7 @@ export default function Page() {
         {/* CTA */}
         <section
           id="request-access"
-          className="mt-16 rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm"
+          className="mt-16 scroll-mt-28 rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm"
         >
           <div className="space-y-2">
             <h2 className="text-xl font-semibold tracking-tight">Request access</h2>
@@ -329,7 +354,7 @@ export default function Page() {
         </section>
 
         {/* Investor CTA */}
-        <section className="mt-16">
+        <section id="investors" className="mt-16 scroll-mt-28">
           <div className="rounded-2xl border border-[#2A1B12]/10 bg-white/40 p-6 shadow-sm">
             <h2 className="text-xl font-semibold tracking-tight">For investors</h2>
             <p className="mt-2 text-sm leading-relaxed text-[#3B2418]">
@@ -347,7 +372,7 @@ export default function Page() {
         </section>
 
         {/* FAQ */}
-        <section className="mt-16 space-y-6">
+        <section id="faq" className="mt-16 space-y-6 scroll-mt-28">
           <h2 className="text-xl font-semibold tracking-tight">FAQ</h2>
 
           <div className="space-y-4">
