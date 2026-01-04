@@ -35,13 +35,67 @@ function asUtm(value: unknown): LeadUtm | null {
   return Object.keys(out).length ? out : null;
 }
 
+function coerceConsent(v: unknown): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (!s) return false;
+    return s === "true" || s === "1" || s === "yes" || s === "y" || s === "on";
+  }
+  return Boolean(v);
+}
+
+async function readBody(req: Request): Promise<LeadPayload> {
+  const ct = req.headers.get("content-type") ?? "";
+
+  // JSON
+  if (ct.includes("application/json")) {
+    try {
+      return (await req.json()) as LeadPayload;
+    } catch {
+      return {};
+    }
+  }
+
+  // HTML form
+  if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+    try {
+      const fd = await req.formData();
+
+      // Optional: hidden input "utm" with JSON string
+      const utmRaw = fd.get("utm");
+      let utm: unknown = null;
+      if (typeof utmRaw === "string" && utmRaw.trim()) {
+        try {
+          utm = JSON.parse(utmRaw);
+        } catch {
+          utm = null;
+        }
+      }
+
+      return {
+        email: fd.get("email"),
+        name: fd.get("name"),
+        consent: fd.get("consent"),
+        company: fd.get("company"),
+        utm,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
+}
+
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as LeadPayload;
+    const body = await readBody(req);
 
     const email = String(body?.email ?? "").trim().toLowerCase();
     const name = String(body?.name ?? "").trim();
-    const consent = Boolean(body?.consent ?? true);
+    const consent = coerceConsent(body?.consent ?? true);
 
     // Honeypot (campo invisible en UI). Si viene lleno, es bot.
     const company = String(body?.company ?? "").trim();
@@ -58,19 +112,20 @@ export async function POST(req: Request) {
     const sb = supabaseAdmin();
     const utm = asUtm(body?.utm);
 
-    // Upsert por email (dedupe)
-    const { error } = await sb.from("leads").upsert(
-      {
-        email,
-        name: name || null,
-        source: "dresz.io",
-        consent: true,
-        consent_at: new Date().toISOString(),
-        user_agent: req.headers.get("user-agent") ?? null,
-        utm,
-      },
-      { onConflict: "email" }
-    );
+    const { error } = await sb
+      .from("leads")
+      .upsert(
+        {
+          email,
+          name: name || null,
+          source: "dresz.io",
+          consent: true,
+          consent_at: new Date().toISOString(),
+          user_agent: req.headers.get("user-agent") ?? null,
+          utm,
+        },
+        { onConflict: "email" }
+      );
 
     if (error) {
       return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
