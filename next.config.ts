@@ -9,6 +9,8 @@ const nextConfig: NextConfig = {
   // Note: `outputFileTracingIncludes` is a top-level config key (not under `experimental`).
   outputFileTracingIncludes: {
     "/api/wardrobe-videos/process": ["./node_modules/ffmpeg-static/**"],
+    "/app/api/wardrobe-videos/process/route": ["./node_modules/ffmpeg-static/**"],
+},
   },
 };
 
