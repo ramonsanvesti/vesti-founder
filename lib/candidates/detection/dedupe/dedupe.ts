@@ -16,7 +16,7 @@
     from grayscale pixels (bounded by early exits and a small cache).
 */
 
-import type { CandidateDetectionConfig, ReasonCodeString } from "../config";
+import type { CandidateDetectionConfig } from "../config";
 import { ReasonCode } from "../config";
 import type { Hash64Hex } from "../scoring/hashing/phash";
 import { hammingDistance64Hex } from "../scoring/hashing/phash";
@@ -42,7 +42,7 @@ export interface CandidateForDedupe {
   readonly embedding_input?: DedupeEmbedInput;
 
   /** Mutable reason codes list owned by caller; we will append codes. */
-  readonly reason_codes: ReasonCodeString[];
+  readonly reason_codes: ReasonCode[];
 }
 
 export interface DedupeCounts {
@@ -56,52 +56,9 @@ export interface DedupeResult {
   readonly suppressed: ReadonlyArray<CandidateForDedupe>;
   readonly counts: DedupeCounts;
   /** Populated when we stop early due to caps/time. */
-  readonly early_exit_reason: string | null;
+  readonly early_exit_reason: ReasonCode | null;
 }
 
-// Support multiple config shapes without leaking `any`.
-type CfgDedupeCompat = CandidateDetectionConfig & {
-  readonly max_candidates?: number;
-  readonly dedupe?: {
-    readonly phash_hamming_threshold?: number;
-    readonly embedding_cosine_threshold?: number;
-    readonly max_candidates?: number;
-  };
-  readonly embedding?: {
-    readonly cosine_threshold?: number;
-  };
-  readonly embeddings?: {
-    readonly cosine_threshold?: number;
-  };
-};
-
-function getMaxCandidates(cfg: CandidateDetectionConfig): number {
-  const c = cfg as CfgDedupeCompat;
-  const v = c.dedupe?.max_candidates;
-  if (Number.isFinite(v) && (v as number) > 0) return Math.trunc(v as number);
-
-  const top = c.max_candidates;
-  if (Number.isFinite(top) && (top as number) > 0) return Math.trunc(top as number);
-
-  return 8;
-}
-
-function getPhashHammingThreshold(cfg: CandidateDetectionConfig): number {
-  const c = cfg as CfgDedupeCompat;
-  const v = c.dedupe?.phash_hamming_threshold;
-  if (Number.isFinite(v) && (v as number) >= 0) return Math.trunc(v as number);
-  return 10; // beta default
-}
-
-function getEmbeddingCosineThreshold(cfg: CandidateDetectionConfig): number {
-  const c = cfg as CfgDedupeCompat;
-  const v =
-    c.dedupe?.embedding_cosine_threshold ??
-    c.embeddings?.cosine_threshold ??
-    c.embedding?.cosine_threshold;
-  if (Number.isFinite(v) && (v as number) > 0) return Number(v);
-  return 0.94; // beta default
-}
 
 function stableSortCandidates(input: ReadonlyArray<CandidateForDedupe>): CandidateForDedupe[] {
   // Deterministic sort: score desc, then candidate_id asc.
@@ -159,9 +116,9 @@ export async function dedupeCandidates(params: {
   shouldExit?: () => boolean;
 }): Promise<DedupeResult> {
   const cfg = params.config;
-  const phashThresh = getPhashHammingThreshold(cfg);
-  const cosThresh = getEmbeddingCosineThreshold(cfg);
-  const maxCandidates = getMaxCandidates(cfg);
+  const phashThresh = cfg.dedupe.phash_hamming_threshold;
+  const cosThresh = cfg.dedupe.embedding_cosine_threshold;
+  const maxCandidates = cfg.max_candidates;
 
   const sorted = stableSortCandidates(params.candidates);
 
@@ -171,23 +128,25 @@ export async function dedupeCandidates(params: {
   let deduped_phash = 0;
   let deduped_embedding = 0;
   let embed_computed = 0;
-  let early_exit_reason: string | null = null;
+  let early_exit_reason: ReasonCode | null = null;
 
   const embedder = params.embedder ?? null;
   const embedCache = new Map<string, ReadonlyArray<number>>();
 
   for (const cand of sorted) {
     if (params.shouldExit?.()) {
-      early_exit_reason = "E_EARLY_EXIT_TIME_BUDGET";
+      early_exit_reason = ReasonCode.E_EARLY_EXIT_TIME_BUDGET;
       break;
     }
 
     if (kept.length >= maxCandidates) {
-      early_exit_reason = "E_EARLY_EXIT_MAX_CANDIDATES";
+      early_exit_reason = ReasonCode.E_MAX_CANDIDATES_CAPPED;
       break;
     }
 
     let isDuplicate = false;
+    // Cache candidate embedding per-candidate to avoid recomputing per winner.
+    let candEmbCached: { vec: ReadonlyArray<number> | null; computed: boolean } | null = null;
 
     // Compare against already-kept candidates
     for (const winner of kept) {
@@ -201,14 +160,16 @@ export async function dedupeCandidates(params: {
       }
 
       // Stage 2: embedding
-      const candEmb = await getOrComputeEmbedding(cand, embedder, embedCache);
-      const winEmb = await getOrComputeEmbedding(winner, embedder, embedCache);
+      if (!candEmbCached) {
+        candEmbCached = await getOrComputeEmbedding(cand, embedder, embedCache);
+        if (candEmbCached.computed) embed_computed += 1;
+      }
 
-      if (candEmb.computed) embed_computed += 1;
+      const winEmb = await getOrComputeEmbedding(winner, embedder, embedCache);
       if (winEmb.computed) embed_computed += 1;
 
-      if (candEmb.vec && winEmb.vec) {
-        const sim = cosineSimilarity(candEmb.vec, winEmb.vec).cosine;
+      if (candEmbCached.vec && winEmb.vec) {
+        const sim = cosineSimilarity(candEmbCached.vec, winEmb.vec).cosine;
         if (sim >= cosThresh) {
           cand.reason_codes.push(ReasonCode.E_DUPLICATE_SUPPRESSED_EMBEDDING);
           deduped_embedding += 1;
@@ -231,8 +192,10 @@ export async function dedupeCandidates(params: {
         // when later candidates arrive.
         const existing = embedCache.get(cand.candidate_id);
         if (!existing) {
-          const emb = await getOrComputeEmbedding(cand, embedder, embedCache);
-          if (emb.computed) embed_computed += 1;
+          if (!candEmbCached) {
+            candEmbCached = await getOrComputeEmbedding(cand, embedder, embedCache);
+            if (candEmbCached.computed) embed_computed += 1;
+          }
         }
       }
     }
