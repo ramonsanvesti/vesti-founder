@@ -4,7 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 
 import { detectGarmentCandidates } from "../../../../lib/candidates/detection/detectGarmentCandidates";
 
-import ffmpegStatic from "ffmpeg-static";
+
+import { createRequire } from "node:module";
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -15,6 +16,8 @@ import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import sharp from "sharp";
+
+const require = createRequire(import.meta.url);
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -164,7 +167,7 @@ async function getFfmpegPath(): Promise<string> {
   }
 
   // Static import is required so Next/Vercel file tracing can include the binary.
-  const resolved = (ffmpegStatic as unknown as string) || "";
+  const resolved = (require("ffmpeg-static") as unknown as string) || "";
   if (!resolved) {
     throw new Error(
       "ffmpeg-static did not resolve a binary path (empty). Ensure ffmpeg-static is installed as a production dependency."
