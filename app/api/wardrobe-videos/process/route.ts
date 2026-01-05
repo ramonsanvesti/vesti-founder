@@ -31,6 +31,14 @@ const WARDROBE_VIDEOS_BUCKET =
 const WARDROBE_CANDIDATES_BUCKET =
   process.env.WARDROBE_CANDIDATES_BUCKET ?? "wardrobe-candidates";
 
+const CANDIDATE_SIGNED_URL_TTL_SECONDS = (() => {
+  const raw = (process.env.CANDIDATE_SIGNED_URL_TTL_SECONDS ?? "1800").trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 1800;
+  // Bound to a sane range (1 min .. 2 hours)
+  return Math.max(60, Math.min(7200, n));
+})();
+
 // App-level retry cap for QStash-delivered jobs. Upstash-Retried is 0 on first attempt.
 // When Upstash-Retried >= MAX_RETRIES, treat as terminal and mark the row failed.
 const MAX_RETRIES = (() => {
@@ -672,6 +680,44 @@ function sha256Hex(buf: Buffer) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+function uuidV5(name: string, namespaceUuid: string) {
+  // RFC 4122 UUID v5 (SHA-1)
+  const ns = Buffer.from(namespaceUuid.replace(/-/g, ""), "hex");
+  const hash = crypto.createHash("sha1").update(ns).update(name, "utf8").digest();
+  // Take first 16 bytes
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  // Set version to 5
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  // Set variant to RFC 4122
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function createSignedUrlForCandidate(params: {
+  supabase: ReturnType<typeof getSupabaseAdminClient>;
+  bucket: string;
+  storagePath: string;
+  expiresInSeconds: number;
+  meta: Record<string, any>;
+}): Promise<string | null> {
+  const { supabase, bucket, storagePath, expiresInSeconds, meta } = params;
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(storagePath, expiresInSeconds);
+
+  if (error || !data?.signedUrl) {
+    log("candidates.storage.sign_url_failed", {
+      ...meta,
+      bucket,
+      storagePath,
+      err: error?.message ?? "unknown",
+    });
+    return null;
+  }
+  return data.signedUrl;
+}
+
 async function handler(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as ProcessPayload;
@@ -962,6 +1008,8 @@ async function handler(req: Request) {
     let videoBytes: number | null = null;
     let candidates: any[] = [];
     let detectMs: number | null = null;
+    let candidatesUploaded = 0;
+    let candidatesPersisted = 0;
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
@@ -1088,10 +1136,13 @@ async function handler(req: Request) {
 
       const expiresAt = addDaysIso(7);
       const persistedRows: any[] = [];
+      const seenSha256 = new Set<string>();
+
+      // Use a stable UUID namespace (DNS) to derive deterministic candidate IDs.
+      const CANDIDATE_UUID_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
 
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
-        const candidateId = String(c.candidate_id ?? crypto.randomUUID());
         const frameTsMs = typeof c.frame_ts_ms === "number" ? c.frame_ts_ms : null;
 
         const frame = findNearestFrameByTs(frames, frameTsMs);
@@ -1105,14 +1156,21 @@ async function handler(req: Request) {
         });
         if (!built) continue;
 
+        // Idempotency key from uploaded bytes.
+        const sha256 = sha256Hex(built.buffer);
+        if (!sha256 || seenSha256.has(sha256)) {
+          continue;
+        }
+        seenSha256.add(sha256);
+
+        // Deterministic UUID per (user, video, sha256) to keep storage paths stable across retries.
+        const candidateId = uuidV5(`${FOUNDER_USER_ID}:${wardrobeVideoId}:${sha256}`, CANDIDATE_UUID_NAMESPACE);
+
         const storagePath = candidateStoragePath({
           userId: FOUNDER_USER_ID,
           wardrobeVideoId,
           candidateId,
         });
-
-        // Compute sha256 deterministically from the uploaded bytes (idempotency key).
-        const sha256 = sha256Hex(built.buffer);
 
         await uploadCandidateObject({
           supabase,
@@ -1120,6 +1178,15 @@ async function handler(req: Request) {
           storagePath,
           buffer: built.buffer,
           contentType: built.mimeType,
+          meta,
+        });
+        candidatesUploaded++;
+
+        const signedUrl = await createSignedUrlForCandidate({
+          supabase,
+          bucket: WARDROBE_CANDIDATES_BUCKET,
+          storagePath,
+          expiresInSeconds: CANDIDATE_SIGNED_URL_TTL_SECONDS,
           meta,
         });
 
@@ -1131,7 +1198,9 @@ async function handler(req: Request) {
           storage_bucket: WARDROBE_CANDIDATES_BUCKET,
           storage_path: storagePath,
           frame_ts_ms: frameTsMs ?? frame.tsMs,
-          crop_box: c.crop_box ?? { x: 0, y: 0, w: built.width, h: built.height },
+          crop_box:
+            c.crop_box ??
+            ({ x: 0, y: 0, w: built.width, h: built.height, frame_w: built.width, frame_h: built.height } as any),
           confidence: typeof c.confidence === "number" ? c.confidence : 0,
           reason_codes: Array.isArray(c.reason_codes) ? c.reason_codes : [],
           phash: typeof c.phash === "string" ? c.phash : "",
@@ -1148,7 +1217,7 @@ async function handler(req: Request) {
           updated_at: new Date().toISOString(),
         });
 
-        // Keep the response object consistent with persisted info.
+        // Keep the response object consistent with persisted info (camelCase for runtime payload).
         c.candidate_id = candidateId;
         c.user_id = FOUNDER_USER_ID;
         c.wardrobe_video_id = wardrobeVideoId;
@@ -1159,6 +1228,8 @@ async function handler(req: Request) {
         c.mime_type = built.mimeType;
         c.width = built.width;
         c.height = built.height;
+        c.signedUrl = signedUrl;
+        c.signedUrlExpiresInSeconds = CANDIDATE_SIGNED_URL_TTL_SECONDS;
       }
 
       // Upsert by (user_id, wardrobe_video_id, sha256) to be retry-safe.
@@ -1171,6 +1242,7 @@ async function handler(req: Request) {
           log("candidates.db.upsert_failed", { ...meta, err: upsertErr.message });
           throw new Error(`Candidate DB upsert failed: ${upsertErr.message}`);
         }
+        candidatesPersisted = persistedRows.length;
       }
 
       const persistMs = Date.now() - tPersistStart;
@@ -1219,7 +1291,8 @@ async function handler(req: Request) {
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
           candidates_generated: candidates.length,
-          candidates_persisted: candidates.length,
+          candidates_uploaded: candidatesUploaded,
+          candidates_persisted: candidatesPersisted,
           candidate_detection: {
             detect_ms: detectMs,
           },
@@ -1288,7 +1361,8 @@ async function handler(req: Request) {
             candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
             candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
             candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
-            candidates_uploaded: typeof candidates !== "undefined" ? candidates.length : 0,
+            candidates_uploaded: candidatesUploaded,
+            candidates_persisted: candidatesPersisted,
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -1322,7 +1396,8 @@ async function handler(req: Request) {
           candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
           candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
           candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
-          candidates_uploaded: typeof candidates !== "undefined" ? candidates.length : 0,
+          candidates_uploaded: candidatesUploaded,
+          candidates_persisted: candidatesPersisted,
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
