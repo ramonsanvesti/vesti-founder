@@ -1222,6 +1222,13 @@ async function handler(req: NextRequest) {
         // Deterministic UUID per (user, video, sha256) to keep storage paths stable across retries.
         const candidateId = uuidV5(`${FOUNDER_USER_ID}:${wardrobeVideoId}:${sha256}`, CANDIDATE_UUID_NAMESPACE);
 
+        // phash is required (NOT NULL) in the DB schema. If detection doesn't provide it,
+        // derive a stable fallback from sha256 (good enough for beta-grade dedupe/auditing).
+        const phashVal =
+          typeof c.phash === "string" && c.phash.trim().length > 0
+            ? c.phash.trim()
+            : sha256.slice(0, 16);
+
         const storagePath = candidateStoragePath({
           userId: FOUNDER_USER_ID,
           wardrobeVideoId,
@@ -1261,7 +1268,7 @@ async function handler(req: NextRequest) {
             ({ x: 0, y: 0, w: built.width, h: built.height, frame_w: built.width, frame_h: built.height } as any),
           confidence: typeof c.confidence === "number" ? c.confidence : 0,
           reason_codes: Array.isArray(c.reason_codes) ? c.reason_codes : [],
-          phash: typeof c.phash === "string" ? c.phash : "",
+          phash: phashVal,
           sha256,
           bytes: built.buffer.byteLength,
           width: built.width,
@@ -1311,11 +1318,12 @@ async function handler(req: NextRequest) {
         });
       }
 
-      // Upsert by (user_id, wardrobe_video_id, sha256) to be retry-safe.
+      // Upsert by primary key (id) to be retry-safe across retries and schema changes.
+      // candidateId is deterministic per (user, video, sha256), so duplicates collapse cleanly.
       if (persistedRows.length > 0) {
         const { error: upsertErr } = await supabase
           .from("wardrobe_video_candidates")
-          .upsert(persistedRows, { onConflict: "user_id,wardrobe_video_id,sha256" });
+          .upsert(persistedRows, { onConflict: "id" });
 
         if (upsertErr) {
           log("candidates.db.upsert_failed", { ...meta, err: upsertErr.message });
