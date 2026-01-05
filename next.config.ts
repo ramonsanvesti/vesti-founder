@@ -10,7 +10,6 @@ const nextConfig: NextConfig = {
   outputFileTracingIncludes: {
     "/api/wardrobe-videos/process": ["./node_modules/ffmpeg-static/**"],
     "/app/api/wardrobe-videos/process/route": ["./node_modules/ffmpeg-static/**"],
-},
   },
 };
 
