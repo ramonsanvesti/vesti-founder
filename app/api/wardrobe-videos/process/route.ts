@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
+import sharp from "sharp";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,6 +27,9 @@ const FOUNDER_USER_ID =
 
 const WARDROBE_VIDEOS_BUCKET =
   process.env.WARDROBE_VIDEOS_BUCKET ?? "wardrobe-videos";
+
+const WARDROBE_CANDIDATES_BUCKET =
+  process.env.WARDROBE_CANDIDATES_BUCKET ?? "wardrobe-candidates";
 
 // App-level retry cap for QStash-delivered jobs. Upstash-Retried is 0 on first attempt.
 // When Upstash-Retried >= MAX_RETRIES, treat as terminal and mark the row failed.
@@ -554,6 +558,120 @@ function isUuid(v: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
+function addDaysIso(days: number) {
+  const ms = Date.now() + days * 24 * 60 * 60 * 1000;
+  return new Date(ms).toISOString();
+}
+
+function clampInt(n: number, min: number, max: number) {
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function candidateStoragePath(params: {
+  userId: string;
+  wardrobeVideoId: string;
+  candidateId: string;
+}) {
+  // Spec (webp): user_id/video_id/candidates/<candidate_id>.webp
+  const { userId, wardrobeVideoId, candidateId } = params;
+  return `${userId}/${wardrobeVideoId}/candidates/${candidateId}.webp`;
+}
+
+function findNearestFrameByTs(frames: ExtractedFrame[], tsMs: number | null): ExtractedFrame | null {
+  if (!frames.length) return null;
+  if (tsMs == null || !Number.isFinite(tsMs as any)) return frames[Math.floor(frames.length / 2)] ?? null;
+  let best = frames[0];
+  let bestD = Math.abs(frames[0].tsMs - tsMs);
+  for (let i = 1; i < frames.length; i++) {
+    const d = Math.abs(frames[i].tsMs - tsMs);
+    if (d < bestD) {
+      bestD = d;
+      best = frames[i];
+    }
+  }
+  return best;
+}
+
+async function buildCandidateWebpBuffer(params: {
+  framePath: string;
+  cropBox: any;
+  maxWidth: number;
+}): Promise<{ buffer: Buffer; width: number; height: number; mimeType: string } | null> {
+  const { framePath, cropBox, maxWidth } = params;
+
+  const input = await fsp.readFile(framePath);
+  let img = sharp(input, { failOn: "none" });
+
+  // If crop_box is present and has x,y,w,h, extract that region.
+  const x = Number(cropBox?.x);
+  const y = Number(cropBox?.y);
+  const w = Number(cropBox?.w);
+  const h = Number(cropBox?.h);
+
+  if ([x, y, w, h].every((v) => Number.isFinite(v)) && w > 1 && h > 1) {
+    // Clamp against known frame dims if present, else clamp to a generous safe range.
+    const fw = Number(cropBox?.frame_w ?? cropBox?.frameW ?? cropBox?.frame_width);
+    const fh = Number(cropBox?.frame_h ?? cropBox?.frameH ?? cropBox?.frame_height);
+
+    const maxW = Number.isFinite(fw) && fw > 0 ? fw : 10_000;
+    const maxH = Number.isFinite(fh) && fh > 0 ? fh : 10_000;
+
+    const left = clampInt(x, 0, Math.max(0, maxW - 1));
+    const top = clampInt(y, 0, Math.max(0, maxH - 1));
+    const width = clampInt(w, 1, Math.max(1, maxW - left));
+    const height = clampInt(h, 1, Math.max(1, maxH - top));
+
+    img = img.extract({ left, top, width, height });
+  }
+
+  // Resize down to maxWidth (never upscale).
+  img = img.resize({ width: Math.max(1, maxWidth), withoutEnlargement: true });
+
+  // Encode as WEBP.
+  const out = await img
+    .webp({ quality: 82, smartSubsample: true })
+    .toBuffer({ resolveWithObject: true });
+
+  const meta = out.info;
+  return {
+    buffer: out.data,
+    width: meta.width ?? 0,
+    height: meta.height ?? 0,
+    mimeType: "image/webp",
+  };
+}
+
+async function uploadCandidateObject(params: {
+  supabase: ReturnType<typeof getSupabaseAdminClient>;
+  bucket: string;
+  storagePath: string;
+  buffer: Buffer;
+  contentType: string;
+  meta: Record<string, any>;
+}) {
+  const { supabase, bucket, storagePath, buffer, contentType, meta } = params;
+
+  const { error } = await supabase.storage
+    .from(bucket)
+    .upload(storagePath, buffer, {
+      contentType,
+      upsert: true,
+      cacheControl: "0",
+    });
+
+  if (error) {
+    log("candidates.storage.upload_failed", { ...meta, bucket, storagePath, err: error.message });
+    throw new Error(`candidate upload failed: ${error.message}`);
+  }
+
+  return { ok: true };
+}
+
+function sha256Hex(buf: Buffer) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
 async function handler(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as ProcessPayload;
@@ -963,6 +1081,105 @@ async function handler(req: Request) {
         candidates: candidates.length,
       });
 
+      // ------------------------------
+      // DRESZI-5.6 — Persist candidate records (temporary) + upload candidate images
+      // ------------------------------
+      const tPersistStart = Date.now();
+
+      const expiresAt = addDaysIso(7);
+      const persistedRows: any[] = [];
+
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        const candidateId = String(c.candidate_id ?? crypto.randomUUID());
+        const frameTsMs = typeof c.frame_ts_ms === "number" ? c.frame_ts_ms : null;
+
+        const frame = findNearestFrameByTs(frames, frameTsMs);
+        if (!frame) continue;
+
+        // Build candidate image (cropped if crop_box present) as webp.
+        const built = await buildCandidateWebpBuffer({
+          framePath: frame.path,
+          cropBox: c.crop_box,
+          maxWidth,
+        });
+        if (!built) continue;
+
+        const storagePath = candidateStoragePath({
+          userId: FOUNDER_USER_ID,
+          wardrobeVideoId,
+          candidateId,
+        });
+
+        // Compute sha256 deterministically from the uploaded bytes (idempotency key).
+        const sha256 = sha256Hex(built.buffer);
+
+        await uploadCandidateObject({
+          supabase,
+          bucket: WARDROBE_CANDIDATES_BUCKET,
+          storagePath,
+          buffer: built.buffer,
+          contentType: built.mimeType,
+          meta,
+        });
+
+        persistedRows.push({
+          id: candidateId,
+          user_id: FOUNDER_USER_ID,
+          wardrobe_video_id: wardrobeVideoId,
+          status: "generated",
+          storage_bucket: WARDROBE_CANDIDATES_BUCKET,
+          storage_path: storagePath,
+          frame_ts_ms: frameTsMs ?? frame.tsMs,
+          crop_box: c.crop_box ?? { x: 0, y: 0, w: built.width, h: built.height },
+          confidence: typeof c.confidence === "number" ? c.confidence : 0,
+          reason_codes: Array.isArray(c.reason_codes) ? c.reason_codes : [],
+          phash: typeof c.phash === "string" ? c.phash : "",
+          sha256,
+          bytes: built.buffer.byteLength,
+          width: built.width,
+          height: built.height,
+          mime_type: built.mimeType,
+          source_frame_index: frame.index,
+          source_frame_ts_ms: frame.tsMs,
+          embedding_model: typeof c.embedding_model === "string" ? c.embedding_model : null,
+          rank: typeof c.rank === "number" ? c.rank : i + 1,
+          expires_at: expiresAt,
+          updated_at: new Date().toISOString(),
+        });
+
+        // Keep the response object consistent with persisted info.
+        c.candidate_id = candidateId;
+        c.user_id = FOUNDER_USER_ID;
+        c.wardrobe_video_id = wardrobeVideoId;
+        c.storage_bucket = WARDROBE_CANDIDATES_BUCKET;
+        c.storage_path = storagePath;
+        c.sha256 = sha256;
+        c.bytes = built.buffer.byteLength;
+        c.mime_type = built.mimeType;
+        c.width = built.width;
+        c.height = built.height;
+      }
+
+      // Upsert by (user_id, wardrobe_video_id, sha256) to be retry-safe.
+      if (persistedRows.length > 0) {
+        const { error: upsertErr } = await supabase
+          .from("wardrobe_video_candidates")
+          .upsert(persistedRows, { onConflict: "user_id,wardrobe_video_id,sha256" });
+
+        if (upsertErr) {
+          log("candidates.db.upsert_failed", { ...meta, err: upsertErr.message });
+          throw new Error(`Candidate DB upsert failed: ${upsertErr.message}`);
+        }
+      }
+
+      const persistMs = Date.now() - tPersistStart;
+      log("candidates.persist.done", {
+        ...meta,
+        persisted: persistedRows.length,
+        persistMs,
+      });
+
       const nowIso = new Date().toISOString();
 
       const { data, error } = await supabase
@@ -1002,12 +1219,14 @@ async function handler(req: Request) {
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
           candidates_generated: candidates.length,
+          candidates_persisted: candidates.length,
           candidate_detection: {
             detect_ms: detectMs,
           },
           candidates,
           video_duration_seconds: durationSeconds,
           video_bytes: videoBytes,
+          candidate_persist_ms: persistMs,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -1068,6 +1287,8 @@ async function handler(req: Request) {
             video_bytes: videoBytes,
             candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
             candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
+            candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
+            candidates_uploaded: typeof candidates !== "undefined" ? candidates.length : 0,
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -1100,6 +1321,8 @@ async function handler(req: Request) {
           video_bytes: videoBytes,
           candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
           candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
+          candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
+          candidates_uploaded: typeof candidates !== "undefined" ? candidates.length : 0,
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
