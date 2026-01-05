@@ -1,5 +1,3 @@
-
-
 /*
   DRESZI — Image decode + preprocessing (serverless-safe)
 
@@ -34,13 +32,13 @@ export class DecodeError extends Error {
   }
 }
 
-function loadSharpOrThrow(): any {
-  // Avoid static import so TS doesn't require sharp typings at compile time.
+async function loadSharpOrThrow(): Promise<unknown> {
+  // Use dynamic import to satisfy ESLint (no require) while still keeping sharp optional.
   // If sharp isn't installed, we fail loudly with a clear action.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require("sharp");
-    return mod?.default ?? mod;
+    const mod = await import("sharp");
+    // `sharp` exports a default function in ESM builds.
+    return (mod as unknown as { default?: unknown }).default ?? (mod as unknown);
   } catch (e) {
     throw new DecodeError(
       "sharp is required for DRESZI image decode. Install 'sharp' or provide a FrameLoader that returns pre-decoded pixels.",
@@ -88,7 +86,8 @@ export function rgbaToGrayscale(rgba: Uint8Array, width: number, height: number)
  */
 export async function decodeToRgba(bytes: Uint8Array, opts: DecodeOptions): Promise<{ width: number; height: number; rgba: Uint8Array }> {
   assertMaxWidth(opts.maxWidthUsed);
-  const sharp = loadSharpOrThrow();
+  const sharpMod = await loadSharpOrThrow();
+  const sharp = sharpMod as unknown as (input: Buffer, options?: { failOnError?: boolean }) => any;
 
   try {
     const pipeline = sharp(Buffer.from(bytes), { failOnError: false })

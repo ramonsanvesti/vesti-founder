@@ -1,7 +1,5 @@
-
-
 /*
-  VESTI-5.5A — Candidate detection config + reason codes
+  DRESZI-5.5A — Candidate detection config + reason codes
   Single source of truth for thresholds, caps, and standardized reason codes.
 
   Design goals
@@ -10,7 +8,7 @@
   - No magic numbers scattered throughout the codebase.
 */
 
-export const CONFIG_VERSION = "candidate-detect/v1" as const;
+export const CONFIG_VERSION = "dreszi/candidate-detect/v1" as const;
 
 /**
  * Standardized reason codes used across the candidate detection pipeline.
@@ -50,7 +48,7 @@ export enum ReasonCode {
   E_NOT_ENOUGH_UNIQUE = "E_NOT_ENOUGH_UNIQUE"
 }
 
-export type ReasonCodeString = `${ReasonCode}`;
+export type ReasonCodeString = ReasonCode;
 
 export type ImageOutputFormat = "jpeg" | "webp";
 
@@ -121,10 +119,7 @@ export interface CandidateDetectionConfig {
   readonly roi: {
     readonly torso_default: TorsoRoiPercentages;
 
-    /**
-     * Whether to run the cheap saliency refinement around the torso window.
-     * Keep off by default if you want the simplest baseline.
-     */
+    /** Whether to run the cheap saliency refinement around the torso window. */
     readonly enable_saliency_refine: boolean;
 
     /** Grid search steps around torso ROI (bounded). Deterministic. */
@@ -139,16 +134,25 @@ export interface CandidateDetectionConfig {
    */
   readonly dedupe: {
     /** pHash Hamming distance at or below which we consider a near-duplicate */
-    readonly phash_hamming_dup_threshold: number;
+    readonly phash_hamming_threshold: number;
 
     /** Cosine similarity at/above which embeddings are considered duplicates */
-    readonly embedding_dup_threshold: number;
+    readonly embedding_cosine_threshold: number;
 
     /**
      * If true, compute embeddings only for candidates that survive pHash stage.
      * Strongly recommended for cost.
      */
     readonly embed_after_phash_only: boolean;
+  };
+
+  /**
+   * Lightweight embedding config (local baseline).
+   * If/when you swap to a real model, keep this namespace and add fields.
+   */
+  readonly embeddings: {
+    /** Downscale grid for TinyBlockEmbedder (8..32). Default 16. */
+    readonly tinyblock_grid: number;
   };
 
   /**
@@ -209,7 +213,7 @@ export const CANDIDATE_DETECTION_DEFAULTS: CandidateDetectionConfig = {
     // Torso-ish baseline: centered and tall
     torso_default: { x: 0.18, y: 0.18, w: 0.64, h: 0.7 },
 
-    // Keep refinement off by default for simplest baseline; can enable later.
+    // Keep refinement on by default (still bounded + deterministic)
     enable_saliency_refine: true,
 
     // Small bounded grid = deterministic + cheap
@@ -219,12 +223,16 @@ export const CANDIDATE_DETECTION_DEFAULTS: CandidateDetectionConfig = {
 
   dedupe: {
     // 64-bit pHash: 10 is a common near-duplicate threshold
-    phash_hamming_dup_threshold: 10,
+    phash_hamming_threshold: 10,
 
     // Local baseline embedding tends to be coarse; 0.94 is a reasonable start
-    embedding_dup_threshold: 0.94,
+    embedding_cosine_threshold: 0.94,
 
     embed_after_phash_only: true
+  },
+
+  embeddings: {
+    tinyblock_grid: 16
   },
 
   encoding: {
@@ -238,13 +246,14 @@ export const CANDIDATE_DETECTION_DEFAULTS: CandidateDetectionConfig = {
 };
 
 export type CandidateDetectionConfigOverrides = Partial<
-  Omit<CandidateDetectionConfig, "scoring" | "roi" | "dedupe" | "encoding" | "debug">
+  Omit<CandidateDetectionConfig, "version" | "scoring" | "roi" | "dedupe" | "embeddings" | "encoding" | "debug">
 > & {
   scoring?: Partial<CandidateDetectionConfig["scoring"]>;
   roi?: Partial<CandidateDetectionConfig["roi"]> & {
     torso_default?: Partial<TorsoRoiPercentages>;
   };
   dedupe?: Partial<CandidateDetectionConfig["dedupe"]>;
+  embeddings?: Partial<CandidateDetectionConfig["embeddings"]>;
   encoding?: Partial<CandidateDetectionConfig["encoding"]>;
   debug?: Partial<CandidateDetectionConfig["debug"]>;
 };
@@ -259,6 +268,7 @@ export function buildCandidateDetectionConfig(
   const merged: CandidateDetectionConfig = {
     ...CANDIDATE_DETECTION_DEFAULTS,
     ...overrides,
+    version: CONFIG_VERSION,
     scoring: {
       ...CANDIDATE_DETECTION_DEFAULTS.scoring,
       ...(overrides.scoring ?? {})
@@ -274,6 +284,10 @@ export function buildCandidateDetectionConfig(
     dedupe: {
       ...CANDIDATE_DETECTION_DEFAULTS.dedupe,
       ...(overrides.dedupe ?? {})
+    },
+    embeddings: {
+      ...CANDIDATE_DETECTION_DEFAULTS.embeddings,
+      ...(overrides.embeddings ?? {})
     },
     encoding: {
       ...CANDIDATE_DETECTION_DEFAULTS.encoding,
@@ -302,6 +316,8 @@ export function assertCandidateDetectionConfig(cfg: CandidateDetectionConfig): v
   if (cfg.time_budget_ms <= 0) fail("time_budget_ms must be > 0");
 
   if (cfg.max_frames_to_score <= 0) fail("max_frames_to_score must be > 0");
+  if (cfg.max_frames_to_score > 60) fail("max_frames_to_score must be <= 60 (hard cap)");
+
   if (cfg.top_k_frames <= 0) fail("top_k_frames must be > 0");
   if (cfg.top_k_frames > cfg.max_frames_to_score)
     fail("top_k_frames must be <= max_frames_to_score");
@@ -311,7 +327,7 @@ export function assertCandidateDetectionConfig(cfg: CandidateDetectionConfig): v
   if (cfg.max_candidates > cfg.max_candidates_hard)
     fail("max_candidates must be <= max_candidates_hard");
   if (cfg.max_candidates_hard > 12)
-    fail("max_candidates_hard must be <= 12 (hard cap) ");
+    fail("max_candidates_hard must be <= 12 (hard cap)");
 
   if (cfg.max_width_used < 128) fail("max_width_used must be >= 128");
   if (cfg.min_crop_dim_px < 32) fail("min_crop_dim_px must be >= 32");
@@ -339,10 +355,14 @@ export function assertCandidateDetectionConfig(cfg: CandidateDetectionConfig): v
     fail("scoring.frames_for_roi must be <= top_k_frames");
 
   const d = cfg.dedupe;
-  if (d.phash_hamming_dup_threshold < 0 || d.phash_hamming_dup_threshold > 64)
-    fail("dedupe.phash_hamming_dup_threshold must be within 0..64");
-  if (d.embedding_dup_threshold < 0 || d.embedding_dup_threshold > 1)
-    fail("dedupe.embedding_dup_threshold must be within 0..1");
+  if (d.phash_hamming_threshold < 0 || d.phash_hamming_threshold > 64)
+    fail("dedupe.phash_hamming_threshold must be within 0..64");
+  if (d.embedding_cosine_threshold < 0 || d.embedding_cosine_threshold > 1)
+    fail("dedupe.embedding_cosine_threshold must be within 0..1");
+
+  const emb = cfg.embeddings;
+  if (!Number.isFinite(emb.tinyblock_grid) || emb.tinyblock_grid < 8 || emb.tinyblock_grid > 32)
+    fail("embeddings.tinyblock_grid must be within 8..32");
 
   const e = cfg.encoding;
   if (e.quality < 1 || e.quality > 100) fail("encoding.quality must be within 1..100");
@@ -357,4 +377,5 @@ export function assertCandidateDetectionConfig(cfg: CandidateDetectionConfig): v
 /**
  * Convenience: export a stable ordered list for logging/validation.
  */
-export const ALL_REASON_CODES: ReadonlyArray<ReasonCodeString> = Object.values(ReasonCode);
+export const ALL_REASON_CODES: ReadonlyArray<ReasonCodeString> =
+  Object.values(ReasonCode) as ReadonlyArray<ReasonCodeString>;

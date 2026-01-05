@@ -1,5 +1,3 @@
-
-
 /*
   DRESZI — Crop utilities + encoding (serverless-safe)
 
@@ -41,11 +39,10 @@ export class CropError extends Error {
   }
 }
 
-function loadSharpOrThrow(): any {
+async function loadSharpOrThrow(): Promise<unknown> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require("sharp");
-    return mod?.default ?? mod;
+    const mod = await import("sharp");
+    return (mod as unknown as { default?: unknown }).default ?? (mod as unknown);
   } catch (e) {
     throw new CropError("sharp is required for DRESZI crop encoding. Install 'sharp'.", e);
   }
@@ -64,9 +61,17 @@ function assertDecodedDims(frame_w: number, frame_h: number, rgba: Uint8Array, g
 }
 
 function assertCropBox(c: CropBox): void {
-  for (const k of ["x", "y", "w", "h", "frame_w", "frame_h"] as const) {
-    const v = (c as any)[k] as number;
-    if (!Number.isFinite(v)) throw new CropError(`CropBox.${k} is not finite`);
+  const vals: Array<[keyof CropBox, number]> = [
+    ["x", c.x],
+    ["y", c.y],
+    ["w", c.w],
+    ["h", c.h],
+    ["frame_w", c.frame_w],
+    ["frame_h", c.frame_h]
+  ];
+
+  for (const [k, v] of vals) {
+    if (!Number.isFinite(v)) throw new CropError(`CropBox.${String(k)} is not finite`);
   }
 }
 
@@ -97,7 +102,6 @@ export function cropFromDecoded(params: {
 
   const c = clamped.crop;
   const w = Math.trunc(params.frame_w);
-  const h = Math.trunc(params.frame_h);
 
   const outW = Math.trunc(c.w);
   const outH = Math.trunc(c.h);
@@ -126,6 +130,8 @@ export function cropFromDecoded(params: {
   };
 }
 
+type SharpFactory = (input: Buffer, options?: { failOnError?: boolean; raw?: { width: number; height: number; channels: number } }) => any;
+
 /**
  * Encode a cropped RGBA buffer to JPEG deterministically.
  *
@@ -138,7 +144,8 @@ export async function encodeCropToJpeg(params: {
   cropped: CroppedImage;
   config: CandidateDetectionConfig;
 }): Promise<EncodedCrop> {
-  const sharp = loadSharpOrThrow();
+  const sharpMod = await loadSharpOrThrow();
+  const sharp = sharpMod as unknown as SharpFactory;
   const c = params.cropped;
 
   // Stable encoding settings.

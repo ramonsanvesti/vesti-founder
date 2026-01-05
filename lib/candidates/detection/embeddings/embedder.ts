@@ -37,20 +37,11 @@ function assertDims(width: number, height: number): void {
   }
 }
 
-// Support multiple config shapes without leaking `any`.
-// We keep CandidateDetectionConfig as the source of truth, but allow optional nesting
-// for embedding-related overrides during refactors.
-type CfgEmbeddingCompat = CandidateDetectionConfig & {
-  readonly embedding?: { readonly tinyblock_grid?: number };
-  readonly embeddings?: { readonly tinyblock_grid?: number };
-  readonly dedupe?: { readonly embedding?: { readonly tinyblock_grid?: number } };
-};
-
 function getTinyblockGrid(cfg: CandidateDetectionConfig): number {
-  const c = cfg as CfgEmbeddingCompat;
-  const v = c.embeddings?.tinyblock_grid ?? c.embedding?.tinyblock_grid ?? c.dedupe?.embedding?.tinyblock_grid;
-  if (Number.isFinite(v) && (v as number) > 0) return Math.trunc(v as number);
-  return 16;
+  const raw = cfg.embeddings.tinyblock_grid;
+  const v = Number.isFinite(raw) ? Math.trunc(raw) : 16;
+  // Config validator already enforces 8..32, but keep local safety.
+  return Math.max(8, Math.min(32, v));
 }
 
 function dot(a: ReadonlyArray<number>, b: ReadonlyArray<number>): number {
@@ -75,11 +66,12 @@ export function cosineSimilarity(a: ReadonlyArray<number>, b: ReadonlyArray<numb
   return { cosine: Math.max(-1, Math.min(1, c)) };
 }
 
-function l2Normalize(vec: number[]): number[] {
+function l2Normalize(vec: ReadonlyArray<number>): ReadonlyArray<number> {
   const n = norm(vec);
   if (n === 0) return vec;
-  for (let i = 0; i < vec.length; i++) vec[i] /= n;
-  return vec;
+  const out = new Array<number>(vec.length);
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] / n;
+  return out;
 }
 
 /**
