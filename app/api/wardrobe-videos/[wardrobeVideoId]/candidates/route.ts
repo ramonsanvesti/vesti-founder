@@ -79,12 +79,13 @@ export async function OPTIONS() {
 
 export async function GET(
   req: NextRequest,
-  ctx: { params: { wardrobeVideoId: string } }
+  ctx: { params: Promise<{ wardrobeVideoId: string }> | { wardrobeVideoId: string } }
 ) {
   try {
     const supabase = getSupabaseAdminClient();
 
-    const wardrobeVideoId = asString(ctx?.params?.wardrobeVideoId);
+    const params = await Promise.resolve(ctx?.params as any);
+    const wardrobeVideoId = asString(params?.wardrobeVideoId);
     if (!wardrobeVideoId) {
       return NextResponse.json(
         { ok: false, error: "Missing wardrobeVideoId" },

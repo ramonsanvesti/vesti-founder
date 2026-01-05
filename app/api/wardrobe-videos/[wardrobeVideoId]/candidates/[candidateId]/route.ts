@@ -3,7 +3,7 @@
 // app/api/wardrobe-videos/[wardrobeVideoId]/candidates/[candidateId]/route.ts
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
@@ -78,7 +78,7 @@ function getSupabaseAdminClient(): SupabaseClient {
   });
 }
 
-async function readJson<T>(req: Request): Promise<T | null> {
+async function readJson<T>(req: Request | NextRequest): Promise<T | null> {
   const ct = req.headers.get("content-type") || "";
   if (!ct.toLowerCase().includes("application/json")) return null;
   try {
@@ -89,10 +89,20 @@ async function readJson<T>(req: Request): Promise<T | null> {
 }
 
 export async function PATCH(
-  req: Request,
-  ctx: { params: { wardrobeVideoId: string; candidateId: string } },
+  req: NextRequest,
+  ctx: {
+    params:
+      | Promise<{ wardrobeVideoId: string; candidateId: string }>
+      | { wardrobeVideoId: string; candidateId: string };
+  },
 ): Promise<NextResponse> {
-  const { wardrobeVideoId, candidateId } = ctx.params;
+  const params = await Promise.resolve((ctx as any)?.params);
+  const wardrobeVideoId = typeof params?.wardrobeVideoId === "string" ? params.wardrobeVideoId.trim() : "";
+  const candidateId = typeof params?.candidateId === "string" ? params.candidateId.trim() : "";
+
+  if (!wardrobeVideoId || !candidateId) {
+    return jsonError(400, "E_MISSING_PARAMS", "Missing wardrobeVideoId or candidateId");
+  }
 
   if (!isUuid(wardrobeVideoId)) {
     return jsonError(400, "E_BAD_WARDROBE_VIDEO_ID", "Invalid wardrobeVideoId");
