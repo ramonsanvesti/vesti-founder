@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
 
+import { detectGarmentCandidates } from "../../../../lib/candidates/detection/detectGarmentCandidates";
+
 import ffmpegStatic from "ffmpeg-static";
 
 import fs from "node:fs";
@@ -524,7 +526,7 @@ function getSupabaseAdminClient() {
     auth: { persistSession: false, autoRefreshToken: false },
     global: {
       headers: {
-        "X-Client-Info": "vesti-founder:wardrobe-videos-process",
+        "X-Client-Info": "dreszi-founder:wardrobe-videos-process",
       },
     },
   });
@@ -708,12 +710,12 @@ async function handler(req: Request) {
       );
     }
 
-    // VESTI-5.4 (Frame extraction) config. Conservative defaults for serverless.
+    // DRESZI-5.4 (Frame extraction) config. Conservative defaults for serverless.
     const sampleEverySeconds = asInt(body.sample_every_seconds, 2, 1, 60);
     const maxFrames = asInt(body.max_frames, 40, 1, 300);
     const maxWidth = asInt(body.max_width, 1280, 200, 4000);
 
-    // Reserved for downstream candidate detection (VESTI-5.5).
+    // Reserved for downstream candidate detection (DRESZI-5.5).
     const maxCandidates = asInt(body.max_candidates, 8, 1, 50);
 
     // Mark as processing at job start (safe for retries).
@@ -790,11 +792,11 @@ async function handler(req: Request) {
     }
 
     // ------------------------------
-    // VESTI-5.4 — Extract frames (ephemeral)
+    // DRESZI-5.4 — Extract frames (ephemeral)
     // ------------------------------
 
     const jobId = qstashMessageId ?? crypto.randomUUID();
-    const jobDir = path.join(os.tmpdir(), "vesti", "wardrobe-videos", wardrobeVideoId, jobId);
+    const jobDir = path.join(os.tmpdir(), "dreszi", "wardrobe-videos", wardrobeVideoId, jobId);
     const meta = {
       jobId,
       wardrobeVideoId,
@@ -840,6 +842,8 @@ async function handler(req: Request) {
     let frames: ExtractedFrame[] = [];
     let durationSeconds: number | null = null;
     let videoBytes: number | null = null;
+    let candidates: any[] = [];
+    let detectMs: number | null = null;
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
@@ -884,8 +888,80 @@ async function handler(req: Request) {
         meta,
       });
 
-      // NOTE: VESTI-5.5 (candidate detection) will run next, using these /tmp frames.
-      // For VESTI-5.4, we only prove reliable extraction + safe status transitions.
+      // ------------------------------
+      // DRESZI-5.5 — Detect garment candidates from frames (ephemeral)
+      // ------------------------------
+      const tDetectStart = Date.now();
+      let detectionResult: any = null;
+
+      try {
+        detectionResult = await detectGarmentCandidates({
+          wardrobeVideoId,
+          userId: FOUNDER_USER_ID,
+          frames,
+          maxCandidates,
+          maxWidth,
+          sampleEverySeconds,
+        } as any);
+      } catch (e: any) {
+        log("candidates.detect.failed", {
+          ...meta,
+          err: toErrorString(e),
+        });
+        detectionResult = null;
+      }
+
+      detectMs = Date.now() - tDetectStart;
+
+      // Support a couple of possible shapes to be resilient across refactors.
+      const candidatesRaw: any[] = Array.isArray(detectionResult?.candidates)
+        ? detectionResult.candidates
+        : Array.isArray(detectionResult?.kept)
+          ? detectionResult.kept
+          : [];
+
+      // Do NOT return embedding vectors in the route response (keep payload small).
+      candidates = candidatesRaw.map((c: any, i: number) => ({
+        candidate_id: c.candidate_id ?? c.id ?? crypto.randomUUID(),
+        wardrobe_video_id: c.wardrobe_video_id ?? wardrobeVideoId,
+        user_id: c.user_id ?? FOUNDER_USER_ID,
+        frame_ts_ms: c.frame_ts_ms ?? c.tsMs ?? null,
+        crop_box: c.crop_box ?? null,
+        confidence: typeof c.confidence === "number" ? c.confidence : null,
+        reason_codes: Array.isArray(c.reason_codes) ? c.reason_codes : [],
+        phash: typeof c.phash === "string" ? c.phash : null,
+        sha256: typeof c.sha256 === "string" ? c.sha256 : null,
+        bytes: typeof c.bytes === "number" ? c.bytes : null,
+        embedding_model: typeof c.embedding_model === "string" ? c.embedding_model : null,
+        rank: typeof c.rank === "number" ? c.rank : i + 1,
+        status: typeof c.status === "string" ? c.status : "generated",
+      }));
+
+      // Absolute safety: never return empty candidates if frames exist.
+      if (candidates.length === 0 && frames.length > 0) {
+        const mid = frames[Math.floor(frames.length / 2)];
+        candidates.push({
+          candidate_id: crypto.randomUUID(),
+          wardrobe_video_id: wardrobeVideoId,
+          user_id: FOUNDER_USER_ID,
+          frame_ts_ms: mid.tsMs,
+          crop_box: null,
+          confidence: 0.01,
+          reason_codes: ["E_FALLBACK_CENTER_FRAME"],
+          phash: null,
+          sha256: null,
+          bytes: null,
+          embedding_model: null,
+          rank: 1,
+          status: "generated",
+        });
+      }
+
+      log("candidates.detect.done", {
+        ...meta,
+        detectMs,
+        candidates: candidates.length,
+      });
 
       const nowIso = new Date().toISOString();
 
@@ -925,6 +1001,11 @@ async function handler(req: Request) {
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
+          candidates_generated: candidates.length,
+          candidate_detection: {
+            detect_ms: detectMs,
+          },
+          candidates,
           video_duration_seconds: durationSeconds,
           video_bytes: videoBytes,
         },
@@ -985,6 +1066,8 @@ async function handler(req: Request) {
             details: String(err?.message ?? err),
             video_duration_seconds: durationSeconds,
             video_bytes: videoBytes,
+            candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
+            candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -1015,6 +1098,8 @@ async function handler(req: Request) {
           details: String(err?.message ?? err),
           video_duration_seconds: durationSeconds,
           video_bytes: videoBytes,
+          candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
+          candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
