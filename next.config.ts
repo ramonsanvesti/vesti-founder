@@ -8,8 +8,11 @@ const nextConfig: NextConfig = {
   // Without this, Vercel can deploy the function without the ffmpeg binary, causing spawn ENOENT.
   // Note: `outputFileTracingIncludes` is a top-level config key (not under `experimental`).
   outputFileTracingIncludes: {
+    // App Router route path (this is what Vercel/Next traces for the serverless entrypoint)
     "/api/wardrobe-videos/process": ["./node_modules/ffmpeg-static/**"],
-    "/app/api/wardrobe-videos/process/route": ["./node_modules/ffmpeg-static/**"],
+
+    // Safety net: any wardrobe-videos API route that may call ffmpeg helpers
+    "/api/wardrobe-videos/**": ["./node_modules/ffmpeg-static/**"],
   },
 };
 
