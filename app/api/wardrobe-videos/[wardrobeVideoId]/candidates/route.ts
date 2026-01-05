@@ -57,7 +57,7 @@ type CandidateRow = {
   storage_path: string;
   phash: string;
   sha256: string;
-  crop_box: any;
+  crop_box: unknown;
   frame_ts_ms: number;
   width: number | null;
   height: number | null;
@@ -73,18 +73,93 @@ type CandidateRow = {
   updated_at: string | null;
 };
 
+// API DTO (camelCase) — do not leak DB snake_case over the wire.
+export type CandidateDto = {
+  id: string;
+  userId: string;
+  wardrobeVideoId: string;
+  status: string;
+  storageBucket: string;
+  storagePath: string;
+  phash: string;
+  sha256: string;
+  cropBox: unknown;
+  frameTsMs: number;
+  width: number | null;
+  height: number | null;
+  mimeType: string | null;
+  bytes: number | null;
+  qualityScore: number | null;
+  confidence: number | null;
+  reasonCodes: string[] | null;
+  embeddingModel: string | null;
+  rank: number | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string | null;
+  signedUrl: string | null;
+  signedUrlError: string | null;
+  signedUrlExpiresInSeconds: number;
+};
+
+function asNullableNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "bigint") return Number(v);
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function mapCandidateRowToDto(params: {
+  row: CandidateRow;
+  signedUrl: string | null;
+  signedUrlError: string | null;
+  signedUrlExpiresInSeconds: number;
+}): CandidateDto {
+  const { row: r, signedUrl, signedUrlError, signedUrlExpiresInSeconds } = params;
+  return {
+    id: r.id,
+    userId: r.user_id,
+    wardrobeVideoId: r.wardrobe_video_id,
+    status: r.status,
+    storageBucket: r.storage_bucket,
+    storagePath: r.storage_path,
+    phash: r.phash,
+    sha256: r.sha256,
+    cropBox: r.crop_box,
+    frameTsMs: r.frame_ts_ms,
+    width: r.width,
+    height: r.height,
+    mimeType: r.mime_type,
+    bytes: asNullableNumber(r.bytes),
+    qualityScore: r.quality_score,
+    confidence: r.confidence,
+    reasonCodes: r.reason_codes,
+    embeddingModel: r.embedding_model,
+    rank: r.rank,
+    expiresAt: r.expires_at,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    signedUrl,
+    signedUrlError,
+    signedUrlExpiresInSeconds,
+  };
+}
+
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: RESPONSE_HEADERS });
 }
 
 export async function GET(
   req: NextRequest,
-  ctx: { params: Promise<{ wardrobeVideoId: string }> | { wardrobeVideoId: string } }
+  ctx: { params: Promise<{ wardrobeVideoId: string }> }
 ) {
   try {
     const supabase = getSupabaseAdminClient();
 
-    const params = await Promise.resolve(ctx?.params as any);
+    const params = await ctx.params;
     const wardrobeVideoId = asString(params?.wardrobeVideoId);
     if (!wardrobeVideoId) {
       return NextResponse.json(
@@ -103,6 +178,9 @@ export async function GET(
       60,
       60 * 60
     );
+    const limit = clampInt(url.searchParams.get("limit"), 50, 1, 200);
+
+    const nowIso = new Date().toISOString();
 
     // Ensure the video belongs to this founder user (cheap ownership gate)
     const { data: video, error: videoErr } = await supabase
@@ -117,6 +195,31 @@ export async function GET(
         { ok: false, error: "Video not found" },
         { status: 404, headers: RESPONSE_HEADERS }
       );
+    }
+
+    // Beta TTL cleanup (on-read purge): mark expired candidates as `expired`.
+    // This keeps UI lists clean without relying on scheduled jobs.
+    try {
+      const { data: expRows } = await supabase
+        .from("wardrobe_video_candidates")
+        .select("id")
+        .eq("user_id", FOUNDER_USER_ID)
+        .eq("wardrobe_video_id", wardrobeVideoId)
+        .lt("expires_at", nowIso)
+        .neq("status", "expired")
+        .limit(200);
+
+      const expIds = Array.isArray(expRows)
+        ? (expRows as Array<{ id: string }>).map((r) => r.id).filter(Boolean)
+        : [];
+      if (expIds.length > 0) {
+        await supabase
+          .from("wardrobe_video_candidates")
+          .update({ status: "expired", updated_at: nowIso })
+          .in("id", expIds);
+      }
+    } catch {
+      // Best-effort; do not fail list endpoint if cleanup fails.
     }
 
     // NOTE: We intentionally keep the Supabase query loosely typed here because
@@ -154,7 +257,7 @@ export async function GET(
       .eq("wardrobe_video_id", wardrobeVideoId);
 
     if (!includeExpired) {
-      query = query.gt("expires_at", new Date().toISOString());
+      query = query.gt("expires_at", nowIso);
       query = query.neq("status", "expired");
     }
 
@@ -164,6 +267,7 @@ export async function GET(
 
     // Deterministic ordering for UI
     const { data: dataRows, error } = await (query as any)
+      .limit(limit)
       .order("rank", { ascending: true, nullsFirst: false })
       .order("created_at", { ascending: true });
 
@@ -178,41 +282,54 @@ export async function GET(
       ? (dataRows as CandidateRow[])
       : [];
 
+    type CreateSignedUrlResult = {
+      signed_url: string | null;
+      error?: string | null;
+    };
+
     const candidates = await Promise.all(
       rows.map(async (r) => {
-        let signed_url: string | null = null;
-        let signed_url_error: string | null = null;
+        const isExpired = new Date(r.expires_at).getTime() <= Date.now();
+        let signedUrl: string | null = null;
+        let signedUrlError: string | null = null;
 
-        try {
-          // Helper currently returns `{ signed_url: string | null, ... }` (no `ok` flag).
-          // Cast the params + result defensively so this route does not break if helper types evolve.
-          const signed = (await createCandidateSignedUrl(
-            {
-              storageBucket: r.storage_bucket,
-              storagePath: r.storage_path,
-              expiresInSeconds: signedUrlTtlSeconds,
-            } as any
-          )) as any;
+        if (isExpired) {
+          signedUrl = null;
+          signedUrlError = "expired";
+        } else {
+          try {
+            const signed: CreateSignedUrlResult = await createCandidateSignedUrl({
+              storage_path: r.storage_path,
+              expires_in_seconds: signedUrlTtlSeconds,
+            });
 
-          signed_url = typeof signed?.signed_url === "string" ? signed.signed_url : null;
-          signed_url_error = signed_url ? null : (typeof signed?.error === "string" ? signed.error : null);
-        } catch (e) {
-          signed_url = null;
-          signed_url_error = e instanceof Error ? e.message : String(e);
+            signedUrl = typeof signed.signed_url === "string" ? signed.signed_url : null;
+            signedUrlError = signedUrl
+              ? null
+              : typeof signed.error === "string"
+                ? signed.error
+                : null;
+          } catch (e) {
+            signedUrl = null;
+            signedUrlError = e instanceof Error ? e.message : String(e);
+          }
         }
 
-        return {
-          ...r,
-          signed_url,
-          signed_url_error,
-        };
+        return mapCandidateRowToDto({
+          row: r,
+          signedUrl,
+          signedUrlError,
+          signedUrlExpiresInSeconds: signedUrlTtlSeconds,
+        });
       })
     );
 
     return NextResponse.json(
       {
         ok: true,
-        wardrobe_video_id: wardrobeVideoId,
+        wardrobeVideoId: wardrobeVideoId,
+        signedUrlExpiresInSeconds: signedUrlTtlSeconds,
+        count: candidates.length,
         candidates,
       },
       { status: 200, headers: RESPONSE_HEADERS }

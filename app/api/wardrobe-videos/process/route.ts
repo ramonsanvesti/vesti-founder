@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { verifySignatureAppRouter } from "@upstash/qstash/nextjs";
 import { createClient } from "@supabase/supabase-js";
 
@@ -48,6 +48,8 @@ const MAX_RETRIES = (() => {
   return Math.max(0, Math.min(20, n));
 })();
 
+// Stable UUID namespace (DNS) used to derive deterministic candidate IDs (UUIDv5).
+const CANDIDATE_UUID_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8" as const;
 const MAX_VIDEO_SECONDS = (() => {
   const raw = (process.env.WARDROBE_VIDEO_MAX_SECONDS ?? "60").trim();
   const n = Number.parseFloat(raw);
@@ -718,7 +720,7 @@ async function createSignedUrlForCandidate(params: {
   return data.signedUrl;
 }
 
-async function handler(req: Request) {
+async function handler(req: NextRequest) {
   try {
     const body = (await req.json().catch(() => ({}))) as ProcessPayload;
 
@@ -1008,6 +1010,7 @@ async function handler(req: Request) {
     let videoBytes: number | null = null;
     let candidates: any[] = [];
     let detectMs: number | null = null;
+    let persistMs: number | null = null;
     let candidatesUploaded = 0;
     let candidatesPersisted = 0;
 
@@ -1085,6 +1088,7 @@ async function handler(req: Request) {
         : Array.isArray(detectionResult?.kept)
           ? detectionResult.kept
           : [];
+      const candidatesDetected = candidatesRaw.length;
 
       // Do NOT return embedding vectors in the route response (keep payload small).
       candidates = candidatesRaw.map((c: any, i: number) => ({
@@ -1126,7 +1130,8 @@ async function handler(req: Request) {
       log("candidates.detect.done", {
         ...meta,
         detectMs,
-        candidates: candidates.length,
+        candidatesDetected,
+        candidatesWithFallback: candidates.length,
       });
 
       // ------------------------------
@@ -1134,12 +1139,63 @@ async function handler(req: Request) {
       // ------------------------------
       const tPersistStart = Date.now();
 
+      type CandidateDbUpsertRow = {
+        id: string;
+        user_id: string;
+        wardrobe_video_id: string;
+        status: string;
+        storage_bucket: string;
+        storage_path: string;
+        frame_ts_ms: number;
+        crop_box: any;
+        confidence: number;
+        reason_codes: string[];
+        phash: string;
+        sha256: string;
+        bytes: number;
+        width: number;
+        height: number;
+        mime_type: string;
+        source_frame_index: number;
+        source_frame_ts_ms: number;
+        embedding_model: string | null;
+        rank: number;
+        expires_at: string;
+        updated_at: string;
+        quality_score: number;
+      };
+
+      type CandidateRuntimePayload = {
+        candidate_id: string;
+        wardrobe_video_id: string;
+        user_id: string;
+        status: string;
+        storage_bucket: string;
+        storage_path: string;
+        signed_url: string | null;
+        signed_url_expires_in_seconds: number;
+        frame_ts_ms: number;
+        crop_box: any;
+        confidence: number;
+        reason_codes: string[];
+        phash: string;
+        sha256: string;
+        bytes: number;
+        width: number;
+        height: number;
+        mime_type: string;
+        source_frame_index: number;
+        source_frame_ts_ms: number;
+        embedding_model: string | null;
+        rank: number;
+        expires_at: string;
+      };
+
       const expiresAt = addDaysIso(7);
-      const persistedRows: any[] = [];
+      const persistedRows: CandidateDbUpsertRow[] = [];
+      const responseCandidates: CandidateRuntimePayload[] = [];
       const seenSha256 = new Set<string>();
 
-      // Use a stable UUID namespace (DNS) to derive deterministic candidate IDs.
-      const CANDIDATE_UUID_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
 
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
@@ -1190,7 +1246,9 @@ async function handler(req: Request) {
           meta,
         });
 
-        persistedRows.push({
+        const nowIso = new Date().toISOString();
+
+        const dbRow: CandidateDbUpsertRow = {
           id: candidateId,
           user_id: FOUNDER_USER_ID,
           wardrobe_video_id: wardrobeVideoId,
@@ -1214,22 +1272,43 @@ async function handler(req: Request) {
           embedding_model: typeof c.embedding_model === "string" ? c.embedding_model : null,
           rank: typeof c.rank === "number" ? c.rank : i + 1,
           expires_at: expiresAt,
-          updated_at: new Date().toISOString(),
-        });
+          updated_at: nowIso,
+          // If detection provides a quality score, keep it; otherwise derive a simple one from confidence.
+          quality_score:
+            typeof c.quality_score === "number"
+              ? c.quality_score
+              : typeof c.qualityScore === "number"
+                ? c.qualityScore
+                : Math.max(0, Math.min(1000, Math.round((typeof c.confidence === "number" ? c.confidence : 0) * 1000))),
+        };
 
-        // Keep the response object consistent with persisted info (camelCase for runtime payload).
-        c.candidate_id = candidateId;
-        c.user_id = FOUNDER_USER_ID;
-        c.wardrobe_video_id = wardrobeVideoId;
-        c.storage_bucket = WARDROBE_CANDIDATES_BUCKET;
-        c.storage_path = storagePath;
-        c.sha256 = sha256;
-        c.bytes = built.buffer.byteLength;
-        c.mime_type = built.mimeType;
-        c.width = built.width;
-        c.height = built.height;
-        c.signedUrl = signedUrl;
-        c.signedUrlExpiresInSeconds = CANDIDATE_SIGNED_URL_TTL_SECONDS;
+        persistedRows.push(dbRow);
+
+        responseCandidates.push({
+          candidate_id: candidateId,
+          wardrobe_video_id: wardrobeVideoId,
+          user_id: FOUNDER_USER_ID,
+          status: "generated",
+          storage_bucket: WARDROBE_CANDIDATES_BUCKET,
+          storage_path: storagePath,
+          signed_url: signedUrl,
+          signed_url_expires_in_seconds: CANDIDATE_SIGNED_URL_TTL_SECONDS,
+          frame_ts_ms: dbRow.frame_ts_ms,
+          crop_box: dbRow.crop_box,
+          confidence: dbRow.confidence,
+          reason_codes: dbRow.reason_codes,
+          phash: dbRow.phash,
+          sha256: dbRow.sha256,
+          bytes: dbRow.bytes,
+          width: dbRow.width,
+          height: dbRow.height,
+          mime_type: dbRow.mime_type,
+          source_frame_index: dbRow.source_frame_index,
+          source_frame_ts_ms: dbRow.source_frame_ts_ms,
+          embedding_model: dbRow.embedding_model,
+          rank: dbRow.rank,
+          expires_at: dbRow.expires_at,
+        });
       }
 
       // Upsert by (user_id, wardrobe_video_id, sha256) to be retry-safe.
@@ -1245,7 +1324,7 @@ async function handler(req: Request) {
         candidatesPersisted = persistedRows.length;
       }
 
-      const persistMs = Date.now() - tPersistStart;
+      persistMs = Date.now() - tPersistStart;
       log("candidates.persist.done", {
         ...meta,
         persisted: persistedRows.length,
@@ -1290,13 +1369,14 @@ async function handler(req: Request) {
           sample_every_seconds_used: sampleEverySeconds,
           max_width_used: maxWidth,
           max_candidates: maxCandidates,
-          candidates_generated: candidates.length,
+          candidates_detected: candidatesDetected,
+          candidates_with_fallback: candidates.length,
           candidates_uploaded: candidatesUploaded,
           candidates_persisted: candidatesPersisted,
           candidate_detection: {
             detect_ms: detectMs,
           },
-          candidates,
+          candidates: responseCandidates,
           video_duration_seconds: durationSeconds,
           video_bytes: videoBytes,
           candidate_persist_ms: persistMs,
@@ -1358,11 +1438,12 @@ async function handler(req: Request) {
             details: String(err?.message ?? err),
             video_duration_seconds: durationSeconds,
             video_bytes: videoBytes,
-            candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
+            candidates_with_fallback: typeof candidates !== "undefined" ? candidates.length : 0,
             candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
             candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
             candidates_uploaded: candidatesUploaded,
             candidates_persisted: candidatesPersisted,
+            candidate_persist_ms: persistMs,
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -1393,11 +1474,12 @@ async function handler(req: Request) {
           details: String(err?.message ?? err),
           video_duration_seconds: durationSeconds,
           video_bytes: videoBytes,
-          candidates_generated: typeof candidates !== "undefined" ? candidates.length : 0,
+          candidates_with_fallback: typeof candidates !== "undefined" ? candidates.length : 0,
           candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
           candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
           candidates_uploaded: candidatesUploaded,
           candidates_persisted: candidatesPersisted,
+          candidate_persist_ms: persistMs,
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
@@ -1422,7 +1504,7 @@ const hasSigningKeys = Boolean(
 
 export const POST = hasSigningKeys
   ? verifySignatureAppRouter(handler)
-  : async (req: Request) => {
+  : async (req: NextRequest) => {
       if (process.env.NODE_ENV === "production") {
         return NextResponse.json(
           {

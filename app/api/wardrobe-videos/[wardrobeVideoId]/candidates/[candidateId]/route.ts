@@ -1,5 +1,3 @@
-
-
 // app/api/wardrobe-videos/[wardrobeVideoId]/candidates/[candidateId]/route.ts
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -36,6 +34,33 @@ type CandidateRow = {
   quality_score: number | null;
 };
 
+type CandidateDto = {
+  id: string;
+  userId: string;
+  wardrobeVideoId: string;
+  status: CandidateStatus;
+  storageBucket: string;
+  storagePath: string;
+  frameTsMs: number;
+  cropBox: unknown;
+  confidence: number;
+  reasonCodes: string[];
+  phash: string;
+  sha256: string;
+  bytes: number | null;
+  width: number;
+  height: number;
+  mimeType: string;
+  rank: number;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceFrameIndex: number | null;
+  sourceFrameTsMs: number | null;
+  embeddingModel: string | null;
+  qualityScore: number | null;
+};
+
 type PatchBody = {
   /** DRESZI convention: camelCase in API */
   userId?: string;
@@ -63,6 +88,35 @@ function jsonError(
     { ok: false, error: { code, message, ...extra } },
     { status },
   );
+}
+
+function mapCandidateRowToDto(row: CandidateRow): CandidateDto {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    wardrobeVideoId: row.wardrobe_video_id,
+    status: row.status,
+    storageBucket: row.storage_bucket,
+    storagePath: row.storage_path,
+    frameTsMs: row.frame_ts_ms,
+    cropBox: row.crop_box,
+    confidence: row.confidence,
+    reasonCodes: row.reason_codes,
+    phash: row.phash,
+    sha256: row.sha256,
+    bytes: row.bytes,
+    width: row.width,
+    height: row.height,
+    mimeType: row.mime_type,
+    rank: row.rank,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    sourceFrameIndex: row.source_frame_index,
+    sourceFrameTsMs: row.source_frame_ts_ms,
+    embeddingModel: row.embedding_model,
+    qualityScore: row.quality_score,
+  };
 }
 
 function getSupabaseAdminClient(): SupabaseClient {
@@ -159,7 +213,7 @@ export async function PATCH(
 
   // 2) Idempotent update
   if (row.status === requestedStatus) {
-    return NextResponse.json({ ok: true, candidate: row }, { status: 200 });
+    return NextResponse.json({ ok: true, candidate: mapCandidateRowToDto(row) }, { status: 200 });
   }
 
   // Only allow transitions from generated -> selected/discarded.
@@ -192,5 +246,6 @@ export async function PATCH(
     });
   }
 
-  return NextResponse.json({ ok: true, candidate: updated ?? row }, { status: 200 });
+  const finalRow = (updated ?? row) as CandidateRow;
+  return NextResponse.json({ ok: true, candidate: mapCandidateRowToDto(finalRow) }, { status: 200 });
 }
