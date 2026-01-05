@@ -17,7 +17,17 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import sharp from "sharp";
 
+
 const require = createRequire(import.meta.url);
+// Hoist ffmpeg-static resolution to module scope so Next/Vercel file tracing can reliably include the binary.
+const FFMPEG_STATIC_PATH: string = (() => {
+  try {
+    const p = require("ffmpeg-static") as unknown as string;
+    return typeof p === "string" ? p : "";
+  } catch {
+    return "";
+  }
+})();
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -166,8 +176,9 @@ async function getFfmpegPath(): Promise<string> {
     throw new Error(`FFMPEG_PATH was set but file does not exist: ${envPath}`);
   }
 
-  // Static import is required so Next/Vercel file tracing can include the binary.
-  const resolved = (require("ffmpeg-static") as unknown as string) || "";
+  // Static resolution is required so Next/Vercel file tracing can include the binary.
+  const resolved = FFMPEG_STATIC_PATH || "";
+
   if (!resolved) {
     throw new Error(
       "ffmpeg-static did not resolve a binary path (empty). Ensure ffmpeg-static is installed as a production dependency."
@@ -175,10 +186,11 @@ async function getFfmpegPath(): Promise<string> {
   }
 
   if (!fs.existsSync(resolved)) {
+    // Provide a crisp, actionable error for Vercel deployments.
     throw new Error(
       `FFmpeg binary not found at resolved path: ${resolved}. ` +
         `This usually means the binary was not included in the serverless bundle. ` +
-        `This route uses a static import; if it still fails on Vercel, force-include node_modules/ffmpeg-static/** via Vercel includeFiles/outputFileTracingIncludes.`
+        `Fix: force-include node_modules/ffmpeg-static/** via Next outputFileTracingIncludes or Vercel function includeFiles.`
     );
   }
 
