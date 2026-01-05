@@ -75,7 +75,7 @@ function mkCandidate(params: {
 
 // Deterministic toy embedder: always returns the same vector so cosine similarity is 1.0.
 const FakeEmbedder: EmbedderLike = {
-  async embedFromGrayscale(_grayscale: Uint8Array, _width: number, _height: number) {
+  async embedFromGrayscale() {
     return [1, 0];
   }
 };

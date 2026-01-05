@@ -111,6 +111,11 @@ export interface CandidateDetectionConfig {
 
     /** How many of the best frames we attempt ROI+crops on (<= top_k_frames) */
     readonly frames_for_roi: number;
+
+    /** Ranking weights (deterministic). Used to combine sharpness/exposure/background. */
+    readonly weight_sharpness: number;
+    readonly weight_exposure: number;
+    readonly weight_background_simplicity: number;
   };
 
   /**
@@ -206,7 +211,12 @@ export const CANDIDATE_DETECTION_DEFAULTS: CandidateDetectionConfig = {
     clipped_high_ratio_max: 0.12,
 
     // How many of top frames we attempt ROI/crop on
-    frames_for_roi: 8
+    frames_for_roi: 8,
+
+    // Ranking weights (should sum to 1.0)
+    weight_sharpness: 0.55,
+    weight_exposure: 0.25,
+    weight_background_simplicity: 0.2
   },
 
   roi: {
@@ -353,6 +363,15 @@ export function assertCandidateDetectionConfig(cfg: CandidateDetectionConfig): v
   if (s.frames_for_roi <= 0) fail("scoring.frames_for_roi must be > 0");
   if (s.frames_for_roi > cfg.top_k_frames)
     fail("scoring.frames_for_roi must be <= top_k_frames");
+
+  const wOk = (v: number): boolean => Number.isFinite(v) && v >= 0 && v <= 1;
+  if (!wOk(s.weight_sharpness) || !wOk(s.weight_exposure) || !wOk(s.weight_background_simplicity)) {
+    fail("scoring weights must be within [0,1]");
+  }
+  const wSum = s.weight_sharpness + s.weight_exposure + s.weight_background_simplicity;
+  if (Math.abs(wSum - 1) > 1e-6) {
+    fail("scoring weights must sum to 1.0");
+  }
 
   const d = cfg.dedupe;
   if (d.phash_hamming_threshold < 0 || d.phash_hamming_threshold > 64)
