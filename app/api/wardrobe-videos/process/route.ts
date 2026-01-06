@@ -261,18 +261,52 @@ async function getFfmpegPath(): Promise<string> {
     );
   }
 
-  if (!fs.existsSync(resolved)) {
-    emitFfmpegDebug("ffmpeg_static_missing", resolved);
-
-    // Provide a crisp, actionable error for Vercel deployments.
-    throw new Error(
-      `FFmpeg binary not found at resolved path: ${resolved}. ` +
-        `This usually means the binary was not included in the serverless bundle. ` +
-        `Fix: force-include node_modules/ffmpeg-static/** via Next outputFileTracingIncludes or Vercel function includeFiles.`
-    );
+  if (fs.existsSync(resolved)) {
+    return resolved;
   }
 
-  return resolved;
+  // If the exported path doesn't exist in a serverless bundle, try common fallbacks relative to
+  // where the package actually landed (this helps when the export points at a build-time path).
+  emitFfmpegDebug("ffmpeg_static_missing", resolved);
+
+  const tried: string[] = [];
+  const pushIf = (p: string) => {
+    if (!p) return;
+    if (tried.includes(p)) return;
+    tried.push(p);
+  };
+
+  const binName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+
+  const pkgEntry = FFMPEG_STATIC_PACKAGE_ENTRY;
+  const pkgDir = pkgEntry ? path.dirname(pkgEntry) : "";
+  if (pkgDir) {
+    pushIf(path.join(pkgDir, binName));
+    // Some bundlers change where index.js lives; also try one level up.
+    pushIf(path.join(pkgDir, "..", binName));
+  }
+
+  // Common locations in Vercel/Lambda bundles.
+  pushIf(path.join(process.cwd(), "node_modules", "ffmpeg-static", binName));
+  const lambdaRoot = asString(process.env.LAMBDA_TASK_ROOT);
+  if (lambdaRoot) {
+    pushIf(path.join(lambdaRoot, "node_modules", "ffmpeg-static", binName));
+  }
+
+  for (const p of tried) {
+    emitFfmpegDebug("ffmpeg_static_alt_probe", p);
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+
+  // Provide a crisp, actionable error for Vercel deployments.
+  throw new Error(
+    `FFmpeg binary not found at resolved path: ${resolved}. ` +
+      `Also tried: ${tried.slice(0, 6).join(", ")}${tried.length > 6 ? "…" : ""}. ` +
+      `This usually means the binary was not included in the serverless bundle. ` +
+      `Fix: force-include node_modules/ffmpeg-static/** via Next outputFileTracingIncludes or Vercel function includeFiles.`
+  );
 }
 
 async function downloadVideoToTmp(params: {
