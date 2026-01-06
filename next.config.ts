@@ -5,20 +5,15 @@ const nextConfig: NextConfig = {
   // Do NOT use `output: "export"` because DRESZI needs API routes like /api/ingest
 
   // Ensure native binaries like ffmpeg-static are included in the serverless bundle.
-  // Without this, Vercel can deploy the function without the ffmpeg binary, causing spawn ENOENT.
-  // Note: `outputFileTracingIncludes` is a top-level config key (not under `experimental`).
+  // Keys match ROUTE PATHS; values are globs relative to the project root.
+  // See Next.js docs for output file tracing includes/excludes.
   outputFileTracingIncludes: {
-    // App Router route path (this is what Vercel/Next traces for the serverless entrypoint)
-    "/api/wardrobe-videos/process": [
-      "node_modules/ffmpeg-static/**",
-      "node_modules/ffmpeg-static/ffmpeg",
-    ],
+    // ffmpeg is used by the processing route (frame extraction + candidate pipeline)
+    "/api/wardrobe-videos/process": ["./node_modules/ffmpeg-static/**"],
 
-    // Safety net: any wardrobe-videos API route that may call ffmpeg helpers
-    "/api/wardrobe-videos/**": [
-      "node_modules/ffmpeg-static/**",
-      "node_modules/ffmpeg-static/ffmpeg",
-    ],
+    // Safety net: these routes import the same helpers in some environments
+    "/api/wardrobe-videos/upload": ["./node_modules/ffmpeg-static/**"],
+    "/api/wardrobe-videos": ["./node_modules/ffmpeg-static/**"],
   },
 };
 
