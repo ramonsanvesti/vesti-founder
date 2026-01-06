@@ -18,6 +18,7 @@ import { Readable } from "node:stream";
 import sharp from "sharp";
 
 
+
 const require = createRequire(import.meta.url);
 // Hoist ffmpeg-static resolution to module scope so Next/Vercel file tracing can reliably include the binary.
 const FFMPEG_STATIC_PATH: string = (() => {
@@ -28,6 +29,79 @@ const FFMPEG_STATIC_PATH: string = (() => {
     return "";
   }
 })();
+
+// Enable verbose ffmpeg resolution diagnostics in production by setting FFMPEG_DEBUG=1.
+const FFMPEG_DEBUG = (process.env.FFMPEG_DEBUG ?? "").trim() === "1";
+
+// Where Node resolved the ffmpeg-static package entry (useful to confirm bundling).
+const FFMPEG_STATIC_PACKAGE_ENTRY: string = (() => {
+  try {
+    return require.resolve("ffmpeg-static");
+  } catch {
+    return "";
+  }
+})();
+
+function safeExists(p: string): boolean {
+  try {
+    return !!p && fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+function safeListDir(p: string, limit = 50): string[] | null {
+  try {
+    if (!p) return null;
+    if (!fs.existsSync(p)) return null;
+    return fs.readdirSync(p).slice(0, limit);
+  } catch {
+    return null;
+  }
+}
+
+function emitFfmpegDebug(label: string, resolvedPath: string) {
+  if (!FFMPEG_DEBUG) return;
+
+  const resolvedDir = resolvedPath ? path.dirname(resolvedPath) : "";
+  const pkgDir = FFMPEG_STATIC_PACKAGE_ENTRY ? path.dirname(FFMPEG_STATIC_PACKAGE_ENTRY) : "";
+
+  // Try a couple of likely dirs for diagnostics.
+  const nodeModulesDir = path.join(process.cwd(), "node_modules", "ffmpeg-static");
+
+  console.log(
+    "[ffmpeg-debug]",
+    JSON.stringify(
+      {
+        ts: new Date().toISOString(),
+        label,
+        resolvedPath,
+        resolvedExists: safeExists(resolvedPath),
+        resolvedDir,
+        resolvedDirExists: safeExists(resolvedDir),
+        resolvedDirList: safeListDir(resolvedDir),
+        packageEntry: FFMPEG_STATIC_PACKAGE_ENTRY,
+        packageEntryExists: safeExists(FFMPEG_STATIC_PACKAGE_ENTRY),
+        packageDir: pkgDir,
+        packageDirExists: safeExists(pkgDir),
+        packageDirList: safeListDir(pkgDir),
+        nodeModulesDir,
+        nodeModulesDirExists: safeExists(nodeModulesDir),
+        nodeModulesDirList: safeListDir(nodeModulesDir),
+        cwd: process.cwd(),
+        platform: process.platform,
+        arch: process.arch,
+        node: process.version,
+        vercel: process.env.VERCEL ?? null,
+        vercelEnv: process.env.VERCEL_ENV ?? null,
+        lambdaTaskRoot: process.env.LAMBDA_TASK_ROOT ?? null,
+        region: process.env.VERCEL_REGION ?? null,
+      },
+      null,
+      0
+    )
+  );
+}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -172,12 +246,14 @@ async function getFfmpegPath(): Promise<string> {
   // Optional override (useful for local/dev or custom binaries)
   const envPath = asString(process.env.FFMPEG_PATH);
   if (envPath) {
+    emitFfmpegDebug("env_override", envPath);
     if (fs.existsSync(envPath)) return envPath;
     throw new Error(`FFMPEG_PATH was set but file does not exist: ${envPath}`);
   }
 
   // Static resolution is required so Next/Vercel file tracing can include the binary.
   const resolved = FFMPEG_STATIC_PATH || "";
+  emitFfmpegDebug("ffmpeg_static_resolved", resolved);
 
   if (!resolved) {
     throw new Error(
@@ -186,6 +262,8 @@ async function getFfmpegPath(): Promise<string> {
   }
 
   if (!fs.existsSync(resolved)) {
+    emitFfmpegDebug("ffmpeg_static_missing", resolved);
+
     // Provide a crisp, actionable error for Vercel deployments.
     throw new Error(
       `FFmpeg binary not found at resolved path: ${resolved}. ` +
