@@ -178,6 +178,9 @@ const MAX_VIDEO_SECONDS = (() => {
   return Math.max(1, Math.min(300, n));
 })();
 
+// Candidate initial status (DB now allows "pending" via constraint).
+const INITIAL_CANDIDATE_STATUS = "pending" as const;
+
 class NonRetriableError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -1359,7 +1362,7 @@ async function handler(req: NextRequest) {
         bytes: typeof c.bytes === "number" ? c.bytes : null,
         embedding_model: typeof c.embedding_model === "string" ? c.embedding_model : null,
         rank: typeof c.rank === "number" ? c.rank : i + 1,
-        status: typeof c.status === "string" ? c.status : "pending",
+        status: typeof c.status === "string" ? c.status : INITIAL_CANDIDATE_STATUS,
       }));
 
       // Absolute safety: never return empty candidates if frames exist.
@@ -1378,7 +1381,7 @@ async function handler(req: NextRequest) {
           bytes: null,
           embedding_model: null,
           rank: 1,
-          status: "pending",
+          status: INITIAL_CANDIDATE_STATUS,
         });
       }
 
@@ -1514,7 +1517,7 @@ async function handler(req: NextRequest) {
           id: candidateId,
           user_id: FOUNDER_USER_ID,
           wardrobe_video_id: wardrobeVideoId,
-          status: "pending",
+          status: INITIAL_CANDIDATE_STATUS,
           storage_bucket: WARDROBE_CANDIDATES_BUCKET,
           storage_path: storagePath,
           frame_ts_ms: frameTsMs ?? frame.tsMs,
@@ -1550,7 +1553,7 @@ async function handler(req: NextRequest) {
           candidateId,
           wardrobeVideoId,
           userId: FOUNDER_USER_ID,
-          status: "pending",
+          status: INITIAL_CANDIDATE_STATUS,
           storageBucket: WARDROBE_CANDIDATES_BUCKET,
           storagePath,
           signedUrl,
