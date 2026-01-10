@@ -167,6 +167,32 @@ function log(event: string, meta: LogMeta = {}) {
   );
 }
 
+function ensurePathString(p: unknown, label: string, meta: LogMeta): string {
+  if (typeof p !== "string") {
+    log("path.invalid_type", {
+      ...meta,
+      label,
+      receivedType: typeof p,
+      receivedValue: String(p),
+    });
+    throw new NonRetriableError(
+      "invalid_path_type",
+      `Invalid ${label}: expected string path, got ${typeof p}`
+    );
+  }
+
+  const s = p.trim();
+  if (!s) {
+    log("path.invalid_empty", { ...meta, label });
+    throw new NonRetriableError(
+      "invalid_path_empty",
+      `Invalid ${label}: empty path`
+    );
+  }
+
+  return s;
+}
+
 function toCamelWardrobeVideo(row: unknown): Record<string, unknown> | null {
   if (!row || typeof row !== "object") return null;
 
@@ -365,7 +391,8 @@ async function downloadVideoToTmp(params: {
     throw new Error(`video fetch failed: ${res.status} ${res.statusText}`);
   }
 
-  await fsp.mkdir(path.dirname(outPath), { recursive: true });
+  const outDir = ensurePathString(path.dirname(outPath), "download.outDir", meta);
+  await fsp.mkdir(outDir, { recursive: true });
 
   // Stream to disk (do not buffer the whole file in RAM).
   // Node fetch body is a Web ReadableStream.
@@ -404,7 +431,7 @@ async function extractFramesWithFfmpeg(params: {
 
   const ffmpeg = await getFfmpegPath();
   log("ffmpeg.path", { ...meta, ffmpegPath: ffmpeg });
-  const framesDir = path.join(jobDir, "frames");
+  const framesDir = ensurePathString(path.join(jobDir, "frames"), "framesDir", meta);
   await fsp.mkdir(framesDir, { recursive: true });
 
   // Default to a faster seek-based mode. Allow override for debugging.
@@ -442,7 +469,7 @@ async function extractFramesWithFfmpeg(params: {
 
     async function runOne(index: number, tSec: number): Promise<ExtractedFrame | null> {
       const outName = `frame_${String(index).padStart(3, "0")}.jpg`;
-      const outPath = path.join(framesDir, outName);
+      const outPath = ensurePathString(path.join(framesDir, outName), "frameOutPath", meta);
 
       // Fast seek with -ss before -i. Disable audio.
       const vf = `scale='min(${maxWidth},iw)':-2:flags=bicubic`;
@@ -550,7 +577,7 @@ async function extractFramesWithFfmpeg(params: {
 
   // 1 frame every N seconds (configurable)
   const vf = `fps=1/${sampleEverySeconds},scale='min(${maxWidth},iw)':-2:flags=lanczos,showinfo`;
-  const outPattern = path.join(framesDir, "frame_%03d.jpg");
+  const outPattern = ensurePathString(path.join(framesDir, "frame_%03d.jpg"), "outPattern", meta);
 
   const args = [
     "-hide_banner",
@@ -1129,13 +1156,17 @@ async function handler(req: NextRequest) {
     // ------------------------------
 
     const jobId = asPathSegment(qstashMessageId ?? crypto.randomUUID());
-    const tmpRoot = String(os.tmpdir());
-    const jobDir = path.join(
-      tmpRoot,
-      "dreszi",
-      "wardrobe-videos",
-      asPathSegment(wardrobeVideoId),
-      jobId
+    const tmpRoot = ensurePathString(String(os.tmpdir()), "tmpRoot", baseMeta);
+    const jobDir = ensurePathString(
+      path.join(
+        tmpRoot,
+        "dreszi",
+        "wardrobe-videos",
+        asPathSegment(wardrobeVideoId),
+        jobId
+      ),
+      "jobDir",
+      baseMeta
     );
     const meta = {
       jobId,
@@ -1146,6 +1177,11 @@ async function handler(req: NextRequest) {
       maxFrames,
       maxWidth,
       maxCandidates,
+      // raw inputs for debugging (safe to log)
+      sampleEverySecondsRaw: (body as any).sample_every_seconds ?? null,
+      maxFramesRaw: (body as any).max_frames ?? null,
+      maxWidthRaw: (body as any).max_width ?? null,
+      maxCandidatesRaw: (body as any).max_candidates ?? null,
     };
 
     log("process.start", meta);
@@ -1177,7 +1213,7 @@ async function handler(req: NextRequest) {
       );
     }
 
-    const inputPath = path.join(jobDir, "input.mp4");
+    const inputPath = ensurePathString(path.join(jobDir, "input.mp4"), "inputPath", meta);
 
     let frames: ExtractedFrame[] = [];
     let durationSeconds: number | null = null;
@@ -1569,6 +1605,14 @@ async function handler(req: NextRequest) {
 
       const classification = classifyNonRetriable(err);
       const errStr = toErrorString(err);
+      log("process.debug.types", {
+        ...meta,
+        jobDirType: typeof jobDir,
+        inputPathType: typeof inputPath,
+        maxWidthType: typeof maxWidth,
+        maxFramesType: typeof maxFrames,
+        sampleEverySecondsType: typeof sampleEverySeconds,
+      });
       log("process.failed", {
         ...meta,
         nonRetriable: classification.nonRetriable,
