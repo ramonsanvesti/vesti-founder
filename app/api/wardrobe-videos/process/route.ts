@@ -154,7 +154,9 @@ class NonRetriableError extends Error {
   }
 }
 
-function log(event: string, meta: Record<string, any>) {
+type LogMeta = Record<string, unknown>;
+
+function log(event: string, meta: LogMeta = {}) {
   // Single-line JSON logs that are easy to grep in Vercel.
   console.log(
     JSON.stringify({
@@ -163,6 +165,30 @@ function log(event: string, meta: Record<string, any>) {
       ...meta,
     })
   );
+}
+
+function toCamelWardrobeVideo(row: unknown): Record<string, unknown> | null {
+  if (!row || typeof row !== "object") return null;
+
+  const r = row as Record<string, unknown>;
+  const get = (k: string) => r[k];
+
+  return {
+    id: get("id"),
+    userId: get("user_id") ?? get("userId"),
+    status: get("status"),
+    videoUrl: get("video_url") ?? get("videoUrl"),
+    createdAt: get("created_at") ?? get("createdAt"),
+    lastProcessMessageId: get("last_process_message_id") ?? get("lastProcessMessageId"),
+    lastProcessRetried: get("last_process_retried") ?? get("lastProcessRetried"),
+    lastProcessedAt: get("last_processed_at") ?? get("lastProcessedAt"),
+    lastProcessError: get("last_process_error") ?? get("lastProcessError"),
+    framesExtractedCount: get("frames_extracted_count") ?? get("framesExtractedCount"),
+    sampleEverySecondsUsed: get("sample_every_seconds_used") ?? get("sampleEverySecondsUsed"),
+    maxWidthUsed: get("max_width_used") ?? get("maxWidthUsed"),
+    videoDurationSeconds: get("video_duration_seconds") ?? get("videoDurationSeconds"),
+    videoBytes: get("video_bytes") ?? get("videoBytes"),
+  };
 }
 
 type ExtractedFrame = {
@@ -185,7 +211,7 @@ function parsePtsTimesFromFfmpegShowinfo(stderr: string): number[] {
 // Helper: probe duration (fast metadata parse)
 async function probeDurationSeconds(params: {
   inputPath: string;
-  meta: Record<string, any>;
+  meta: LogMeta;
 }): Promise<number | null> {
   const { inputPath, meta } = params;
   const ffmpeg = await getFfmpegPath();
@@ -234,7 +260,7 @@ async function probeDurationSeconds(params: {
   return dur;
 }
 
-async function safeRm(dir: string, meta: Record<string, any>) {
+async function safeRm(dir: string, meta: LogMeta) {
   try {
     await fsp.rm(dir, { recursive: true, force: true });
   } catch (e: any) {
@@ -314,7 +340,7 @@ async function downloadVideoToTmp(params: {
   bucket: string;
   objectPathOrUrl: string;
   outPath: string;
-  meta: Record<string, any>;
+  meta: LogMeta;
 }): Promise<{ bytes: number }> {
   const { supabase, bucket, objectPathOrUrl, outPath, meta } = params;
 
@@ -364,7 +390,7 @@ async function extractFramesWithFfmpeg(params: {
   maxFrames: number;
   maxWidth: number;
   durationSeconds?: number | null;
-  meta: Record<string, any>;
+  meta: LogMeta;
 }): Promise<ExtractedFrame[]> {
   const {
     inputPath,
@@ -632,6 +658,15 @@ function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string
   }
 
   const msg = String(err?.message ?? err ?? "");
+  // Node path type errors are programmer/config errors; retries will not fix them.
+  // Example: The "path" argument must be of type string. Received type number (9000)
+  if (
+    msg.includes('The "path" argument must be of type string') ||
+    msg.includes('The "path" argument must be of type string.') ||
+    (msg.includes('path" argument') && msg.includes('type string') && msg.includes('Received type number'))
+  ) {
+    return { nonRetriable: true, reason: "invalid_path_type" };
+  }
   if (
     msg.includes("FFmpeg binary not available") ||
     msg.includes("FFmpeg binary not found") ||
@@ -683,6 +718,11 @@ type ProcessPayload = {
 
 function asString(v: unknown) {
   return typeof v === "string" ? v.trim() : "";
+}
+
+function asPathSegment(v: unknown) {
+  // Force to string and prevent path traversal / separators.
+  return asString(String(v ?? "")).replace(/[\\/]/g, "_");
 }
 
 function asInt(v: unknown, fallback: number, min: number, max: number) {
@@ -785,7 +825,7 @@ async function uploadCandidateObject(params: {
   storagePath: string;
   buffer: Buffer;
   contentType: string;
-  meta: Record<string, any>;
+  meta: LogMeta;
 }) {
   const { supabase, bucket, storagePath, buffer, contentType, meta } = params;
 
@@ -828,7 +868,7 @@ async function createSignedUrlForCandidate(params: {
   bucket: string;
   storagePath: string;
   expiresInSeconds: number;
-  meta: Record<string, any>;
+  meta: LogMeta;
 }): Promise<string | null> {
   const { supabase, bucket, storagePath, expiresInSeconds, meta } = params;
   const { data, error } = await supabase.storage
@@ -895,11 +935,11 @@ async function handler(req: NextRequest) {
       return NextResponse.json(
         {
           ok: false,
-          wardrobe_video_id: wardrobeVideoId,
+          wardrobeVideoId,
           status: "failed",
           error: "Max retries exceeded",
           retried: qstashRetriedSafe,
-          max_retries: MAX_RETRIES,
+          maxRetries: MAX_RETRIES,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -928,7 +968,7 @@ async function handler(req: NextRequest) {
       // Non-retriable: the row doesn't exist (or belongs to a different user).
       // Return 200 to prevent QStash from retrying a permanent failure.
       return NextResponse.json(
-        { ok: false, error: "Wardrobe video not found", wardrobe_video_id: wardrobeVideoId },
+        { ok: false, error: "Wardrobe video not found", wardrobeVideoId },
         { status: 200, headers: RESPONSE_HEADERS }
       );
     }
@@ -963,7 +1003,7 @@ async function handler(req: NextRequest) {
       return NextResponse.json(
         {
           ok: true,
-          video: { ...(existing as any), status: "processed" },
+          video: toCamelWardrobeVideo({ ...(existing as any), status: "processed" }) ?? ({ ...(existing as any), status: "processed" } as any),
           reconciled: true,
         },
         { status: 200, headers: RESPONSE_HEADERS }
@@ -973,7 +1013,7 @@ async function handler(req: NextRequest) {
     // If already processed, acknowledge idempotently (even if a duplicate message arrives).
     if (String((existing as any).status) === "processed") {
       return NextResponse.json(
-        { ok: true, video: existing, idempotent: true },
+        { ok: true, video: toCamelWardrobeVideo(existing) ?? (existing as any), idempotent: true },
         { status: 200, headers: RESPONSE_HEADERS }
       );
     }
@@ -997,7 +1037,7 @@ async function handler(req: NextRequest) {
           ok: true,
           deduped: true,
           reason: "already_processing",
-          active_message_id: (existing as any).last_process_message_id,
+          activeMessageId: (existing as any).last_process_message_id,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -1079,7 +1119,7 @@ async function handler(req: NextRequest) {
       });
 
       return NextResponse.json(
-        { ok: true, wardrobe_video_id: wardrobeVideoId, skipped: true, reason: "not_eligible" },
+        { ok: true, wardrobeVideoId, skipped: true, reason: "not_eligible" },
         { status: 200, headers: RESPONSE_HEADERS }
       );
     }
@@ -1088,8 +1128,15 @@ async function handler(req: NextRequest) {
     // DRESZI-5.4 — Extract frames (ephemeral)
     // ------------------------------
 
-    const jobId = qstashMessageId ?? crypto.randomUUID();
-    const jobDir = path.join(os.tmpdir(), "dreszi", "wardrobe-videos", wardrobeVideoId, jobId);
+    const jobId = asPathSegment(qstashMessageId ?? crypto.randomUUID());
+    const tmpRoot = String(os.tmpdir());
+    const jobDir = path.join(
+      tmpRoot,
+      "dreszi",
+      "wardrobe-videos",
+      asPathSegment(wardrobeVideoId),
+      jobId
+    );
     const meta = {
       jobId,
       wardrobeVideoId,
@@ -1125,7 +1172,7 @@ async function handler(req: NextRequest) {
         .eq("user_id", FOUNDER_USER_ID);
 
       return NextResponse.json(
-        { ok: false, error: "Missing video_url on wardrobe_videos row", non_retriable: true },
+        { ok: false, error: "Missing video_url on wardrobe_videos row", nonRetriable: true },
         { status: 200, headers: RESPONSE_HEADERS }
       );
     }
@@ -1293,29 +1340,29 @@ async function handler(req: NextRequest) {
       };
 
       type CandidateRuntimePayload = {
-        candidate_id: string;
-        wardrobe_video_id: string;
-        user_id: string;
+        candidateId: string;
+        wardrobeVideoId: string;
+        userId: string;
         status: string;
-        storage_bucket: string;
-        storage_path: string;
-        signed_url: string | null;
-        signed_url_expires_in_seconds: number;
-        frame_ts_ms: number;
-        crop_box: any;
+        storageBucket: string;
+        storagePath: string;
+        signedUrl: string | null;
+        signedUrlExpiresInSeconds: number;
+        frameTsMs: number;
+        cropBox: any;
         confidence: number;
-        reason_codes: string[];
+        reasonCodes: string[];
         phash: string;
         sha256: string;
         bytes: number;
         width: number;
         height: number;
-        mime_type: string;
-        source_frame_index: number;
-        source_frame_ts_ms: number;
-        embedding_model: string | null;
+        mimeType: string;
+        sourceFrameIndex: number;
+        sourceFrameTsMs: number;
+        embeddingModel: string | null;
         rank: number;
-        expires_at: string;
+        expiresAt: string;
       };
 
       const expiresAt = addDaysIso(7);
@@ -1419,29 +1466,29 @@ async function handler(req: NextRequest) {
         persistedRows.push(dbRow);
 
         responseCandidates.push({
-          candidate_id: candidateId,
-          wardrobe_video_id: wardrobeVideoId,
-          user_id: FOUNDER_USER_ID,
+          candidateId,
+          wardrobeVideoId,
+          userId: FOUNDER_USER_ID,
           status: "generated",
-          storage_bucket: WARDROBE_CANDIDATES_BUCKET,
-          storage_path: storagePath,
-          signed_url: signedUrl,
-          signed_url_expires_in_seconds: CANDIDATE_SIGNED_URL_TTL_SECONDS,
-          frame_ts_ms: dbRow.frame_ts_ms,
-          crop_box: dbRow.crop_box,
+          storageBucket: WARDROBE_CANDIDATES_BUCKET,
+          storagePath,
+          signedUrl,
+          signedUrlExpiresInSeconds: CANDIDATE_SIGNED_URL_TTL_SECONDS,
+          frameTsMs: dbRow.frame_ts_ms,
+          cropBox: dbRow.crop_box,
           confidence: dbRow.confidence,
-          reason_codes: dbRow.reason_codes,
+          reasonCodes: dbRow.reason_codes,
           phash: dbRow.phash,
           sha256: dbRow.sha256,
           bytes: dbRow.bytes,
           width: dbRow.width,
           height: dbRow.height,
-          mime_type: dbRow.mime_type,
-          source_frame_index: dbRow.source_frame_index,
-          source_frame_ts_ms: dbRow.source_frame_ts_ms,
-          embedding_model: dbRow.embedding_model,
+          mimeType: dbRow.mime_type,
+          sourceFrameIndex: dbRow.source_frame_index,
+          sourceFrameTsMs: dbRow.source_frame_ts_ms,
+          embeddingModel: dbRow.embedding_model,
           rank: dbRow.rank,
-          expires_at: dbRow.expires_at,
+          expiresAt: dbRow.expires_at,
         });
       }
 
@@ -1497,24 +1544,24 @@ async function handler(req: NextRequest) {
       return NextResponse.json(
         {
           ok: true,
-          video: data,
-          message_id: qstashMessageId,
+          video: toCamelWardrobeVideo(data) ?? (data as any),
+          messageId: qstashMessageId,
           retried: qstashRetriedSafe,
-          frames_extracted: frames.length,
-          sample_every_seconds_used: sampleEverySeconds,
-          max_width_used: maxWidth,
-          max_candidates: maxCandidates,
-          candidates_detected: candidatesDetected,
-          candidates_with_fallback: candidates.length,
-          candidates_uploaded: candidatesUploaded,
-          candidates_persisted: candidatesPersisted,
-          candidate_detection: {
-            detect_ms: detectMs,
+          framesExtracted: frames.length,
+          sampleEverySecondsUsed: sampleEverySeconds,
+          maxWidthUsed: maxWidth,
+          maxCandidates: maxCandidates,
+          candidatesDetected: candidatesDetected,
+          candidatesWithFallback: candidates.length,
+          candidatesUploaded: candidatesUploaded,
+          candidatesPersisted: candidatesPersisted,
+          candidateDetection: {
+            detectMs: detectMs,
           },
           candidates: responseCandidates,
-          video_duration_seconds: durationSeconds,
-          video_bytes: videoBytes,
-          candidate_persist_ms: persistMs,
+          videoDurationSeconds: durationSeconds,
+          videoBytes: videoBytes,
+          candidatePersistMs: persistMs,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
@@ -1569,16 +1616,16 @@ async function handler(req: NextRequest) {
             terminal: true,
             reason: terminalReason,
             retried: qstashRetriedSafe,
-            max_retries: MAX_RETRIES,
+            maxRetries: MAX_RETRIES,
             details: String(err?.message ?? err),
-            video_duration_seconds: durationSeconds,
-            video_bytes: videoBytes,
-            candidates_with_fallback: typeof candidates !== "undefined" ? candidates.length : 0,
-            candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
-            candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
-            candidates_uploaded: candidatesUploaded,
-            candidates_persisted: candidatesPersisted,
-            candidate_persist_ms: persistMs,
+            videoDurationSeconds: durationSeconds,
+            videoBytes: videoBytes,
+            candidatesWithFallback: typeof candidates !== "undefined" ? candidates.length : 0,
+            candidateDetection: typeof detectMs !== "undefined" ? { detectMs: detectMs } : { detectMs: null },
+            candidatesBucket: WARDROBE_CANDIDATES_BUCKET,
+            candidatesUploaded: candidatesUploaded,
+            candidatesPersisted: candidatesPersisted,
+            candidatePersistMs: persistMs,
           },
           { status: 200, headers: RESPONSE_HEADERS }
         );
@@ -1605,22 +1652,22 @@ async function handler(req: NextRequest) {
           ok: false,
           error: "Processing failed (retriable)",
           retried: qstashRetriedSafe,
-          max_retries: MAX_RETRIES,
+          maxRetries: MAX_RETRIES,
           details: String(err?.message ?? err),
-          video_duration_seconds: durationSeconds,
-          video_bytes: videoBytes,
-          candidates_with_fallback: typeof candidates !== "undefined" ? candidates.length : 0,
-          candidate_detection: typeof detectMs !== "undefined" ? { detect_ms: detectMs } : { detect_ms: null },
-          candidates_bucket: WARDROBE_CANDIDATES_BUCKET,
-          candidates_uploaded: candidatesUploaded,
-          candidates_persisted: candidatesPersisted,
-          candidate_persist_ms: persistMs,
+          videoDurationSeconds: durationSeconds,
+          videoBytes: videoBytes,
+          candidatesWithFallback: typeof candidates !== "undefined" ? candidates.length : 0,
+          candidateDetection: typeof detectMs !== "undefined" ? { detectMs: detectMs } : { detectMs: null },
+          candidatesBucket: WARDROBE_CANDIDATES_BUCKET,
+          candidatesUploaded: candidatesUploaded,
+          candidatesPersisted: candidatesPersisted,
+          candidatePersistMs: persistMs,
         },
         { status: 500, headers: RESPONSE_HEADERS }
       );
     } finally {
       // Ephemeral guarantee: remove /tmp artifacts.
-      await safeRm(jobDir, meta);
+      await safeRm(String(jobDir), meta);
     }
   } catch (err: any) {
     return NextResponse.json(
