@@ -42,17 +42,17 @@ const FFMPEG_STATIC_PACKAGE_ENTRY: string = (() => {
   }
 })();
 
-function safeExists(p: string): boolean {
+function safeExists(p: unknown): boolean {
   try {
-    return !!p && fs.existsSync(p);
+    return typeof p === "string" && p.length > 0 && fs.existsSync(p);
   } catch {
     return false;
   }
 }
 
-function safeListDir(p: string, limit = 50): string[] | null {
+function safeListDir(p: unknown, limit = 50): string[] | null {
   try {
-    if (!p) return null;
+    if (typeof p !== "string" || !p) return null;
     if (!fs.existsSync(p)) return null;
     return fs.readdirSync(p).slice(0, limit);
   } catch {
@@ -60,10 +60,25 @@ function safeListDir(p: string, limit = 50): string[] | null {
   }
 }
 
-function emitFfmpegDebug(label: string, resolvedPath: string) {
+function emitFfmpegDebug(label: string, resolvedPath: unknown) {
   if (!FFMPEG_DEBUG) return;
 
-  const resolvedDir = resolvedPath ? path.dirname(resolvedPath) : "";
+  const resolvedPathStr = typeof resolvedPath === "string" ? resolvedPath : "";
+  const resolvedPathType = typeof resolvedPath;
+  const resolvedPathPreview =
+    resolvedPathType === "string"
+      ? resolvedPathStr
+      : resolvedPath == null
+        ? String(resolvedPath)
+        : (() => {
+            try {
+              return JSON.stringify(resolvedPath);
+            } catch {
+              return String(resolvedPath);
+            }
+          })();
+
+  const resolvedDir = resolvedPathStr ? path.dirname(resolvedPathStr) : "";
   const pkgDir = FFMPEG_STATIC_PACKAGE_ENTRY ? path.dirname(FFMPEG_STATIC_PACKAGE_ENTRY) : "";
 
   // Try a couple of likely dirs for diagnostics.
@@ -75,19 +90,28 @@ function emitFfmpegDebug(label: string, resolvedPath: string) {
       {
         ts: new Date().toISOString(),
         label,
-        resolvedPath,
-        resolvedExists: safeExists(resolvedPath),
+
+        // Raw/typed info (prevents crashes if the value is not a string)
+        resolvedPathType,
+        resolvedPathPreview,
+
+        // String-only path info used for filesystem checks
+        resolvedPath: resolvedPathStr,
+        resolvedExists: safeExists(resolvedPathStr),
         resolvedDir,
         resolvedDirExists: safeExists(resolvedDir),
         resolvedDirList: safeListDir(resolvedDir),
+
         packageEntry: FFMPEG_STATIC_PACKAGE_ENTRY,
         packageEntryExists: safeExists(FFMPEG_STATIC_PACKAGE_ENTRY),
         packageDir: pkgDir,
         packageDirExists: safeExists(pkgDir),
         packageDirList: safeListDir(pkgDir),
+
         nodeModulesDir,
         nodeModulesDirExists: safeExists(nodeModulesDir),
         nodeModulesDirList: safeListDir(nodeModulesDir),
+
         cwd: process.cwd(),
         platform: process.platform,
         arch: process.arch,
