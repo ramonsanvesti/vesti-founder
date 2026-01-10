@@ -1258,6 +1258,10 @@ async function handler(req: NextRequest) {
         meta,
       });
       videoBytes = dl.bytes;
+      log("ffmpeg.probe.about_to_start", {
+        ...meta,
+        inputPath,
+      });
 
       // Guardrail: enforce max duration (product constraint) to protect cost/time.
       durationSeconds = await probeDurationSeconds({ inputPath, meta });
@@ -1629,6 +1633,11 @@ async function handler(req: NextRequest) {
 
       const classification = classifyNonRetriable(err);
       const errStr = toErrorString(err);
+      const errStack =
+        typeof err?.stack === "string"
+          ? err.stack.replace(/\s+/g, " ").trim().slice(0, 1800)
+          : null;
+
       log("process.debug.types", {
         ...meta,
         jobDirType: typeof jobDir,
@@ -1636,12 +1645,14 @@ async function handler(req: NextRequest) {
         maxWidthType: typeof maxWidth,
         maxFramesType: typeof maxFrames,
         sampleEverySecondsType: typeof sampleEverySeconds,
+        errStack,
       });
       log("process.failed", {
         ...meta,
         nonRetriable: classification.nonRetriable,
         reason: classification.reason,
         err: errStr,
+        errStack,
       });
 
       const nowIso = new Date().toISOString();
@@ -1686,6 +1697,7 @@ async function handler(req: NextRequest) {
             retried: qstashRetriedSafe,
             maxRetries: MAX_RETRIES,
             details: String(err?.message ?? err),
+            errStack: errStack,
             videoDurationSeconds: durationSeconds,
             videoBytes: videoBytes,
             candidatesWithFallback: typeof candidates !== "undefined" ? candidates.length : 0,
@@ -1722,6 +1734,7 @@ async function handler(req: NextRequest) {
           retried: qstashRetriedSafe,
           maxRetries: MAX_RETRIES,
           details: String(err?.message ?? err),
+          errStack: errStack,
           videoDurationSeconds: durationSeconds,
           videoBytes: videoBytes,
           candidatesWithFallback: typeof candidates !== "undefined" ? candidates.length : 0,
