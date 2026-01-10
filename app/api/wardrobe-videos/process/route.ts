@@ -727,6 +727,14 @@ function classifyNonRetriable(err: any): { nonRetriable: boolean; reason: string
   ) {
     return { nonRetriable: true, reason: "invalid_path_type" };
   }
+  // DB schema / constraint violations are programmer/config errors; retries will not fix them.
+  // Example: Candidate DB upsert failed: new row for relation "wardrobe_video_candidates" violates check constraint "wardrobe_video_candidates_status_allowed"
+  if (
+    msg.includes("violates check constraint") &&
+    (msg.includes("wardrobe_video_candidates_status_allowed") || msg.includes("wardrobe_video_candidates"))
+  ) {
+    return { nonRetriable: true, reason: "db_check_constraint" };
+  }
   if (
     msg.includes("FFmpeg binary not available") ||
     msg.includes("FFmpeg binary not found") ||
@@ -1351,7 +1359,7 @@ async function handler(req: NextRequest) {
         bytes: typeof c.bytes === "number" ? c.bytes : null,
         embedding_model: typeof c.embedding_model === "string" ? c.embedding_model : null,
         rank: typeof c.rank === "number" ? c.rank : i + 1,
-        status: typeof c.status === "string" ? c.status : "generated",
+        status: typeof c.status === "string" ? c.status : "pending",
       }));
 
       // Absolute safety: never return empty candidates if frames exist.
@@ -1370,7 +1378,7 @@ async function handler(req: NextRequest) {
           bytes: null,
           embedding_model: null,
           rank: 1,
-          status: "generated",
+          status: "pending",
         });
       }
 
@@ -1506,7 +1514,7 @@ async function handler(req: NextRequest) {
           id: candidateId,
           user_id: FOUNDER_USER_ID,
           wardrobe_video_id: wardrobeVideoId,
-          status: "generated",
+          status: "pending",
           storage_bucket: WARDROBE_CANDIDATES_BUCKET,
           storage_path: storagePath,
           frame_ts_ms: frameTsMs ?? frame.tsMs,
@@ -1542,7 +1550,7 @@ async function handler(req: NextRequest) {
           candidateId,
           wardrobeVideoId,
           userId: FOUNDER_USER_ID,
-          status: "generated",
+          status: "pending",
           storageBucket: WARDROBE_CANDIDATES_BUCKET,
           storagePath,
           signedUrl,
