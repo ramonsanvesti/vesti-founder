@@ -36,7 +36,8 @@ const FFMPEG_DEBUG = (process.env.FFMPEG_DEBUG ?? "").trim() === "1";
 // Where Node resolved the ffmpeg-static package entry (useful to confirm bundling).
 const FFMPEG_STATIC_PACKAGE_ENTRY: string = (() => {
   try {
-    return require.resolve("ffmpeg-static");
+    const v = require.resolve("ffmpeg-static") as unknown;
+    return typeof v === "string" ? v : "";
   } catch {
     return "";
   }
@@ -60,6 +61,14 @@ function safeListDir(p: unknown, limit = 50): string[] | null {
   }
 }
 
+function safeDirname(p: unknown): string {
+  try {
+    return typeof p === "string" && p ? path.dirname(p) : "";
+  } catch {
+    return "";
+  }
+}
+
 function emitFfmpegDebug(label: string, resolvedPath: unknown) {
   if (!FFMPEG_DEBUG) return;
 
@@ -78,8 +87,8 @@ function emitFfmpegDebug(label: string, resolvedPath: unknown) {
             }
           })();
 
-  const resolvedDir = resolvedPathStr ? path.dirname(resolvedPathStr) : "";
-  const pkgDir = FFMPEG_STATIC_PACKAGE_ENTRY ? path.dirname(FFMPEG_STATIC_PACKAGE_ENTRY) : "";
+  const resolvedDir = safeDirname(resolvedPathStr);
+  const pkgDir = safeDirname(FFMPEG_STATIC_PACKAGE_ENTRY);
 
   // Try a couple of likely dirs for diagnostics.
   const nodeModulesDir = path.join(process.cwd(), "node_modules", "ffmpeg-static");
@@ -354,8 +363,8 @@ async function getFfmpegPath(): Promise<string> {
 
   const binName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
 
-  const pkgEntry = FFMPEG_STATIC_PACKAGE_ENTRY;
-  const pkgDir = pkgEntry ? path.dirname(pkgEntry) : "";
+  const pkgEntry = typeof FFMPEG_STATIC_PACKAGE_ENTRY === "string" ? FFMPEG_STATIC_PACKAGE_ENTRY : "";
+  const pkgDir = safeDirname(pkgEntry);
   if (pkgDir) {
     pushIf(path.join(pkgDir, binName));
     // Some bundlers change where index.js lives; also try one level up.
