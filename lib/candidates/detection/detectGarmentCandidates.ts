@@ -338,6 +338,101 @@ function backgroundSimplicityProxy(gray: Uint8Array, width: number, height: numb
   return 1 - norm;
 }
 
+function garmentPresenceHeuristic(
+  gray: Uint8Array,
+  width: number,
+  height: number
+): { ok: boolean; score: number; metrics: { fgFrac: number; edgeFrac: number; varLum: number } } {
+  if (width < 32 || height < 32 || gray.length !== width * height) {
+    return { ok: false, score: 0, metrics: { fgFrac: 0, edgeFrac: 0, varLum: 0 } };
+  }
+
+  // Estimate background tone using an outer border band.
+  const bw = Math.max(2, Math.floor(width * 0.08));
+  const bh = Math.max(2, Math.floor(height * 0.08));
+
+  let borderSum = 0;
+  let borderN = 0;
+
+  for (let y = 0; y < height; y++) {
+    const isYBorder = y < bh || y >= height - bh;
+    for (let x = 0; x < width; x++) {
+      const isXBorder = x < bw || x >= width - bw;
+      if (isYBorder || isXBorder) {
+        borderSum += gray[y * width + x] ?? 0;
+        borderN++;
+      }
+    }
+  }
+
+  const borderMean = borderN > 0 ? borderSum / borderN : 0;
+
+  // Analyze a central ROI where clothing is most likely.
+  const cx0 = Math.floor(width * 0.15);
+  const cx1 = Math.floor(width * 0.85);
+  const cy0 = Math.floor(height * 0.15);
+  const cy1 = Math.floor(height * 0.9);
+
+  const delta = 18; // minimal contrast vs background to count as foreground
+  let fgCount = 0;
+  let roiN = 0;
+
+  // Cheap edge density proxy with abs(Laplacian)
+  let edgeCount = 0;
+  const edgeThr = 22;
+
+  // Luminance variance to reject overly flat crops
+  let sum = 0;
+  let sum2 = 0;
+
+  for (let y = cy0; y < cy1; y++) {
+    for (let x = cx0; x < cx1; x++) {
+      const v = gray[y * width + x] ?? 0;
+      roiN++;
+
+      const dv = Math.abs(v - borderMean);
+      if (dv >= delta) fgCount++;
+
+      sum += v;
+      sum2 += v * v;
+
+      if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+        const c = v;
+        const up = gray[(y - 1) * width + x] ?? 0;
+        const dn = gray[(y + 1) * width + x] ?? 0;
+        const lf = gray[y * width + (x - 1)] ?? 0;
+        const rt = gray[y * width + (x + 1)] ?? 0;
+        const lap = up + dn + lf + rt - 4 * c;
+        if (Math.abs(lap) >= edgeThr) edgeCount++;
+      }
+    }
+  }
+
+  const fgFrac = roiN > 0 ? fgCount / roiN : 0;
+  const edgeFrac = roiN > 0 ? edgeCount / roiN : 0;
+
+  const mean = roiN > 0 ? sum / roiN : 0;
+  const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
+
+  // Minimal thresholds (cheap, deterministic).
+  const ok =
+    fgFrac >= 0.12 &&
+    fgFrac <= 0.92 &&
+    edgeFrac >= 0.01 &&
+    varLum >= 120;
+
+  // Composite score ~0..1
+  const score = Math.max(
+    0,
+    Math.min(
+      1,
+      fgFrac * 0.55 + (Math.min(0.08, edgeFrac) / 0.08) * 0.3 + (Math.min(900, varLum) / 900) * 0.15
+    )
+  );
+
+  return { ok, score, metrics: { fgFrac, edgeFrac, varLum } };
+}
+
 // -----------------------------
 // ROI + crop
 // -----------------------------
@@ -817,30 +912,43 @@ function resolveJpegQuality(cfg: CandidateDetectionConfig): number {
       const cw = cropDecoded.info.width;
       const ch = cropDecoded.info.height;
 
-      const sha = sha256Hex(cropBytes);
-      const ph = await phash64HexFromGray(cropGray, cw, ch);
-      const emb = embedLocal(cropGray, cw, ch);
+      const pres = garmentPresenceHeuristic(cropGray, cw, ch);
 
-      const reasonCodes: ReasonCode[] = [ReasonCode.E_FALLBACK_CENTER_FRAME];
+      if (!pres.ok) {
+        console.info({
+          at: "dreszi.candidates.fallback.rejected",
+          wardrobe_video_id: input.wardrobe_video_id,
+          user_id: input.user_id,
+          metrics: pres.metrics
+        });
+        // Do NOT emit a fallback candidate if the crop doesn't look like it contains a garment.
+        // Returning no candidates allows the caller to mark the video as `processed_no_candidates`.
+      } else {
+        const sha = sha256Hex(cropBytes);
+        const ph = await phash64HexFromGray(cropGray, cw, ch);
+        const emb = embedLocal(cropGray, cw, ch);
 
-      const candidate: HashEmbedCandidate = {
-        candidate_id: randomUUID(),
-        wardrobe_video_id: input.wardrobe_video_id,
-        user_id: input.user_id,
-        frame_ts_ms: ref.frame_ts_ms,
-        crop_box: roi,
-        confidence: 0.2,
-        reason_codes: reasonCodes,
-        phash: ph,
-        sha256: sha,
-        bytes: cropBytes.length,
-        embedding_model: "local:downsample-16x8",
-        embedding_vector: emb,
-        score: 0,
-        tie_id: "fallback"
-      };
+        const reasonCodes: ReasonCode[] = [ReasonCode.E_FALLBACK_CENTER_FRAME];
 
-      winners.push(candidate);
+        const candidate: HashEmbedCandidate = {
+          candidate_id: randomUUID(),
+          wardrobe_video_id: input.wardrobe_video_id,
+          user_id: input.user_id,
+          frame_ts_ms: ref.frame_ts_ms,
+          crop_box: roi,
+          confidence: Math.max(0.2, Math.min(0.6, 0.25 + pres.score * 0.45)),
+          reason_codes: reasonCodes,
+          phash: ph,
+          sha256: sha,
+          bytes: cropBytes.length,
+          embedding_model: "local:downsample-16x8",
+          embedding_vector: emb,
+          score: 0,
+          tie_id: "fallback"
+        };
+
+        winners.push(candidate);
+      }
     }
   }
 
