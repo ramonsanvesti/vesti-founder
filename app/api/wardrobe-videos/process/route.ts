@@ -1285,6 +1285,7 @@ async function handler(req: NextRequest) {
     let persistMs: number | null = null;
     let candidatesUploaded = 0;
     let candidatesPersisted = 0;
+    let candidatesActionable = 0; // ready/selected only (used to decide processed vs processed_no_candidates)
 
     try {
       // Download video to /tmp (ephemeral). Prefer signed URL + streaming.
@@ -1466,6 +1467,13 @@ async function handler(req: NextRequest) {
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
         const frameTsMs = typeof c.frame_ts_ms === "number" ? c.frame_ts_ms : null;
+        const candidateInitialStatus =
+          Array.isArray(c?.reason_codes) && c.reason_codes.includes("E_FALLBACK_CENTER_FRAME")
+            ? "discarded"
+            : INITIAL_CANDIDATE_STATUS;
+        if (candidateInitialStatus === "ready" || candidateInitialStatus === "selected") {
+          candidatesActionable++;
+        }
 
         const frame = findNearestFrameByTs(frames, frameTsMs);
         if (!frame) continue;
@@ -1525,7 +1533,7 @@ async function handler(req: NextRequest) {
           id: candidateId,
           user_id: FOUNDER_USER_ID,
           wardrobe_video_id: wardrobeVideoId,
-          status: INITIAL_CANDIDATE_STATUS,
+          status: candidateInitialStatus,
           storage_bucket: WARDROBE_CANDIDATES_BUCKET,
           storage_path: storagePath,
           frame_ts_ms: frameTsMs ?? frame.tsMs,
@@ -1561,7 +1569,7 @@ async function handler(req: NextRequest) {
           candidateId,
           wardrobeVideoId,
           userId: FOUNDER_USER_ID,
-          status: INITIAL_CANDIDATE_STATUS,
+          status: candidateInitialStatus,
           storageBucket: WARDROBE_CANDIDATES_BUCKET,
           storagePath,
           signedUrl,
@@ -1607,7 +1615,7 @@ async function handler(req: NextRequest) {
 
       const nowIso = new Date().toISOString();
 
-      const finalVideoStatus = candidatesPersisted > 0 ? "processed" : "processed_no_candidates";
+      const finalVideoStatus = candidatesActionable > 0 ? "processed" : "processed_no_candidates";
 
       const { data, error } = await supabase
         .from("wardrobe_videos")
@@ -1633,7 +1641,7 @@ async function handler(req: NextRequest) {
         throw new Error(`DB update failed: ${error.message}`);
       }
 
-      log("process.success", { ...meta, framesExtracted: frames.length, finalVideoStatus, candidatesPersisted });
+      log("process.success", { ...meta, framesExtracted: frames.length, finalVideoStatus, candidatesPersisted, candidatesActionable });
 
       return NextResponse.json(
         {
@@ -1649,6 +1657,7 @@ async function handler(req: NextRequest) {
           candidatesWithFallback: candidates.length,
           candidatesUploaded: candidatesUploaded,
           candidatesPersisted: candidatesPersisted,
+          candidatesActionable: candidatesActionable,
           candidateDetection: {
             detectMs: detectMs,
           },
