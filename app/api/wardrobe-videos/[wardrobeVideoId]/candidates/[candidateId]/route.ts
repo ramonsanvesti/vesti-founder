@@ -5,7 +5,29 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-type CandidateStatus = "generated" | "selected" | "discarded" | "promoted" | "expired";
+// Bump this when you want to confirm a deployment is serving the latest code.
+const ROUTE_VERSION = "wvc-candidate-patch@2026-01-14";
+
+function withRouteHeaders(init?: ResponseInit): ResponseInit {
+  const headers = new Headers((init as any)?.headers ?? undefined);
+  headers.set("x-dreszi-route", ROUTE_VERSION);
+  // Helpful when running on Vercel.
+  const sha = process.env.VERCEL_GIT_COMMIT_SHA;
+  const deploymentId = process.env.VERCEL_DEPLOYMENT_ID;
+  if (sha) headers.set("x-vercel-git-commit-sha", sha);
+  if (deploymentId) headers.set("x-vercel-deployment-id", deploymentId);
+  return { ...(init ?? {}), headers };
+}
+
+type CandidateStatus =
+  | "pending"
+  | "generated"
+  | "ready"
+  | "selected"
+  | "discarded"
+  | "promoted"
+  | "expired"
+  | "failed";
 
 type CandidateRow = {
   id: string;
@@ -64,8 +86,10 @@ type CandidateDto = {
 type PatchBody = {
   /** DRESZI convention: camelCase in API */
   userId?: string;
-  /** Only allow lifecycle transitions the UI needs */
-  status: "selected" | "discarded";
+  /** Preferred: explicit status */
+  status?: "selected" | "discarded";
+  /** Optional legacy/UX-friendly action */
+  action?: "select" | "discard";
 };
 
 function env(name: string): string {
@@ -74,8 +98,13 @@ function env(name: string): string {
   return v;
 }
 
+/**
+ * Accepts any UUID-shaped value (32 hex chars + hyphens).
+ * We intentionally do NOT enforce RFC4122 version/variant bits because some internal/test ids
+ * (e.g. 00000000-0000-0000-0000-000000000001) are not v1-v5.
+ */
 function isUuid(v: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 }
 
 function jsonError(
@@ -86,7 +115,7 @@ function jsonError(
 ): NextResponse {
   return NextResponse.json(
     { ok: false, error: { code, message, ...extra } },
-    { status },
+    withRouteHeaders({ status }),
   );
 }
 
@@ -142,6 +171,16 @@ async function readJson<T>(req: Request | NextRequest): Promise<T | null> {
   }
 }
 
+async function resolveParams(ctx: unknown): Promise<{ wardrobeVideoId: string; candidateId: string }> {
+  const raw = (ctx as { params?: unknown } | null | undefined)?.params;
+  const params = await Promise.resolve(raw as any);
+
+  const wardrobeVideoId = typeof (params as any)?.wardrobeVideoId === "string" ? (params as any).wardrobeVideoId.trim() : "";
+  const candidateId = typeof (params as any)?.candidateId === "string" ? (params as any).candidateId.trim() : "";
+
+  return { wardrobeVideoId, candidateId };
+}
+
 export async function PATCH(
   req: NextRequest,
   ctx: {
@@ -150,9 +189,7 @@ export async function PATCH(
       | { wardrobeVideoId: string; candidateId: string };
   },
 ): Promise<NextResponse> {
-  const params = await Promise.resolve((ctx as any)?.params);
-  const wardrobeVideoId = typeof params?.wardrobeVideoId === "string" ? params.wardrobeVideoId.trim() : "";
-  const candidateId = typeof params?.candidateId === "string" ? params.candidateId.trim() : "";
+  const { wardrobeVideoId, candidateId } = await resolveParams(ctx);
 
   if (!wardrobeVideoId || !candidateId) {
     return jsonError(400, "E_MISSING_PARAMS", "Missing wardrobeVideoId or candidateId");
@@ -170,15 +207,26 @@ export async function PATCH(
     return jsonError(415, "E_UNSUPPORTED_CONTENT_TYPE", "Expected application/json");
   }
 
-  const requestedStatus = body.status;
-  if (requestedStatus !== "selected" && requestedStatus !== "discarded") {
-    return jsonError(400, "E_BAD_STATUS", "status must be 'selected' or 'discarded'");
+  const requestedStatus =
+    body.status === "selected" || body.status === "discarded"
+      ? body.status
+      : (body as any)?.action === "select"
+          ? "selected"
+          : (body as any)?.action === "discard"
+              ? "discarded"
+              : null;
+
+  if (!requestedStatus) {
+    return jsonError(400, "E_BAD_STATUS", "status must be 'selected' or 'discarded' (or action: 'select'|'discard')");
   }
 
   // Beta auth model: accept userId from JSON or x-user-id header and enforce ownership via DB predicate.
-  const userId = body.userId ?? req.headers.get("x-user-id") ?? undefined;
+  const userIdRaw = body.userId ?? req.headers.get("x-user-id") ?? undefined;
+  const userId = typeof userIdRaw === "string" ? userIdRaw.trim() : undefined;
   if (!userId || !isUuid(userId)) {
-    return jsonError(401, "E_MISSING_USER", "Missing or invalid userId");
+    return jsonError(401, "E_MISSING_USER", "Missing or invalid userId", {
+      hint: "Provide userId in JSON body (camelCase) or x-user-id header as a UUID-shaped string",
+    });
   }
 
   const supabase = getSupabaseAdminClient();
@@ -203,22 +251,23 @@ export async function PATCH(
     return jsonError(404, "E_NOT_FOUND", "Candidate not found");
   }
 
-  const now = Date.now();
-  const expiresAtMs = Number.isFinite(Date.parse(row.expires_at))
-    ? Date.parse(row.expires_at)
-    : NaN;
-  if (Number.isFinite(expiresAtMs) && expiresAtMs < now) {
+  const nowMs = Date.now();
+  const expiresAtMs = Date.parse(row.expires_at);
+  if (Number.isFinite(expiresAtMs) && expiresAtMs <= nowMs) {
     return jsonError(410, "E_CANDIDATE_EXPIRED", "Candidate has expired");
   }
 
   // 2) Idempotent update
   if (row.status === requestedStatus) {
-    return NextResponse.json({ ok: true, candidate: mapCandidateRowToDto(row) }, { status: 200 });
+    return NextResponse.json(
+      { ok: true, candidate: mapCandidateRowToDto(row) },
+      withRouteHeaders({ status: 200 }),
+    );
   }
 
-  // Only allow transitions from generated -> selected/discarded.
-  // If already promoted/expired, do not allow changes.
-  if (row.status === "promoted" || row.status === "expired") {
+  // Allow UI lifecycle changes among pending/generated/ready/selected/discarded.
+  // If already promoted/expired/failed, do not allow changes.
+  if (row.status === "promoted" || row.status === "expired" || row.status === "failed") {
     return jsonError(
       409,
       "E_INVALID_TRANSITION",
@@ -247,5 +296,8 @@ export async function PATCH(
   }
 
   const finalRow = (updated ?? row) as CandidateRow;
-  return NextResponse.json({ ok: true, candidate: mapCandidateRowToDto(finalRow) }, { status: 200 });
+  return NextResponse.json(
+    { ok: true, candidate: mapCandidateRowToDto(finalRow) },
+    withRouteHeaders({ status: 200 }),
+  );
 }
