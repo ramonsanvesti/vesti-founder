@@ -1471,7 +1471,9 @@ async function handler(req: NextRequest) {
           Array.isArray(c?.reason_codes) && c.reason_codes.includes("E_FALLBACK_CENTER_FRAME")
             ? "discarded"
             : INITIAL_CANDIDATE_STATUS;
-        if (candidateInitialStatus === "ready" || candidateInitialStatus === "selected") {
+
+        // Actionable candidates are those the UI should show (ready now; can become selected via PATCH later).
+        if (candidateInitialStatus === "ready") {
           candidatesActionable++;
         }
 
