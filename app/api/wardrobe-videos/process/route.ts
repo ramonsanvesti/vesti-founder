@@ -916,8 +916,109 @@ async function uploadCandidateObject(params: {
   return { ok: true };
 }
 
+
 function sha256Hex(buf: Buffer) {
   return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+// Minimal garment check: quick grayscale/texture/edge heuristics to rescue "fallback center frame" candidates if they show real structure.
+async function passesMinimalGarmentCheck(params: {
+  buffer: Buffer; // WEBP buffer
+  meta: LogMeta;
+}): Promise<{ ok: boolean; metrics: { lapVar: number; std: number; edgeRatio: number } }> {
+  const { buffer, meta } = params;
+
+  // Cheap downscale for analysis (serverless-safe).
+  const W = 96;
+  const H = 96;
+
+  // Convert to grayscale raw pixels.
+  const { data, info } = await sharp(buffer, { failOn: "none" })
+    .resize(W, H, { fit: "fill" })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const w = info.width ?? W;
+  const h = info.height ?? H;
+
+  // Helpers
+  const mean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / Math.max(1, arr.length);
+  const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+
+  // Compute std dev of intensity (contrast proxy).
+  const px: number[] = new Array(w * h);
+  for (let i = 0; i < px.length; i++) px[i] = data[i] ?? 0;
+
+  const m = mean(px);
+  let v = 0;
+  for (let i = 0; i < px.length; i++) {
+    const d = px[i] - m;
+    v += d * d;
+  }
+  v /= Math.max(1, px.length);
+  const std = Math.sqrt(v);
+
+  // Variance of Laplacian (edge/texture proxy).
+  // 3x3 Laplacian kernel:
+  //  0  1  0
+  //  1 -4  1
+  //  0  1  0
+  const lap: number[] = [];
+  lap.length = (w - 2) * (h - 2);
+
+  let edgeCount = 0;
+  const edgeThresh = 18; // in grayscale intensity units (0..255)
+  let idx = 0;
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const c = px[y * w + x];
+      const up = px[(y - 1) * w + x];
+      const dn = px[(y + 1) * w + x];
+      const lf = px[y * w + (x - 1)];
+      const rt = px[y * w + (x + 1)];
+      const l = up + dn + lf + rt - 4 * c; // Laplacian response
+      lap[idx++] = l;
+
+      if (Math.abs(l) >= edgeThresh) edgeCount++;
+    }
+  }
+
+  const lm = mean(lap);
+  let lv = 0;
+  for (let i = 0; i < lap.length; i++) {
+    const d = lap[i] - lm;
+    lv += d * d;
+  }
+  lv /= Math.max(1, lap.length);
+  const lapVar = lv;
+
+  // Edge pixel ratio (how much structure exists).
+  const edgeRatio = clamp01(edgeCount / Math.max(1, lap.length));
+
+  // Thresholds tuned to avoid "blank center frame" fallbacks.
+  // Allow override via env for rapid tuning.
+  const minStd = Number.parseFloat((process.env.MIN_GARMENT_STD ?? "22").trim()); // contrast
+  const minLapVar = Number.parseFloat((process.env.MIN_GARMENT_LAPVAR ?? "120").trim()); // texture/edges
+  const minEdgeRatio = Number.parseFloat((process.env.MIN_GARMENT_EDGERATIO ?? "0.06").trim()); // structure
+
+  const ok =
+    Number.isFinite(std) &&
+    Number.isFinite(lapVar) &&
+    Number.isFinite(edgeRatio) &&
+    std >= minStd &&
+    lapVar >= minLapVar &&
+    edgeRatio >= minEdgeRatio;
+
+  log("candidates.mincheck", {
+    ...meta,
+    ok,
+    metrics: { std, lapVar, edgeRatio },
+    thresholds: { minStd, minLapVar, minEdgeRatio },
+  });
+
+  return { ok, metrics: { lapVar, std, edgeRatio } };
 }
 
 function uuidV5(name: string, namespaceUuid: string) {
@@ -1467,15 +1568,17 @@ async function handler(req: NextRequest) {
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
         const frameTsMs = typeof c.frame_ts_ms === "number" ? c.frame_ts_ms : null;
-        const candidateInitialStatus =
-          Array.isArray(c?.reason_codes) && c.reason_codes.includes("E_FALLBACK_CENTER_FRAME")
-            ? "discarded"
-            : INITIAL_CANDIDATE_STATUS;
+        // Default status:
+        // - If detection flagged this as a fallback-center-frame, we discard it UNLESS a minimal visual check suggests
+        //   there is real garment-like structure (so we don't hide an obviously good frame behind a fallback flag).
+        const baseReasonCodes = Array.isArray(c?.reason_codes) ? c.reason_codes : [];
+        let reasonCodes = baseReasonCodes.slice();
 
-        // Actionable candidates are those the UI should show (ready now; can become selected via PATCH later).
-        if (candidateInitialStatus === "ready") {
-          candidatesActionable++;
-        }
+        let candidateInitialStatus: string =
+          baseReasonCodes.includes("E_FALLBACK_CENTER_FRAME") ? "discarded" : INITIAL_CANDIDATE_STATUS;
+
+        // We'll run the minimal check AFTER we build the candidate image (so we judge the actual crop/webp bytes).
+        let wantsMinCheck = candidateInitialStatus === "discarded";
 
         const frame = findNearestFrameByTs(frames, frameTsMs);
         if (!frame) continue;
@@ -1488,12 +1591,36 @@ async function handler(req: NextRequest) {
         });
         if (!built) continue;
 
+        // Minimal pre-fallback check: if this was labeled fallback-center-frame but the image shows garment-like structure,
+        // rescue it to "ready" so the user can actually see/select it.
+        if (wantsMinCheck) {
+          try {
+            const mincheck = await passesMinimalGarmentCheck({ buffer: built.buffer, meta });
+            if (mincheck.ok) {
+              candidateInitialStatus = INITIAL_CANDIDATE_STATUS;
+              // Keep the original fallback reason for auditing, but annotate that we rescued it.
+              if (!reasonCodes.includes("H_MINCHECK_RESCUED")) reasonCodes.push("H_MINCHECK_RESCUED");
+            } else {
+              if (!reasonCodes.includes("H_MINCHECK_FAILED")) reasonCodes.push("H_MINCHECK_FAILED");
+            }
+          } catch (e: any) {
+            // If the heuristic fails, do not fail the job; keep it discarded.
+            log("candidates.mincheck.error", { ...meta, err: toErrorString(e) });
+            if (!reasonCodes.includes("H_MINCHECK_ERROR")) reasonCodes.push("H_MINCHECK_ERROR");
+          }
+        }
+
         // Idempotency key from uploaded bytes.
         const sha256 = sha256Hex(built.buffer);
         if (!sha256 || seenSha256.has(sha256)) {
           continue;
         }
         seenSha256.add(sha256);
+
+        // Count actionable candidates only if they survive dedupe and are not discarded.
+        if (candidateInitialStatus === "ready" || candidateInitialStatus === "selected") {
+          candidatesActionable++;
+        }
 
         // Deterministic UUID per (user, video, sha256) to keep storage paths stable across retries.
         const candidateId = uuidV5(`${FOUNDER_USER_ID}:${wardrobeVideoId}:${sha256}`, CANDIDATE_UUID_NAMESPACE);
@@ -1543,7 +1670,7 @@ async function handler(req: NextRequest) {
             c.crop_box ??
             ({ x: 0, y: 0, w: built.width, h: built.height, frame_w: built.width, frame_h: built.height } as any),
           confidence: typeof c.confidence === "number" ? c.confidence : 0,
-          reason_codes: Array.isArray(c.reason_codes) ? c.reason_codes : [],
+          reason_codes: reasonCodes,
           phash: phashVal,
           sha256,
           bytes: built.buffer.byteLength,

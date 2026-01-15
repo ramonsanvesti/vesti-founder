@@ -8,7 +8,7 @@
   - Hash (pHash64 + sha256)
   - Lightweight local embedding (deterministic)
   - 2-stage dedupe (pHash Hamming + embedding cosine)
-  - Rank + cap + safe fallback (never empty if frames exist)
+  - Rank + cap + safe fallback (may be empty; caller can mark processed_no_candidates)
 
   Notes
   - Designed for Vercel Node.js runtime constraints.
@@ -433,6 +433,104 @@ function garmentPresenceHeuristic(
   return { ok, score, metrics: { fgFrac, edgeFrac, varLum } };
 }
 
+function garmentPresenceHeuristicInBox(
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  box: CandidateCropBox
+): { ok: boolean; score: number; metrics: { fgFrac: number; edgeFrac: number; varLum: number } } {
+  // Sampled, box-scoped version of garmentPresenceHeuristic to keep runtime low.
+  // Uses a stride so we don't have to materialize a cropped buffer.
+  const x0 = clampInt(box.x, 0, Math.max(0, width - 1));
+  const y0 = clampInt(box.y, 0, Math.max(0, height - 1));
+  const x1 = clampInt(box.x + box.w, 0, width);
+  const y1 = clampInt(box.y + box.h, 0, height);
+
+  const bw = Math.max(2, Math.floor((x1 - x0) * 0.08));
+  const bh = Math.max(2, Math.floor((y1 - y0) * 0.08));
+
+  // Target roughly <= ~160x160 samples for determinism + speed.
+  const stride = Math.max(1, Math.floor(Math.min(x1 - x0, y1 - y0) / 160));
+
+  let borderSum = 0;
+  let borderN = 0;
+
+  for (let y = y0; y < y1; y += stride) {
+    const isYBorder = y < y0 + bh || y >= y1 - bh;
+    for (let x = x0; x < x1; x += stride) {
+      const isXBorder = x < x0 + bw || x >= x1 - bw;
+      if (isYBorder || isXBorder) {
+        borderSum += gray[y * width + x] ?? 0;
+        borderN++;
+      }
+    }
+  }
+
+  const borderMean = borderN > 0 ? borderSum / borderN : 0;
+
+  // Central ROI inside the box
+  const rx0 = x0 + Math.floor((x1 - x0) * 0.12);
+  const rx1 = x0 + Math.floor((x1 - x0) * 0.88);
+  const ry0 = y0 + Math.floor((y1 - y0) * 0.12);
+  const ry1 = y0 + Math.floor((y1 - y0) * 0.92);
+
+  const delta = 18;
+  const edgeThr = 22;
+
+  let fgCount = 0;
+  let roiN = 0;
+
+  let edgeCount = 0;
+
+  let sum = 0;
+  let sum2 = 0;
+
+  for (let y = ry0; y < ry1; y += stride) {
+    for (let x = rx0; x < rx1; x += stride) {
+      const v = gray[y * width + x] ?? 0;
+      roiN++;
+
+      const dv = Math.abs(v - borderMean);
+      if (dv >= delta) fgCount++;
+
+      sum += v;
+      sum2 += v * v;
+
+      if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+        const up = gray[(y - 1) * width + x] ?? 0;
+        const dn = gray[(y + 1) * width + x] ?? 0;
+        const lf = gray[y * width + (x - 1)] ?? 0;
+        const rt = gray[y * width + (x + 1)] ?? 0;
+        const lap = up + dn + lf + rt - 4 * v;
+        if (Math.abs(lap) >= edgeThr) edgeCount++;
+      }
+    }
+  }
+
+  const fgFrac = roiN > 0 ? fgCount / roiN : 0;
+  const edgeFrac = roiN > 0 ? edgeCount / roiN : 0;
+
+  const mean = roiN > 0 ? sum / roiN : 0;
+  const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
+
+  // Same thresholds as the crop-level heuristic (cheap + deterministic)
+  const ok =
+    fgFrac >= 0.12 &&
+    fgFrac <= 0.92 &&
+    edgeFrac >= 0.01 &&
+    varLum >= 120;
+
+  const score = Math.max(
+    0,
+    Math.min(
+      1,
+      fgFrac * 0.55 + (Math.min(0.08, edgeFrac) / 0.08) * 0.3 + (Math.min(900, varLum) / 900) * 0.15
+    )
+  );
+
+  return { ok, score, metrics: { fgFrac, edgeFrac, varLum } };
+}
+
 // -----------------------------
 // ROI + crop
 // -----------------------------
@@ -628,6 +726,14 @@ export async function detectGarmentCandidates(input: DetectCandidatesInput): Pro
     const exp = exposureScore(img.gray);
     const bg = backgroundSimplicityProxy(img.gray, img.width, img.height);
 
+    const roiForPresence = torsoRoiBox(img.width, img.height);
+    const pres = garmentPresenceHeuristicInBox(
+      img.gray,
+      img.width,
+      img.height,
+      roiForPresence
+    );
+
     const reasons: ReasonCode[] = [];
 
     // Low sharpness flag (penalize)
@@ -647,10 +753,16 @@ export async function detectGarmentCandidates(input: DetectCandidatesInput): Pro
     const sharpNormDenom = Math.max(1, cfg.scoring.sharpness_min_var * 4);
     const sharpNorm = Math.min(1, sharpScore / sharpNormDenom);
 
-    const score =
+    const baseScore =
       sharpNorm * cfg.scoring.weight_sharpness +
       exposureFactor * cfg.scoring.weight_exposure +
       bg * cfg.scoring.weight_background_simplicity;
+
+    // Key guardrail: prefer frames where the torso ROI actually looks like it contains a garment.
+    // This reduces "false empty" runs that would otherwise fall back to the center frame.
+    const garmentFactor = pres.ok ? 0.85 + 0.15 * pres.score : 0.35 + 0.15 * pres.score;
+
+    const score = baseScore * garmentFactor;
 
     if (reasons.length === 0) reasons.push(ReasonCode.E_OK);
 
@@ -725,8 +837,24 @@ export async function detectGarmentCandidates(input: DetectCandidatesInput): Pro
     const cw = cropDecoded.info.width;
     const ch = cropDecoded.info.height;
 
-    // Confidence is a soft bounded transform of score.
-    const confidence = Math.max(0, Math.min(1, f.score));
+    // ✅ Minimal garment presence gate BEFORE accepting this crop as a candidate.
+    // This prevents false positives that later lead to fallback-only runs.
+    const pres = garmentPresenceHeuristic(cropGray, cw, ch);
+    if (!pres.ok) {
+      if (debug) {
+        console.info({
+          at: "dreszi.candidates.crop.rejected_no_garment_signal",
+          wardrobe_video_id: input.wardrobe_video_id,
+          user_id: input.user_id,
+          frame_ts_ms: f.ref.frame_ts_ms,
+          metrics: pres.metrics
+        });
+      }
+      continue;
+    }
+
+    // Confidence blends frame score + crop garment-presence score.
+    const confidence = Math.max(0, Math.min(1, 0.15 + f.score * 0.55 + pres.score * 0.3));
 
     const reasons = [...f.reason_codes];
     if (reasons.length === 0) reasons.push(ReasonCode.E_OK);
@@ -797,7 +925,7 @@ function resolveJpegQuality(cfg: CandidateDetectionConfig): number {
       frame_ts_ms: c.frame_ts_ms,
       crop_box: c.crop_box,
       confidence: c.confidence,
-      reason_codes: c.reason_codes,
+      reason_codes: [...c.reason_codes],
       phash: ph,
       sha256: sha,
       bytes: c.crop_bytes.length,
