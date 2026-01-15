@@ -179,7 +179,7 @@ const MAX_VIDEO_SECONDS = (() => {
 })();
 
 // Candidate initial status (DB now allows "pending" via constraint).
-const INITIAL_CANDIDATE_STATUS = "pending" as const;
+const INITIAL_CANDIDATE_STATUS = "ready" as const;
 
 class NonRetriableError extends Error {
   code: string;
@@ -1062,10 +1062,26 @@ async function handler(req: NextRequest) {
         last_processed_at: (existing as any).last_processed_at,
       });
 
+      const { count: reconcileCount, error: reconcileCountErr } = await supabase
+        .from("wardrobe_video_candidates")
+        .select("id", { count: "exact", head: true })
+        .eq("wardrobe_video_id", wardrobeVideoId)
+        .eq("user_id", FOUNDER_USER_ID)
+        .in("status", ["ready", "selected"]);
+
+      if (reconcileCountErr) {
+        log("process.reconcile.count_failed", {
+          ...baseMeta,
+          err: reconcileCountErr.message,
+        });
+      }
+
+      const reconcileFinalStatus = (reconcileCount ?? 0) > 0 ? "processed" : "processed_no_candidates";
+
       await supabase
         .from("wardrobe_videos")
         .update({
-          status: "processed",
+          status: reconcileFinalStatus,
           last_process_error: null,
         })
         .eq("id", wardrobeVideoId)
@@ -1074,15 +1090,17 @@ async function handler(req: NextRequest) {
       return NextResponse.json(
         {
           ok: true,
-          video: toCamelWardrobeVideo({ ...(existing as any), status: "processed" }) ?? ({ ...(existing as any), status: "processed" } as any),
+          video:
+            toCamelWardrobeVideo({ ...(existing as any), status: reconcileFinalStatus }) ??
+            ({ ...(existing as any), status: reconcileFinalStatus } as any),
           reconciled: true,
         },
         { status: 200, headers: RESPONSE_HEADERS }
       );
     }
 
-    // If already processed, acknowledge idempotently (even if a duplicate message arrives).
-    if (String((existing as any).status) === "processed") {
+    // If already processed or processed_no_candidates, acknowledge idempotently (even if a duplicate message arrives).
+    if (["processed", "processed_no_candidates"].includes(String((existing as any).status))) {
       return NextResponse.json(
         { ok: true, video: toCamelWardrobeVideo(existing) ?? (existing as any), idempotent: true },
         { status: 200, headers: RESPONSE_HEADERS }
@@ -1365,23 +1383,13 @@ async function handler(req: NextRequest) {
         status: typeof c.status === "string" ? c.status : INITIAL_CANDIDATE_STATUS,
       }));
 
-      // Absolute safety: never return empty candidates if frames exist.
-      if (candidates.length === 0 && frames.length > 0) {
-        const mid = frames[Math.floor(frames.length / 2)];
-        candidates.push({
-          candidate_id: crypto.randomUUID(),
-          wardrobe_video_id: wardrobeVideoId,
-          user_id: FOUNDER_USER_ID,
-          frame_ts_ms: mid.tsMs,
-          crop_box: null,
-          confidence: 0.01,
-          reason_codes: ["E_FALLBACK_CENTER_FRAME"],
-          phash: null,
-          sha256: null,
-          bytes: null,
-          embedding_model: null,
-          rank: 1,
-          status: INITIAL_CANDIDATE_STATUS,
+      // If detection yields 0 candidates, we allow an empty result.
+      // The video will be marked as processed_no_candidates so the UI can show a helpful message.
+      if (candidates.length === 0) {
+        log("candidates.detect.none", {
+          ...meta,
+          detectMs,
+          framesExtracted: frames.length,
         });
       }
 
@@ -1599,10 +1607,12 @@ async function handler(req: NextRequest) {
 
       const nowIso = new Date().toISOString();
 
+      const finalVideoStatus = candidatesPersisted > 0 ? "processed" : "processed_no_candidates";
+
       const { data, error } = await supabase
         .from("wardrobe_videos")
         .update({
-          status: "processed",
+          status: finalVideoStatus,
           last_processed_at: nowIso,
           last_process_error: null,
           frames_extracted_count: frames.length,
@@ -1623,7 +1633,7 @@ async function handler(req: NextRequest) {
         throw new Error(`DB update failed: ${error.message}`);
       }
 
-      log("process.success", { ...meta, framesExtracted: frames.length });
+      log("process.success", { ...meta, framesExtracted: frames.length, finalVideoStatus, candidatesPersisted });
 
       return NextResponse.json(
         {

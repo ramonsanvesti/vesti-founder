@@ -8,7 +8,7 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const RESPONSE_HEADERS = {
-  "Cache-Control": "no-store",
+  "Cache-Control": "no-store, max-age=0",
   Allow: "GET,OPTIONS",
 } as const;
 
@@ -172,6 +172,9 @@ export async function GET(
     const url = new URL(req.url);
     const includeExpired = url.searchParams.get("include_expired") === "true";
     const includeDiscarded = url.searchParams.get("include_discarded") === "true";
+    const includePending = url.searchParams.get("include_pending") === "true";
+    const includeFailed = url.searchParams.get("include_failed") === "true";
+    const includeAllStatuses = url.searchParams.get("include_all_statuses") === "true";
     const signedUrlTtlSeconds = clampInt(
       url.searchParams.get("signed_url_ttl_seconds"),
       60 * 30,
@@ -256,13 +259,28 @@ export async function GET(
       .eq("user_id", FOUNDER_USER_ID)
       .eq("wardrobe_video_id", wardrobeVideoId);
 
-    if (!includeExpired) {
-      query = query.gt("expires_at", nowIso);
-      query = query.neq("status", "expired");
+    // Default: only show actionable candidates to the UI.
+    // Opt-in flags can broaden the result set for debugging.
+    if (!includeAllStatuses) {
+      // Primary UI states
+      query = query.in("status", ["ready", "selected"]);
+
+      // Optional debug additions
+      if (includePending) query = query.or("status.eq.pending");
+      if (includeFailed) query = query.or("status.eq.failed");
+      if (includeDiscarded) query = query.or("status.eq.discarded");
+      if (includeExpired) query = query.or("status.eq.expired");
     }
 
-    if (!includeDiscarded) {
-      query = query.neq("status", "discarded");
+    if (includeAllStatuses) {
+      if (!includeExpired) {
+        query = query.gt("expires_at", nowIso);
+        query = query.neq("status", "expired");
+      }
+
+      if (!includeDiscarded) {
+        query = query.neq("status", "discarded");
+      }
     }
 
     // Deterministic ordering for UI
@@ -332,7 +350,13 @@ export async function GET(
         count: candidates.length,
         candidates,
       },
-      { status: 200, headers: RESPONSE_HEADERS }
+      {
+        status: 200,
+        headers: {
+          ...RESPONSE_HEADERS,
+          "x-dreszi-route": "wvc-candidates-get@2026-01-14",
+        },
+      }
     );
   } catch (err: any) {
     return NextResponse.json(

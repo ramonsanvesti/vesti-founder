@@ -62,7 +62,7 @@ type WardrobeVideoRow = {
   playback_url?: string | null;
   signed_url?: string | null;
 
-  status: "uploaded" | "processing" | "processed" | "failed";
+  status: "uploaded" | "processing" | "processed" | "processed_no_candidates" | "failed";
   created_at?: string;
 
   // debug (from QStash / processing trace)
@@ -980,6 +980,7 @@ export default function WardrobeClient() {
           <div className="space-y-3">
             {videos.map((v) => {
               const s = String(v.status);
+              const noCandidates = s === "processed_no_candidates";
 
               const vv = normalizeVideoRow(v);
               const jobId = vv.last_process_message_id ?? vv.last_message_id ?? null;
@@ -1007,7 +1008,7 @@ export default function WardrobeClient() {
               // Allow user to re-trigger if processing looks stuck (no job id after a short window)
               const canProcess =
                 !isProcessing &&
-                (s === "uploaded" || s === "failed" || s === "processed" || isStuckProcessing);
+                (s === "uploaded" || s === "failed" || s === "processed" || s === "processed_no_candidates" || isStuckProcessing);
 
               return (
                 <div
@@ -1017,7 +1018,7 @@ export default function WardrobeClient() {
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div className="text-xs text-gray-500">
                       <div>
-                        <span className="text-gray-300">Status:</span> {s}
+                        <span className="text-gray-300">Status:</span> {noCandidates ? "processed (no candidates)" : s}
                       </div>
                       <div>
                         <span className="text-gray-300">Uploaded:</span>{" "}
@@ -1056,6 +1057,11 @@ export default function WardrobeClient() {
                           <span className="text-gray-500">{String(lastProcessedAt)}</span>
                         </div>
                       ) : null}
+                      {noCandidates ? (
+                        <div className="mt-2 text-xs text-yellow-300">
+                          No se detectaron prendas en este video. Intenta con mejor luz, más cerca, y un fondo más limpio.
+                        </div>
+                      ) : null}
                     </div>
 
                     <button
@@ -1065,7 +1071,11 @@ export default function WardrobeClient() {
                       className="px-3 py-2 rounded-md text-sm font-medium border border-white/15 bg-white/5 disabled:opacity-50"
                       title={canProcess ? "Trigger processing pipeline" : "Not available"}
                     >
-                      {isProcessing ? "Processing…" : s === "processed" || isStuckProcessing ? "Reprocess" : "Process"}
+                      {isProcessing
+                        ? "Processing…"
+                        : s === "processed" || s === "processed_no_candidates" || isStuckProcessing
+                        ? "Reprocess"
+                        : "Process"}
                     </button>
                   </div>
 
