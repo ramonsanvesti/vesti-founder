@@ -997,25 +997,26 @@ async function passesMinimalGarmentCheck(params: {
   // Edge pixel ratio (how much structure exists).
   const edgeRatio = clamp01(edgeCount / Math.max(1, lap.length));
 
-  // Thresholds tuned to avoid "blank center frame" fallbacks.
-  // Allow override via env for rapid tuning.
-  const minStd = Number.parseFloat((process.env.MIN_GARMENT_STD ?? "22").trim()); // contrast
-  const minLapVar = Number.parseFloat((process.env.MIN_GARMENT_LAPVAR ?? "120").trim()); // texture/edges
-  const minEdgeRatio = Number.parseFloat((process.env.MIN_GARMENT_EDGERATIO ?? "0.06").trim()); // structure
+  // Thresholds: more permissive defaults, 2-of-3 rule.
+  const minStd = Number.parseFloat((process.env.MIN_GARMENT_STD ?? "14").trim()); // contrast
+  const minLapVar = Number.parseFloat((process.env.MIN_GARMENT_LAPVAR ?? "70").trim()); // texture/edges
+  const minEdgeRatio = Number.parseFloat((process.env.MIN_GARMENT_EDGERATIO ?? "0.035").trim()); // structure
 
-  const ok =
-    Number.isFinite(std) &&
-    Number.isFinite(lapVar) &&
-    Number.isFinite(edgeRatio) &&
-    std >= minStd &&
-    lapVar >= minLapVar &&
-    edgeRatio >= minEdgeRatio;
+  const finite = Number.isFinite(std) && Number.isFinite(lapVar) && Number.isFinite(edgeRatio);
+  const passStd = finite && std >= minStd;
+  const passLap = finite && lapVar >= minLapVar;
+  const passEdge = finite && edgeRatio >= minEdgeRatio;
+
+  // Rescue rule: accept if at least 2 of 3 signals indicate garment-like structure.
+  const passCount = (passStd ? 1 : 0) + (passLap ? 1 : 0) + (passEdge ? 1 : 0);
+  const ok = finite && passCount >= 2;
 
   log("candidates.mincheck", {
     ...meta,
     ok,
     metrics: { std, lapVar, edgeRatio },
     thresholds: { minStd, minLapVar, minEdgeRatio },
+    passes: { passStd, passLap, passEdge, passCount },
   });
 
   return { ok, metrics: { lapVar, std, edgeRatio } };
