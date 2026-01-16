@@ -414,10 +414,14 @@ function garmentPresenceHeuristic(
   const mean = roiN > 0 ? sum / roiN : 0;
   const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
 
-  // More tolerant for clear/solid garments: allow lower edge density or lower luminance variance
-  // as long as there is meaningful foreground separation from the border/background.
   const okFg = fgFrac >= 0.1 && fgFrac <= 0.95;
-  const okVar = varLum >= 80;
+
+  // Solid garments (e.g., a plain hoodie/shirt) can have low luminance variance.
+  // Allow a lower variance threshold when foreground separation is strong.
+  const okVarTextured = varLum >= 80;
+  const okVarSolid = varLum >= 25 && fgFrac >= 0.25;
+  const okVar = okVarTextured || okVarSolid;
+
   const okEdges = edgeFrac >= 0.008;
   const okForegroundStrong = fgFrac >= 0.2;
 
@@ -515,9 +519,14 @@ function garmentPresenceHeuristicInBox(
   const mean = roiN > 0 ? sum / roiN : 0;
   const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
 
-  // More tolerant for clear/solid garments (box-scoped):
   const okFg = fgFrac >= 0.1 && fgFrac <= 0.95;
-  const okVar = varLum >= 80;
+
+  // Solid garments inside the box can look "flat" (low variance). Be more tolerant
+  // when there is strong foreground separation from the box border/background.
+  const okVarTextured = varLum >= 80;
+  const okVarSolid = varLum >= 25 && fgFrac >= 0.25;
+  const okVar = okVarTextured || okVarSolid;
+
   const okEdges = edgeFrac >= 0.008;
   const okForegroundStrong = fgFrac >= 0.2;
 
