@@ -921,6 +921,152 @@ function sha256Hex(buf: Buffer) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+function getOpenAIApiKey(): string {
+  const k = (process.env.OPENAI_API_KEY ?? "").trim();
+  return k;
+}
+
+function getOpenAIVisionModel(): string {
+  // Keep default conservative/cost-effective. Override via env if needed.
+  return (process.env.OPENAI_VISION_MODEL ?? "gpt-4o").trim() || "gpt-4o";
+}
+
+function safeJsonParse<T = any>(text: string): T | null {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function gptVisionJudgeGarment(params: {
+  imageBuffer: Buffer;
+  mimeType: string; // e.g. image/webp
+  meta: LogMeta;
+}): Promise<{ ok: boolean; confidence: number; rationale: string; tags: string[] }> {
+  const { imageBuffer, mimeType, meta } = params;
+
+  const apiKey = getOpenAIApiKey();
+  if (!apiKey) {
+    return { ok: false, confidence: 0, rationale: "OPENAI_API_KEY_missing", tags: ["J_GPT_SKIPPED"] };
+  }
+
+  const model = getOpenAIVisionModel();
+  const b64 = imageBuffer.toString("base64");
+  const dataUrl = `data:${mimeType};base64,${b64}`;
+
+  const judgeSchema = {
+    ok: "boolean (true if there is a clear garment item in view)",
+    confidence: "number between 0 and 1",
+    rationale: "short string",
+    tags: "string[] (optional labels like shirt, hoodie, pants, jacket, shoe, hat, background_only, person_only)",
+  };
+
+  const prompt =
+    "You are a strict garment candidate judge for a wardrobe app. " +
+    "Given ONE image crop, decide if it contains a CLEAR clothing item (garment) that a user could select. " +
+    "Garment means: shirt, hoodie, jacket, pants, shorts, skirt, dress, coat, shoe, hat, bag. " +
+    "If the image is mostly background, empty room, or too blurry/occluded, answer ok=false. " +
+    "Return ONLY valid JSON that matches this schema: " +
+    JSON.stringify(judgeSchema);
+
+  const body = {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          { type: "input_image", image_url: dataUrl, detail: "low" },
+        ],
+      },
+    ],
+  };
+
+  const t0 = Date.now();
+  let res: Response;
+  let json: any;
+
+  try {
+    res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const text = await res.text();
+    json = safeJsonParse<any>(text) ?? { raw: text };
+
+    if (!res.ok) {
+      log("candidates.gpt_judge.http_error", {
+        ...meta,
+        model,
+        status: res.status,
+        statusText: res.statusText,
+        bodyTail: String(text).slice(-1000),
+        ms: Date.now() - t0,
+      });
+      return { ok: false, confidence: 0, rationale: `HTTP_${res.status}`, tags: ["J_GPT_HTTP_ERROR"] };
+    }
+  } catch (e: any) {
+    log("candidates.gpt_judge.fetch_error", { ...meta, model, err: toErrorString(e), ms: Date.now() - t0 });
+    return { ok: false, confidence: 0, rationale: "FETCH_ERROR", tags: ["J_GPT_FETCH_ERROR"] };
+  }
+
+  // Extract assistant text content from Responses API output.
+  // We accept either output_text items or a message with content containing output_text.
+  const outputs: any[] = Array.isArray(json?.output) ? json.output : [];
+  let outText = "";
+
+  for (const item of outputs) {
+    if (item?.type === "message" && Array.isArray(item?.content)) {
+      const c = item.content.find((x: any) => x?.type === "output_text" && typeof x?.text === "string");
+      if (c?.text) {
+        outText = c.text;
+        break;
+      }
+    }
+    if (item?.type === "output_text" && typeof item?.text === "string") {
+      outText = item.text;
+      break;
+    }
+  }
+
+  const parsed = safeJsonParse<any>(String(outText).trim());
+  if (!parsed || typeof parsed.ok !== "boolean") {
+    log("candidates.gpt_judge.parse_failed", {
+      ...meta,
+      model,
+      ms: Date.now() - t0,
+      outTextTail: String(outText).slice(-800),
+    });
+    return { ok: false, confidence: 0, rationale: "PARSE_FAILED", tags: ["J_GPT_PARSE_FAILED"] };
+  }
+
+  const ok = Boolean(parsed.ok);
+  const confidence = typeof parsed.confidence === "number" && Number.isFinite(parsed.confidence)
+    ? Math.max(0, Math.min(1, parsed.confidence))
+    : ok
+      ? 0.6
+      : 0;
+  const rationale = typeof parsed.rationale === "string" ? parsed.rationale.slice(0, 240) : "";
+  const tags = Array.isArray(parsed.tags) ? parsed.tags.filter((t: any) => typeof t === "string").slice(0, 10) : [];
+
+  log("candidates.gpt_judge.done", {
+    ...meta,
+    model,
+    ms: Date.now() - t0,
+    ok,
+    confidence,
+    tags,
+  });
+
+  return { ok, confidence, rationale, tags };
+}
+
 // Minimal garment check: quick grayscale/texture/edge heuristics to rescue "fallback center frame" candidates if they show real structure.
 async function passesMinimalGarmentCheck(params: {
   buffer: Buffer; // WEBP buffer
@@ -1486,14 +1632,33 @@ async function handler(req: NextRequest) {
         status: typeof c.status === "string" ? c.status : INITIAL_CANDIDATE_STATUS,
       }));
 
-      // If detection yields 0 candidates, we allow an empty result.
-      // The video will be marked as processed_no_candidates so the UI can show a helpful message.
+      // If detection yields 0 candidates, inject a single proposal candidate from the middle frame.
+      // This gives the pipeline something to judge (min-check and/or GPT vision) so we don't silently miss obvious garments.
       if (candidates.length === 0) {
         log("candidates.detect.none", {
           ...meta,
           detectMs,
           framesExtracted: frames.length,
         });
+
+        const mid = frames[Math.floor(frames.length / 2)];
+        if (mid) {
+          candidates.push({
+            candidate_id: crypto.randomUUID(),
+            wardrobe_video_id: wardrobeVideoId,
+            user_id: FOUNDER_USER_ID,
+            frame_ts_ms: mid.tsMs,
+            crop_box: null,
+            confidence: 0,
+            reason_codes: ["E_GPT_PROPOSAL_CENTER_FRAME", "E_FALLBACK_CENTER_FRAME"],
+            phash: null,
+            sha256: null,
+            bytes: null,
+            embedding_model: null,
+            rank: 1,
+            status: "discarded",
+          });
+        }
       }
 
       log("candidates.detect.done", {
@@ -1578,6 +1743,12 @@ async function handler(req: NextRequest) {
         let candidateInitialStatus: string =
           baseReasonCodes.includes("E_FALLBACK_CENTER_FRAME") ? "discarded" : INITIAL_CANDIDATE_STATUS;
 
+        // If detection explicitly provided a status, respect it (but keep it to known values).
+        if (typeof c.status === "string") {
+          const s = c.status.trim();
+          if (["ready", "selected", "discarded"].includes(s)) candidateInitialStatus = s;
+        }
+
         // We'll run the minimal check AFTER we build the candidate image (so we judge the actual crop/webp bytes).
         let wantsMinCheck = candidateInitialStatus === "discarded";
 
@@ -1592,20 +1763,38 @@ async function handler(req: NextRequest) {
         });
         if (!built) continue;
 
-        // Minimal pre-fallback check: if this was labeled fallback-center-frame but the image shows garment-like structure,
-        // rescue it to "ready" so the user can actually see/select it.
+        // Minimal pre-fallback check:
         if (wantsMinCheck) {
           try {
+            // Step 1 (cheap): local heuristic.
             const mincheck = await passesMinimalGarmentCheck({ buffer: built.buffer, meta });
             if (mincheck.ok) {
               candidateInitialStatus = INITIAL_CANDIDATE_STATUS;
-              // Keep the original fallback reason for auditing, but annotate that we rescued it.
               if (!reasonCodes.includes("H_MINCHECK_RESCUED")) reasonCodes.push("H_MINCHECK_RESCUED");
             } else {
               if (!reasonCodes.includes("H_MINCHECK_FAILED")) reasonCodes.push("H_MINCHECK_FAILED");
+
+              // Step 2 (strong): GPT Vision judge. Only runs when API key is configured.
+              const gpt = await gptVisionJudgeGarment({
+                imageBuffer: built.buffer,
+                mimeType: built.mimeType,
+                meta,
+              });
+
+              const minGptConfidence = Number.parseFloat((process.env.MIN_GPT_GARMENT_CONFIDENCE ?? "0.65").trim());
+              if (gpt.ok && gpt.confidence >= (Number.isFinite(minGptConfidence) ? minGptConfidence : 0.65)) {
+                candidateInitialStatus = INITIAL_CANDIDATE_STATUS;
+                if (!reasonCodes.includes("H_GPT_RESCUED")) reasonCodes.push("H_GPT_RESCUED");
+                if (gpt.rationale) reasonCodes.push(`H_GPT:${gpt.rationale}`.slice(0, 80));
+                for (const t of gpt.tags) {
+                  const tag = `H_GPT_TAG:${t}`.slice(0, 40);
+                  if (!reasonCodes.includes(tag)) reasonCodes.push(tag);
+                }
+              } else {
+                if (!reasonCodes.includes("H_GPT_REJECTED")) reasonCodes.push("H_GPT_REJECTED");
+              }
             }
           } catch (e: any) {
-            // If the heuristic fails, do not fail the job; keep it discarded.
             log("candidates.mincheck.error", { ...meta, err: toErrorString(e) });
             if (!reasonCodes.includes("H_MINCHECK_ERROR")) reasonCodes.push("H_MINCHECK_ERROR");
           }
