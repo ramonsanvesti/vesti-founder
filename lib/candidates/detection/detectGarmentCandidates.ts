@@ -65,7 +65,7 @@ export interface DetectedCandidate {
   readonly embedding_vector?: ReadonlyArray<number>;
   readonly embedding_id?: string;
   readonly rank: number;
-  readonly status: "generated";
+  readonly status: "pending";
 }
 
 export interface DetectCandidatesInput {
@@ -373,13 +373,13 @@ function garmentPresenceHeuristic(
   const cy0 = Math.floor(height * 0.15);
   const cy1 = Math.floor(height * 0.9);
 
-  const delta = 18; // minimal contrast vs background to count as foreground
+  const delta = 15; // minimal contrast vs background to count as foreground (more tolerant)
   let fgCount = 0;
   let roiN = 0;
 
   // Cheap edge density proxy with abs(Laplacian)
   let edgeCount = 0;
-  const edgeThr = 22;
+  const edgeThr = 20;
 
   // Luminance variance to reject overly flat crops
   let sum = 0;
@@ -414,12 +414,14 @@ function garmentPresenceHeuristic(
   const mean = roiN > 0 ? sum / roiN : 0;
   const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
 
-  // Minimal thresholds (cheap, deterministic).
-  const ok =
-    fgFrac >= 0.12 &&
-    fgFrac <= 0.92 &&
-    edgeFrac >= 0.01 &&
-    varLum >= 120;
+  // More tolerant for clear/solid garments: allow lower edge density or lower luminance variance
+  // as long as there is meaningful foreground separation from the border/background.
+  const okFg = fgFrac >= 0.1 && fgFrac <= 0.95;
+  const okVar = varLum >= 80;
+  const okEdges = edgeFrac >= 0.008;
+  const okForegroundStrong = fgFrac >= 0.2;
+
+  const ok = okFg && okVar && (okEdges || okForegroundStrong);
 
   // Composite score ~0..1
   const score = Math.max(
@@ -474,8 +476,8 @@ function garmentPresenceHeuristicInBox(
   const ry0 = y0 + Math.floor((y1 - y0) * 0.12);
   const ry1 = y0 + Math.floor((y1 - y0) * 0.92);
 
-  const delta = 18;
-  const edgeThr = 22;
+  const delta = 15;
+  const edgeThr = 20;
 
   let fgCount = 0;
   let roiN = 0;
@@ -513,12 +515,13 @@ function garmentPresenceHeuristicInBox(
   const mean = roiN > 0 ? sum / roiN : 0;
   const varLum = roiN > 0 ? Math.max(0, sum2 / roiN - mean * mean) : 0;
 
-  // Same thresholds as the crop-level heuristic (cheap + deterministic)
-  const ok =
-    fgFrac >= 0.12 &&
-    fgFrac <= 0.92 &&
-    edgeFrac >= 0.01 &&
-    varLum >= 120;
+  // More tolerant for clear/solid garments (box-scoped):
+  const okFg = fgFrac >= 0.1 && fgFrac <= 0.95;
+  const okVar = varLum >= 80;
+  const okEdges = edgeFrac >= 0.008;
+  const okForegroundStrong = fgFrac >= 0.2;
+
+  const ok = okFg && okVar && (okEdges || okForegroundStrong);
 
   const score = Math.max(
     0,
@@ -1102,7 +1105,7 @@ function resolveJpegQuality(cfg: CandidateDetectionConfig): number {
       bytes: Number.isFinite(c.bytes) ? c.bytes : null,
       embedding_model: c.embedding_model,
       rank: idx + 1,
-      status: "generated"
+      status: "pending"
     };
 
     if (includeEmbedding) {
